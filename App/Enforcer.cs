@@ -11,6 +11,7 @@ public static class Enforcer {
     var p = Process.Start(new ProcessStartInfo("powershell.exe", "-NoProfile -EncodedCommand " + Convert.ToBase64String(Encoding.Unicode.GetBytes(cmd))) { CreateNoWindow = true, UseShellExecute = false, RedirectStandardOutput = true })!;
     var o = p.StandardOutput.ReadToEnd(); p.WaitForExit(); return o;
   }
+  static void Schtasks(string a) { Process.Start(new ProcessStartInfo("schtasks.exe", a) { CreateNoWindow = true, UseShellExecute = false })!.WaitForExit(); }
   static string[] Lines(string s) => s.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
   public static void Apply(Config c) {
@@ -62,6 +63,14 @@ public static class Enforcer {
       foreach (var a in allow) { using var pk = k.CreateSubKey(@"262144\Paths\{" + Guid.NewGuid() + "}"); pk.SetValue("ItemData", a); pk.SetValue("SaferFlags", 0, RegistryValueKind.DWord); }
       c.Applied.Add("safer");
     }
+    // שירות רקע שסוגר תוכנות חסומות (לתוכנות שלא נתפסות דרך Gate, כמו המחשבון)
+    if (c.Programs.Any(r => r.On && r.Mode == Mode.Full)) {
+      try {
+        var w = System.IO.Path.Combine(Config.Dir, "DeviceGuardWatch.exe"); File.Copy(Environment.ProcessPath!, w, true);
+        Schtasks("/Create /TN DeviceGuardWatch /TR \"" + w + " --watch\" /SC ONSTART /RU SYSTEM /RL HIGHEST /F");
+        Schtasks("/Run /TN DeviceGuardWatch"); c.Applied.Add("task");
+      } catch { }
+    }
     // 5) קבצים, תיקיות וסיומות
     foreach (var r in c.Paths.Where(r => r.On)) if (!Protected(r.Path)) Block(c, r, r.Path);
     var map = new Dictionary<string, Rule>();
@@ -69,6 +78,14 @@ public static class Enforcer {
     M(c.Movies, Config.Vid); M(c.Songs, Config.Aud); M(c.Images, Config.Img);
     foreach (var r in c.Exts.Where(r => r.On)) map[r.Path.TrimStart('.').ToLowerInvariant()] = r;
     if (map.Count > 0) foreach (var d in DriveInfo.GetDrives().Where(d => d.DriveType == DriveType.Fixed && d.IsReady)) Scan(d.RootDirectory.FullName, map, c);
+    if (c.Applied.Any(x => x.StartsWith("hid|"))) {   // מונע הצגת קבצים מוסתרים בסייר הקבצים
+      try {
+        using (var k = Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")) { k.SetValue("Hidden", 2); k.SetValue("ShowSuperHidden", 0); }
+        using (var k = Registry.LocalMachine.CreateSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced\Folder\Hidden\SHOWALL")) k.SetValue("CheckedValue", 0);
+        using (var k = (c.AllUsers ? Registry.LocalMachine : Registry.CurrentUser).CreateSubKey(EXP)) k.SetValue("NoFolderOptions", 1);
+        c.Applied.Add("hideui");
+      } catch { }
+    }
     c.Save();
   }
 
@@ -105,7 +122,7 @@ public static class Enforcer {
   }
 
   public static void Revert(Config c) {
-    foreach (var e in c.Applied.OrderBy(x => x.StartsWith("ifeo") ? 0 : 1).ToList()) {
+    foreach (var e in c.Applied.OrderBy(x => x.StartsWith("task") ? 0 : x.StartsWith("ifeo") ? 1 : 2).ToList()) {
       var p = e.Split('|');
       try {
         switch (p[0]) {
@@ -118,6 +135,12 @@ public static class Enforcer {
           case "net": PS($"Enable-NetAdapter -Name '{p[1]}' -Confirm:$false"); break;
           case "usb": PS($"Enable-PnpDevice -InstanceId '{p[1]}' -Confirm:$false"); break;
           case "usbstor": { using var k = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\USBSTOR", true); k?.SetValue("Start", 3); break; }
+          case "task": Schtasks("/End /TN DeviceGuardWatch"); Schtasks("/Delete /TN DeviceGuardWatch /F"); break;
+          case "hideui": {
+              using (var k = Registry.LocalMachine.CreateSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced\Folder\Hidden\SHOWALL")) k.SetValue("CheckedValue", 1);
+              using (var k = Registry.LocalMachine.OpenSubKey(EXP, true)) k?.DeleteValue("NoFolderOptions", false);
+              using (var k = Registry.CurrentUser.OpenSubKey(EXP, true)) k?.DeleteValue("NoFolderOptions", false);
+              break; }
           case "safer": Registry.LocalMachine.DeleteSubKeyTree(SAFER, false); break;
         }
       } catch { }

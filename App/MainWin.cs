@@ -1,10 +1,55 @@
 using System.Diagnostics; using System.IO; using System.Text.Json; using System.Windows; using System.Windows.Controls; using System.Windows.Controls.Primitives;
 using System.Windows.Interop; using System.Windows.Media; using System.Windows.Media.Imaging; using System.Windows.Threading; using Microsoft.Win32;
 namespace DG;
+public static class Theme {
+  public static readonly Brush Accent = new SolidColorBrush(Color.FromRgb(37, 99, 235));
+  static Style Make(Type t, Color bg, Color? offBg = null) {
+    var s = new Style(t);
+    s.Setters.Add(new Setter(Control.BackgroundProperty, new SolidColorBrush(bg)));
+    s.Setters.Add(new Setter(Control.ForegroundProperty, Brushes.White));
+    s.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(14, 7, 14, 7)));
+    s.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(0)));
+    s.Setters.Add(new Setter(FrameworkElement.CursorProperty, System.Windows.Input.Cursors.Hand));
+    var b = new FrameworkElementFactory(typeof(Border), "b");
+    b.SetValue(Border.CornerRadiusProperty, new CornerRadius(8));
+    b.SetValue(Border.BackgroundProperty, new TemplateBindingExtension(Control.BackgroundProperty));
+    b.SetValue(Border.PaddingProperty, new TemplateBindingExtension(Control.PaddingProperty));
+    var cp = new FrameworkElementFactory(typeof(ContentPresenter));
+    cp.SetValue(FrameworkElement.HorizontalAlignmentProperty, HorizontalAlignment.Center);
+    cp.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
+    b.AppendChild(cp);
+    var tpl = new ControlTemplate(t) { VisualTree = b };
+    var hov = new Trigger { Property = UIElement.IsMouseOverProperty, Value = true }; hov.Setters.Add(new Setter(UIElement.OpacityProperty, 0.85, "b"));
+    tpl.Triggers.Add(hov);
+    s.Setters.Add(new Setter(Control.TemplateProperty, tpl));
+    if (offBg != null) { var off = new Trigger { Property = ToggleButton.IsCheckedProperty, Value = false }; off.Setters.Add(new Setter(Control.BackgroundProperty, new SolidColorBrush(offBg.Value))); s.Triggers.Add(off); }
+    return s;
+  }
+  public static void Apply(Application app) {
+    app.Resources[typeof(Button)] = Make(typeof(Button), Color.FromRgb(37, 99, 235));
+    app.Resources[typeof(ToggleButton)] = Make(typeof(ToggleButton), Color.FromRgb(22, 163, 74), Color.FromRgb(220, 38, 38));
+  }
+}
 public static class Program {
-  [STAThread] public static void Main() {
+  static void Watch() {
+    var alias = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase) { ["calc"] = new[] { "CalculatorApp", "Calculator" } };
+    while (true) {
+      try {
+        var c = Config.Load();
+        if (c.Master) foreach (var r in c.Programs.Where(r => r.On && r.Mode == Mode.Full)) {
+          var n = System.IO.Path.GetFileNameWithoutExtension(r.Path);
+          if (n.Equals("DeviceGuard", StringComparison.OrdinalIgnoreCase) || n.Equals("Gate", StringComparison.OrdinalIgnoreCase)) continue;
+          var names = alias.TryGetValue(n, out var al) ? al.Append(n) : new[] { n };
+          foreach (var nm in names) foreach (var p in Process.GetProcessesByName(nm)) { try { p.Kill(); } catch { } }
+        }
+      } catch { }
+      Thread.Sleep(1000);
+    }
+  }
+  [STAThread] public static void Main(string[] args) {
+    if (args.Contains("--watch")) { Watch(); return; }
     try {
-      var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown }; var c = Config.Load();
+      var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown }; Theme.Apply(app); var c = Config.Load();
       if (c.AppCode == null) {
         var k = MainWin.Ask("הגדר קוד כניסה לתוכנה", true); if (k == null) return;
         c.AppCode = Config.Hash(k); c.OwnerUser = Environment.UserName; c.Save();
@@ -18,7 +63,7 @@ public static class Program {
 public class MainWin : Window {
   Config C; ContentControl host = new(); TextBlock status = new(); DispatcherTimer? tmr;
   public MainWin(Config c) {
-    C = c; Title = "DeviceGuard – מנהל חסימות"; Width = 1050; Height = 720; FlowDirection = FlowDirection.RightToLeft; FontSize = 14;
+    C = c; Title = "DeviceGuard – מנהל חסימות"; Width = 1050; Height = 720; FlowDirection = FlowDirection.RightToLeft; FontSize = 14; Background = new SolidColorBrush(Color.FromRgb(243, 244, 246)); FontFamily = new FontFamily("Segoe UI");
     var tg = new ToggleButton { IsChecked = C.Master, Padding = new Thickness(14, 6, 14, 6), Margin = new Thickness(0, 0, 8, 0) };
     void Lbl() => tg.Content = tg.IsChecked == true ? "החסימות פעילות – לחץ להשבתת הכל" : "החסימות מושבתות – לחץ להפעלה";
     Lbl(); tg.Click += async (s, e) => { C.Master = tg.IsChecked == true; Lbl(); await Do(); };
@@ -29,11 +74,14 @@ public class MainWin : Window {
       IsEnabled = false; await Task.Run(() => Enforcer.Revert(C)); C.Save(); IsEnabled = true;
       tmr?.Stop(); tmr = new DispatcherTimer { Interval = TimeSpan.FromMinutes(30) }; tmr.Tick += async (a, b) => { tmr.Stop(); await Do(); }; tmr.Start(); status.Text = "החסימות פתוחות זמנית";
     };
-    var top = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(8) };
-    top.Children.Add(tg); top.Children.Add(ap); top.Children.Add(un); top.Children.Add(status);
-    var side = new StackPanel { Width = 150, Background = Brushes.WhiteSmoke };
+    var top = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0), Background = Brushes.White };
+    top.Children.Add(tg); top.Children.Add(ap); top.Children.Add(un); top.Children.Add(status); foreach (FrameworkElement ch in top.Children) { ch.Margin = new Thickness(8, 10, 0, 10); ch.VerticalAlignment = VerticalAlignment.Center; }
+    var side = new StackPanel { Width = 190, Background = new SolidColorBrush(Color.FromRgb(17, 24, 39)) };
     var pages = new (string, Func<UIElement>)[] { ("1 · הגדרות כלליות", P1), ("2 · תוכנות מותקנות", P2), ("3 · תוכנות ניידות", P3), ("4 · סוגי קבצים", P4), ("5 · קבצים ותיקיות", P5) };
-    foreach (var (n, f) in pages) { var b = new Button { Content = n, Padding = new Thickness(8, 12, 8, 12), Margin = new Thickness(4) }; b.Click += (s, e) => host.Content = f(); side.Children.Add(b); }
+    side.Children.Add(new TextBlock { Text = "DeviceGuard", Foreground = Brushes.White, FontSize = 20, FontWeight = FontWeights.Bold, Margin = new Thickness(16, 20, 16, 12) });
+    var nav = new List<Button>();
+    foreach (var (n, f) in pages) { var b = new Button { Content = n, Padding = new Thickness(12, 14, 12, 14), Margin = new Thickness(10, 6, 10, 0), Background = Brushes.Transparent, FontSize = 15 }; nav.Add(b); b.Click += (s, e) => { foreach (var x in nav) x.Background = Brushes.Transparent; b.Background = Theme.Accent; host.Content = f(); }; side.Children.Add(b); }
+    nav[0].Background = Theme.Accent;
     var root = new DockPanel(); DockPanel.SetDock(top, Dock.Top); DockPanel.SetDock(side, Dock.Left); // ב-RTL: מופיע מימין
     root.Children.Add(top); root.Children.Add(side); root.Children.Add(host); Content = root; host.Content = P1();
   }
@@ -71,7 +119,7 @@ public class MainWin : Window {
     foreach (UIElement u in new UIElement[] { on, m, sep, hid }) p.Children.Add(u); V();
     if (wl != null) { var b = new Button { Content = "רשימה לבנה…", Padding = new Thickness(8, 2, 8, 2), Margin = m8 }; b.Click += (s, e) => { var x = Pick("רשימה לבנה – " + r.Name, wl(), r.White); if (x != null) { r.White = x; C.Save(); } }; p.Children.Add(b); }
     if (remove != null) { var b = new Button { Content = "הסר", Padding = new Thickness(8, 2, 8, 2) }; b.Click += (s, e) => remove(); p.Children.Add(b); }
-    return p;
+    return new Border { Child = p, Background = Brushes.White, CornerRadius = new CornerRadius(10), Padding = new Thickness(14, 10, 14, 10), Margin = new Thickness(0, 0, 0, 8), Effect = new System.Windows.Media.Effects.DropShadowEffect { BlurRadius = 8, ShadowDepth = 1, Opacity = 0.08 } };
   }
   static ScrollViewer Page(params UIElement[] items) { var sp = new StackPanel { Margin = new Thickness(14) }; foreach (var i in items) sp.Children.Add(i); return new ScrollViewer { Content = sp }; }
   static Button Btn(string t, Action a) { var b = new Button { Content = t, Padding = new Thickness(10, 4, 10, 4), Margin = new Thickness(0, 4, 8, 4) }; b.Click += (s, e) => a(); return b; }

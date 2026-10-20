@@ -3,14 +3,16 @@ using System.Windows.Interop; using System.Windows.Media; using System.Windows.M
 namespace DG;
 public static class Program {
   [STAThread] public static void Main() {
-    var app = new Application(); var c = Config.Load();
-    if (c.AppCode == null) {   // הפעלה ראשונה – הגדרת קוד כניסה
-      var k = MainWin.Ask("הגדר קוד כניסה לתוכנה", true); if (k == null) return;
-      c.AppCode = Config.Hash(k); c.OwnerUser = Environment.UserName; c.Save();
-    } else {
-      while (true) { var k = MainWin.Ask("הזן קוד כניסה"); if (k == null) return; if (Config.Check(k, c.AppCode)) break; MessageBox.Show("קוד שגוי"); }
-    }
-    app.Run(new MainWin(c));
+    try {
+      var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown }; var c = Config.Load();
+      if (c.AppCode == null) {
+        var k = MainWin.Ask("הגדר קוד כניסה לתוכנה", true); if (k == null) return;
+        c.AppCode = Config.Hash(k); c.OwnerUser = Environment.UserName; c.Save();
+      } else {
+        while (true) { var k = MainWin.Ask("הזן קוד כניסה"); if (k == null) return; if (Config.Check(k, c.AppCode)) break; MessageBox.Show("קוד שגוי"); }
+      }
+      var w = new MainWin(c); app.MainWindow = w; app.ShutdownMode = ShutdownMode.OnMainWindowClose; app.Run(w);
+    } catch (Exception x) { MessageBox.Show(x.ToString(), "DeviceGuard – שגיאה"); }
   }
 }
 public class MainWin : Window {

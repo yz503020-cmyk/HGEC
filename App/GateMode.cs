@@ -58,7 +58,7 @@ static class GateMode {
       if (resp == null || resp == "LOCK" || resp == "ERR") return;
     }
     Shell(r.Path);
-    bool dir = Directory.Exists(r.Path); var title = System.IO.Path.GetFileNameWithoutExtension(r.Path); var t0 = DateTime.UtcNow; bool seen = false; int miss = 0;
+    bool dir = System.IO.Directory.Exists(r.Path); var title = System.IO.Path.GetFileNameWithoutExtension(r.Path); var t0 = DateTime.UtcNow; bool seen = false; int miss = 0;
     while (true) {
       Thread.Sleep(2000); Config.Pipe("PING|" + id);
       bool open = dir ? FolderOpen(r.Path) : TitleOpen(title);

@@ -17,9 +17,7 @@ public static class Enforcer {
   public static void Apply(Config c) {
     Revert(c);
     if (!c.Master) { c.Save(); return; }
-    Directory.CreateDirectory(Config.Dir);
-    var g = System.IO.Path.Combine(AppContext.BaseDirectory, "Gate.exe");
-    if (File.Exists(g)) File.Copy(g, GateExe, true);
+    EnsureService();
     var self = Environment.ProcessPath ?? "";
 
     // 1) פעולות PowerShell (לפני חסימת powershell עצמו)
@@ -63,16 +61,8 @@ public static class Enforcer {
       foreach (var a in allow) { using var pk = k.CreateSubKey(@"262144\Paths\{" + Guid.NewGuid() + "}"); pk.SetValue("ItemData", a); pk.SetValue("SaferFlags", 0, RegistryValueKind.DWord); }
       c.Applied.Add("safer");
     }
-    // שירות רקע שסוגר תוכנות חסומות (לתוכנות שלא נתפסות דרך Gate, כמו המחשבון)
-    if (c.Programs.Any(r => r.On && r.Mode == Mode.Full)) {
-      try {
-        var w = System.IO.Path.Combine(Config.Dir, "DeviceGuardWatch.exe"); File.Copy(Environment.ProcessPath!, w, true);
-        Schtasks("/Create /TN DeviceGuardWatch /TR \"" + w + " --watch\" /SC ONSTART /RU SYSTEM /RL HIGHEST /F");
-        Schtasks("/Run /TN DeviceGuardWatch"); c.Applied.Add("task");
-      } catch { }
-    }
     // 5) קבצים, תיקיות וסיומות
-    foreach (var r in c.Paths.Where(r => r.On)) if (!Protected(r.Path)) Block(c, r, r.Path);
+    foreach (var r in c.Paths.Where(r => r.On)) if (!Protected(r.Path)) { Block(c, r, r.Path); if (r.Mode == Mode.Code) MakeLnk(c, r); }
     var map = new Dictionary<string, Rule>();
     void M(Rule r, string[] e) { if (r.On) foreach (var x in e) map[x] = r; }
     M(c.Movies, Config.Vid); M(c.Songs, Config.Aud); M(c.Images, Config.Img);
@@ -93,7 +83,7 @@ public static class Enforcer {
   static void Ifeo(Config c, string exe, Rule r) {
     if (exe.Equals("DeviceGuard.exe", StringComparison.OrdinalIgnoreCase) || exe.Equals("Gate.exe", StringComparison.OrdinalIgnoreCase)) return;
     foreach (var v in Views) { using var b = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, v); using var k = b.CreateSubKey(IFEO + exe); k.SetValue("Debugger", $"\"{GateExe}\" {r.Id}"); }
-    c.Applied.Add("ifeo|" + exe);
+    c.Applied.Add("ifeo|" + exe + "|" + r.Id);
   }
   static void Hide(Config c, string p) { try { var a = File.GetAttributes(p); File.SetAttributes(p, a | FileAttributes.Hidden | FileAttributes.System); c.Applied.Add($"hid|{p}|{(int)a}"); } catch { } }
   static FileSystemAccessRule Deny(bool dir) => new(new SecurityIdentifier(WellKnownSidType.WorldSid, null),
@@ -102,7 +92,7 @@ public static class Enforcer {
   static void Block(Config c, Rule r, string p) {
     try {
       bool dir = Directory.Exists(p); if (!dir && !File.Exists(p)) return;
-      if (r.Hidden && r.Mode == Mode.Full) Hide(c, p);
+      if ((r.Hidden && r.Mode == Mode.Full) || (r.Mode == Mode.Code && c.Paths.Contains(r))) Hide(c, p);
       if (dir) { var i = new DirectoryInfo(p); var s = i.GetAccessControl(); s.AddAccessRule(Deny(true)); i.SetAccessControl(s); }
       else { var i = new FileInfo(p); var s = i.GetAccessControl(); s.AddAccessRule(Deny(false)); i.SetAccessControl(s); }
       c.Applied.Add("acl|" + p);
@@ -121,6 +111,76 @@ public static class Enforcer {
     } catch { }
   }
 
+  static string WatchLog => System.IO.Path.Combine(Config.Dir, "var", "watched.log");
+  static readonly string[] SkipDirs = { "Windows", "Program Files", "Program Files (x86)", "ProgramData", "$Recycle.Bin", "System Volume Information" };
+  public static Dictionary<string, Rule> ExtMap(Config c) {
+    var map = new Dictionary<string, Rule>();
+    void M(Rule r, string[] x) { if (r.On) foreach (var y in x) map[y] = r; }
+    M(c.Movies, Config.Vid); M(c.Songs, Config.Aud); M(c.Images, Config.Img);
+    foreach (var r in c.Exts.Where(r => r.On)) map[r.Path.TrimStart('.').ToLowerInvariant()] = r;
+    return map;
+  }
+  // חוסם קובץ חדש (נקרא משירות הרקע). מחזיר false אם צריך לנסות שוב
+  public static bool BlockNewFile(Rule r, string p) {
+    try {
+      var fi = new FileInfo(p); if (!fi.Exists || Protected(p)) return true;
+      var s = fi.GetAccessControl();
+      if (s.GetAccessRules(true, false, typeof(SecurityIdentifier)).Cast<FileSystemAccessRule>().Any(x => x.AccessControlType == AccessControlType.Deny && x.IdentityReference.Value == "S-1-1-0")) return true;
+      var a = File.GetAttributes(p);
+      if (r.Hidden && r.Mode == Mode.Full) File.SetAttributes(p, a | FileAttributes.Hidden | FileAttributes.System);
+      s.AddAccessRule(Deny(false)); fi.SetAccessControl(s);
+      File.AppendAllText(WatchLog, $"{p}|{(int)a}\n"); return true;
+    } catch { return false; }
+  }
+  public static void ScanNew(Dictionary<string, Rule> map) { foreach (var d in DriveInfo.GetDrives().Where(d => d.DriveType == DriveType.Fixed && d.IsReady)) ScanN(d.RootDirectory.FullName, map); }
+  static void ScanN(string dir, Dictionary<string, Rule> map) {
+    try {
+      foreach (var f in Directory.EnumerateFiles(dir)) if (map.TryGetValue(System.IO.Path.GetExtension(f).TrimStart('.').ToLowerInvariant(), out var r)) BlockNewFile(r, f);
+      foreach (var d in Directory.EnumerateDirectories(dir)) {
+        if (SkipDirs.Contains(System.IO.Path.GetFileName(d), StringComparer.OrdinalIgnoreCase) || (File.GetAttributes(d) & FileAttributes.ReparsePoint) != 0) continue;
+        ScanN(d, map);
+      }
+    } catch { }
+  }
+  // שחזור חסימות שנמחקו מהרישום
+  public static void Heal(Config c) {
+    foreach (var en in c.Applied.Where(x => x.StartsWith("ifeo|"))) {
+      var p = en.Split('|'); if (p.Length < 3) continue; var want = $"\"{GateExe}\" {p[2]}";
+      foreach (var v in Views) { try { using var b = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, v); using var k = b.CreateSubKey(IFEO + p[1]); if (!want.Equals(k.GetValue("Debugger") as string)) k.SetValue("Debugger", want); } catch { } }
+    }
+  }
+  // פתיחה / נעילה מחדש של פריט בודד (חסימה בקוד)
+  public static void Unlock(Rule r) { try { if (Directory.Exists(r.Path)) { var i = new DirectoryInfo(r.Path); var s = i.GetAccessControl(); s.RemoveAccessRule(Deny(true)); i.SetAccessControl(s); } else { var i = new FileInfo(r.Path); var s = i.GetAccessControl(); s.RemoveAccessRule(Deny(false)); i.SetAccessControl(s); } } catch { } }
+  public static void Relock(Rule r) { try { if (Directory.Exists(r.Path)) { var i = new DirectoryInfo(r.Path); var s = i.GetAccessControl(); s.AddAccessRule(Deny(true)); i.SetAccessControl(s); } else if (File.Exists(r.Path)) { var i = new FileInfo(r.Path); var s = i.GetAccessControl(); s.AddAccessRule(Deny(false)); i.SetAccessControl(s); } } catch { } }
+
+  static void Sc(string a) { Process.Start(new ProcessStartInfo("sc.exe", a) { CreateNoWindow = true, UseShellExecute = false })!.WaitForExit(); }
+  // התקנה חד-פעמית של שירות מערכת מוגן; בהמשך הוא רק מקבל עדכון של Gate.exe
+  public static void EnsureService() {
+    var gate = System.IO.Path.Combine(AppContext.BaseDirectory, "Gate.exe");
+    if (!Config.Up()) {
+      Directory.CreateDirectory(Config.Dir);
+      var wd = System.IO.Path.Combine(Config.Dir, "DeviceGuardWatch.exe"); File.Copy(Environment.ProcessPath!, wd, true);
+      if (File.Exists(gate)) File.Copy(gate, GateExe, true);
+      Sc($"create DeviceGuard binPath= \"\\\"{wd}\\\" --service\" start= auto obj= LocalSystem DisplayName= \"DeviceGuard Protection\"");
+      Sc("failure DeviceGuard reset= 0 actions= restart/1000/restart/1000/restart/1000");
+      Sc("start DeviceGuard");
+      for (int i = 0; i < 20 && !Config.Up(); i++) Thread.Sleep(500);
+      Sc("sdset DeviceGuard D:(A;;GA;;;SY)(A;;CCLCSWRPLOCRRC;;;BA)(A;;CCLCSWLOCRRC;;;IU)");
+      if (Config.Token == null && Program.Code != null) Config.Auth(Program.Code);
+    } else if (File.Exists(gate) && Config.Token != null) Config.Pipe($"COPY|{Config.Token}|{gate}|Gate.exe");
+  }
+  // קיצור דרך עם אותו שם, שפותח חלון קוד (הפריט עצמו נעול ומוסתר)
+  static void MakeLnk(Config c, Rule r) {
+    try {
+      var path = r.Path.TrimEnd('\\'); var parent = System.IO.Path.GetDirectoryName(path); if (parent == null) return;
+      var lnk = System.IO.Path.Combine(parent, System.IO.Path.GetFileName(path) + ".lnk");
+      dynamic sh = Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell")!)!; dynamic l = sh.CreateShortcut(lnk);
+      l.TargetPath = GateExe; l.Arguments = "--open " + r.Id;
+      l.IconLocation = Directory.Exists(path) ? Environment.SystemDirectory + @"\shell32.dll,3" : path + ",0";
+      l.Save(); c.Applied.Add("lnk|" + lnk);
+    } catch { }
+  }
+
   public static void Revert(Config c) {
     foreach (var e in c.Applied.OrderBy(x => x.StartsWith("task") ? 0 : x.StartsWith("ifeo") ? 1 : 2).ToList()) {
       var p = e.Split('|');
@@ -135,6 +195,7 @@ public static class Enforcer {
           case "net": PS($"Enable-NetAdapter -Name '{p[1]}' -Confirm:$false"); break;
           case "usb": PS($"Enable-PnpDevice -InstanceId '{p[1]}' -Confirm:$false"); break;
           case "usbstor": { using var k = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\USBSTOR", true); k?.SetValue("Start", 3); break; }
+          case "lnk": File.Delete(p[1]); break;
           case "task": Schtasks("/End /TN DeviceGuardWatch"); Schtasks("/Delete /TN DeviceGuardWatch /F"); break;
           case "hideui": {
               using (var k = Registry.LocalMachine.CreateSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced\Folder\Hidden\SHOWALL")) k.SetValue("CheckedValue", 1);
@@ -145,6 +206,15 @@ public static class Enforcer {
         }
       } catch { }
     }
+    try {   // קבצים שנחסמו אוטומטית על ידי שירות הרקע
+      if (File.Exists(WatchLog)) {
+        foreach (var l in File.ReadAllLines(WatchLog)) {
+          var i = l.LastIndexOf('|'); if (i < 0) continue; var p = l[..i];
+          try { var fi = new FileInfo(p); if (!fi.Exists) continue; var s = fi.GetAccessControl(); s.RemoveAccessRule(Deny(false)); fi.SetAccessControl(s); File.SetAttributes(p, (FileAttributes)int.Parse(l[(i + 1)..])); } catch { }
+        }
+        File.Delete(WatchLog);
+      }
+    } catch { }
     c.Applied.Clear();
   }
 }

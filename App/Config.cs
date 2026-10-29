@@ -1,4 +1,4 @@
-using System.Diagnostics; using System.IO; using System.Security.Cryptography; using System.Text.Json;
+using System.Diagnostics; using System.IO; using System.IO.Pipes; using System.Security.Cryptography; using System.Text; using System.Text.Json;
 namespace DG;
 public enum Mode { Full, Code }
 public class Rule {
@@ -26,12 +26,23 @@ public class Config {
   public static readonly JsonSerializerOptions O = new() { IncludeFields = true, WriteIndented = true };
   public static string Dir = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "DeviceGuard");
   public static Config Load() { try { return JsonSerializer.Deserialize<Config>(File.ReadAllText(System.IO.Path.Combine(Dir, "config.json")), O)!; } catch { return new Config(); } }
+  public static string? Token;
+  public static string? Pipe(string msg, int ms = 3000) {
+    try { using var p = new NamedPipeClientStream(".", "DeviceGuard.Unlock", PipeDirection.InOut); p.Connect(ms); var w = new StreamWriter(p) { AutoFlush = true }; var r = new StreamReader(p); w.WriteLine(msg); return r.ReadLine(); } catch { return null; }
+  }
+  public static bool Up() => Pipe("HELLO", 800) == "OK";
+  public static bool Auth(string code) { var t = Pipe("AUTH|" + code); if (t != null && t.StartsWith("TOKEN|")) { Token = t[6..]; return true; } return false; }
   public void Save() {
+    var json = JsonSerializer.Serialize(this, O);
+    if (Token != null) {   // כשהשירות המוגן פעיל – השמירה עוברת דרכו בלבד
+      if (Pipe("SAVE|" + Token + "|" + Convert.ToBase64String(Encoding.UTF8.GetBytes(json))) == "OK") return;
+      throw new IOException("שמירת ההגדרות דרך שירות ההגנה נכשלה");
+    }
     if (!Directory.Exists(Dir)) {
       Directory.CreateDirectory(Dir);
       Process.Start(new ProcessStartInfo("icacls", $"\"{Dir}\" /inheritance:r /grant *S-1-5-32-544:(OI)(CI)F /grant *S-1-5-18:(OI)(CI)F /grant *S-1-5-32-545:(OI)(CI)RX") { CreateNoWindow = true, UseShellExecute = false })!.WaitForExit();
     }
-    File.WriteAllText(System.IO.Path.Combine(Dir, "config.json"), JsonSerializer.Serialize(this, O));
+    File.WriteAllText(System.IO.Path.Combine(Dir, "config.json"), json);
   }
   public static string Hash(string s) {
     var salt = RandomNumberGenerator.GetBytes(16);

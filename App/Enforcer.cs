@@ -4,7 +4,7 @@ public static class Enforcer {
   const string IFEO = @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\";
   const string EXP = @"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer";
   const string SAFER = @"SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers";
-  static string GateExe => System.IO.Path.Combine(Config.Dir, "Gate.exe");
+  static string GateExe => System.IO.Path.Combine(Config.Dir, "DeviceGuardWatch.exe");
   static readonly RegistryView[] Views = { RegistryView.Registry64, RegistryView.Registry32 };
 
   static string PS(string cmd) {
@@ -81,8 +81,8 @@ public static class Enforcer {
 
   static bool Protected(string p) => p.StartsWith(Config.Dir, StringComparison.OrdinalIgnoreCase) || p.StartsWith(AppContext.BaseDirectory, StringComparison.OrdinalIgnoreCase);
   static void Ifeo(Config c, string exe, Rule r) {
-    if (exe.Equals("DeviceGuard.exe", StringComparison.OrdinalIgnoreCase) || exe.Equals("Gate.exe", StringComparison.OrdinalIgnoreCase)) return;
-    foreach (var v in Views) { using var b = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, v); using var k = b.CreateSubKey(IFEO + exe); k.SetValue("Debugger", $"\"{GateExe}\" {r.Id}"); }
+    if (exe.Equals("DeviceGuard.exe", StringComparison.OrdinalIgnoreCase) || exe.Equals("DeviceGuardWatch.exe", StringComparison.OrdinalIgnoreCase)) return;
+    foreach (var v in Views) { using var b = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, v); using var k = b.CreateSubKey(IFEO + exe); k.SetValue("Debugger", $"\"{GateExe}\" --gate {r.Id}"); }
     c.Applied.Add("ifeo|" + exe + "|" + r.Id);
   }
   static void Hide(Config c, string p) { try { var a = File.GetAttributes(p); File.SetAttributes(p, a | FileAttributes.Hidden | FileAttributes.System); c.Applied.Add($"hid|{p}|{(int)a}"); } catch { } }
@@ -145,7 +145,7 @@ public static class Enforcer {
   // שחזור חסימות שנמחקו מהרישום
   public static void Heal(Config c) {
     foreach (var en in c.Applied.Where(x => x.StartsWith("ifeo|"))) {
-      var p = en.Split('|'); if (p.Length < 3) continue; var want = $"\"{GateExe}\" {p[2]}";
+      var p = en.Split('|'); if (p.Length < 3) continue; var want = $"\"{GateExe}\" --gate {p[2]}";
       foreach (var v in Views) { try { using var b = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, v); using var k = b.CreateSubKey(IFEO + p[1]); if (!want.Equals(k.GetValue("Debugger") as string)) k.SetValue("Debugger", want); } catch { } }
     }
   }
@@ -156,18 +156,16 @@ public static class Enforcer {
   static void Sc(string a) { Process.Start(new ProcessStartInfo("sc.exe", a) { CreateNoWindow = true, UseShellExecute = false })!.WaitForExit(); }
   // התקנה חד-פעמית של שירות מערכת מוגן; בהמשך הוא רק מקבל עדכון של Gate.exe
   public static void EnsureService() {
-    var gate = System.IO.Path.Combine(AppContext.BaseDirectory, "Gate.exe");
     if (!Config.Up()) {
       Directory.CreateDirectory(Config.Dir);
-      var wd = System.IO.Path.Combine(Config.Dir, "DeviceGuardWatch.exe"); File.Copy(Environment.ProcessPath!, wd, true);
-      if (File.Exists(gate)) File.Copy(gate, GateExe, true);
+      var wd = GateExe; File.Copy(Environment.ProcessPath!, wd, true);
       Sc($"create DeviceGuard binPath= \"\\\"{wd}\\\" --service\" start= auto obj= LocalSystem DisplayName= \"DeviceGuard Protection\"");
       Sc("failure DeviceGuard reset= 0 actions= restart/1000/restart/1000/restart/1000");
       Sc("start DeviceGuard");
       for (int i = 0; i < 20 && !Config.Up(); i++) Thread.Sleep(500);
       Sc("sdset DeviceGuard D:(A;;GA;;;SY)(A;;CCLCSWRPLOCRRC;;;BA)(A;;CCLCSWLOCRRC;;;IU)");
       if (Config.Token == null && Program.Code != null) Config.Auth(Program.Code);
-    } else if (File.Exists(gate) && Config.Token != null) Config.Pipe($"COPY|{Config.Token}|{gate}|Gate.exe");
+    } else if (Config.Pipe("VER") != "2") throw new InvalidOperationException("שירות ההגנה הקיים הוא מגרסה ישנה. הסר אותו (חלון 1, 'הסרת שירות ההגנה') ואז לחץ 'החל שינויים'.");
   }
   // קיצור דרך עם אותו שם, שפותח חלון קוד (הפריט עצמו נעול ומוסתר)
   static void MakeLnk(Config c, Rule r) {

@@ -82,6 +82,7 @@ public static class Program {
       var p = line.Split('|', 4); var cfgPath = System.IO.Path.Combine(Config.Dir, "config.json");
       switch (p[0]) {
         case "HELLO": return "OK";
+        case "VER": return "2";
         case "AUTH": {
             if (DateTime.UtcNow < authLock) return "LOCK";
             if (Config.Check(string.Join("|", p.Skip(1)), Config.Load().AppCode)) { authFails = 0; var t = Guid.NewGuid().ToString("N"); tokens[t] = true; return "TOKEN|" + t; }
@@ -150,7 +151,7 @@ public static class Program {
           stamp = ts; c = Config.Load(); kill.Clear();
           if (c.Master) foreach (var r in c.Programs.Where(r => r.On && r.Mode == Mode.Full)) {
             var n = System.IO.Path.GetFileNameWithoutExtension(r.Path);
-            if (n.Equals("DeviceGuard", StringComparison.OrdinalIgnoreCase) || n.Equals("Gate", StringComparison.OrdinalIgnoreCase)) continue;
+            if (n.Equals("DeviceGuard", StringComparison.OrdinalIgnoreCase) || n.Equals("DeviceGuardWatch", StringComparison.OrdinalIgnoreCase)) continue;
             kill.Add(n); if (alias.TryGetValue(n, out var al)) foreach (var x in al) kill.Add(x);
           }
           curMap = c.Master ? Enforcer.ExtMap(c) : new();
@@ -173,8 +174,12 @@ public static class Program {
   [STAThread] public static void Main(string[] args) {
     if (args.Contains("--service")) { System.ServiceProcess.ServiceBase.Run(new GuardService()); return; }
     if (args.Contains("--watch")) { Watch(); return; }
+    if (args.Length >= 2 && args[0] == "--gate") { GateMode.RunGate(args); return; }
+    if (args.Length == 2 && args[0] == "--open") { GateMode.OpenFlow(args[1]); return; }
+    if (!IsAdmin()) { try { Process.Start(new ProcessStartInfo(Environment.ProcessPath!) { UseShellExecute = true, Verb = "runas" }); } catch { } return; }
     RunUi();
   }
+  static bool IsAdmin() { using var id = System.Security.Principal.WindowsIdentity.GetCurrent(); return new System.Security.Principal.WindowsPrincipal(id).IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator); }
   static void RunUi() {
     try {
       var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown }; Theme.Apply(app);
@@ -283,7 +288,7 @@ public class MainWin : Window {
     var d = new DockPanel(); var img = new Image { Source = Icon(e), Width = 32, Height = 32, Margin = new Thickness(0, 0, 10, 0) }; DockPanel.SetDock(img, Dock.Left); d.Children.Add(img); d.Children.Add(Row(r)); return d;
   }
   void OpenWithCode(Rule r) {
-    var g = System.IO.Path.Combine(Config.Dir, "Gate.exe");
+    var g = System.IO.Path.Combine(Config.Dir, "DeviceGuardWatch.exe");
     if (!File.Exists(g)) { MessageBox.Show("יש ללחוץ 'החל שינויים' קודם"); return; }
     Process.Start(new ProcessStartInfo(g, "--open " + r.Id) { UseShellExecute = false });
   }

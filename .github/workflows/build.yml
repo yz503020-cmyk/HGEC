@@ -1,5 +1,7 @@
 name: build
 on: [push, workflow_dispatch]
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: windows-latest
@@ -8,10 +10,6 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with: { dotnet-version: '8.0.x' }
       - run: dotnet publish App/DeviceGuard.csproj -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -o out
-      - run: dotnet publish Gate/Gate.csproj -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -o out
-      - uses: actions/upload-artifact@v4
-        with:
-          name: DeviceGuard
-          path: |
-            out/DeviceGuard.exe
-            out/Gate.exe
+      - run: gh release create "build-${{ github.run_number }}" out/DeviceGuard.exe --title "DeviceGuard build ${{ github.run_number }}" --notes "DeviceGuard build"
+        env:
+          GH_TOKEN: ${{ github.token }}

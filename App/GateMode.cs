@@ -41,7 +41,7 @@ static class GateMode {
     var c = Config.Load(); var r = c.Find(id); if (r == null) return;
     Init();
     var need = r.OwnCode != null ? "הקוד הנפרד של התוכנה הזו" : "קוד ברירת המחדל (שהוגדר בחלון 1)";
-    var w = new Window { Title = "DeviceGuard", Topmost = true, ResizeMode = ResizeMode.NoResize, SizeToContent = SizeToContent.WidthAndHeight, WindowStartupLocation = WindowStartupLocation.CenterScreen, FlowDirection = FlowDirection.RightToLeft, FontFamily = new FontFamily("Segoe UI") };
+    var w = new Window { Title = "DeviceGuard", Topmost = true, ResizeMode = ResizeMode.NoResize, SizeToContent = SizeToContent.WidthAndHeight, WindowStartupLocation = WindowStartupLocation.CenterScreen, FlowDirection = FlowDirection.RightToLeft, FontFamily = new FontFamily("Segoe UI"), Background = new SolidColorBrush(Color.FromRgb(248, 250, 252)) };
     var sp = new StackPanel { Margin = new Thickness(20) };
     sp.Children.Add(new TextBlock { Text = r.Name + " חסומה. יש להקיש את " + need + " תוך 15 שניות, אחרת היא תיסגר.", TextWrapping = TextWrapping.Wrap, Width = 280, Margin = new Thickness(0, 0, 0, 12) });
     var pb = new PasswordBox { Width = 240 }; sp.Children.Add(pb);

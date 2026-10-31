@@ -11,7 +11,8 @@ public class StaTaskScheduler : TaskScheduler, IDisposable {
   public void Dispose() => q.CompleteAdding();
 }
 public static class Theme {
-  public static readonly Brush Accent = new SolidColorBrush(Color.FromRgb(37, 99, 235));
+  public static readonly Brush Accent = new SolidColorBrush(Color.FromRgb(88, 128, 196));
+  public static readonly Brush SideAccent = new SolidColorBrush(Color.FromRgb(88, 128, 196));
   static Style Make(Type t, Color bg, Color? offBg = null) {
     var s = new Style(t);
     s.Setters.Add(new Setter(Control.BackgroundProperty, new SolidColorBrush(bg)));
@@ -20,7 +21,7 @@ public static class Theme {
     s.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(0)));
     s.Setters.Add(new Setter(FrameworkElement.CursorProperty, System.Windows.Input.Cursors.Hand));
     var b = new FrameworkElementFactory(typeof(Border), "b");
-    b.SetValue(Border.CornerRadiusProperty, new CornerRadius(8));
+    b.SetValue(Border.CornerRadiusProperty, new CornerRadius(10));
     b.SetValue(Border.BackgroundProperty, new TemplateBindingExtension(Control.BackgroundProperty));
     b.SetValue(Border.PaddingProperty, new TemplateBindingExtension(Control.PaddingProperty));
     var cp = new FrameworkElementFactory(typeof(ContentPresenter));
@@ -36,20 +37,65 @@ public static class Theme {
   }
   public static readonly FontFamily IconFont = new FontFamily("Segoe Fluent Icons, Segoe MDL2 Assets");
   public static TextBlock Glyph(string g, double size, Brush fg) => new TextBlock { Text = g, FontFamily = IconFont, FontSize = size, Foreground = fg, VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center };
-  public static UIElement IconText(string g, string text) {
+  public static UIElement IconText(string g, string text, Brush? fg = null) {
     var sp = new StackPanel { Orientation = Orientation.Horizontal };
-    var ic = Glyph(g, 16, Brushes.White); ic.Margin = new Thickness(0, 0, 10, 0); sp.Children.Add(ic);
+    var ic = Glyph(g, 16, fg ?? Brushes.White); ic.Margin = new Thickness(0, 0, 10, 0); sp.Children.Add(ic);
     sp.Children.Add(new TextBlock { Text = text, VerticalAlignment = VerticalAlignment.Center }); return sp;
   }
-  public static UIElement Badge(string g) => new Border { Width = 38, Height = 38, CornerRadius = new CornerRadius(10), Background = new SolidColorBrush(Color.FromRgb(239, 246, 255)), Margin = new Thickness(0, 0, 12, 0), VerticalAlignment = VerticalAlignment.Center, Child = Glyph(g, 18, Accent) };
+  public static UIElement Badge(string g) => new Border { Width = 38, Height = 38, CornerRadius = new CornerRadius(12), Background = new SolidColorBrush(Color.FromRgb(238, 243, 252)), Margin = new Thickness(0, 0, 12, 0), VerticalAlignment = VerticalAlignment.Center, Child = Glyph(g, 18, Accent) };
+  // סגנון עדין (רקע בהיר, מסגרת דקה) ללחצנים בסרגל העליון
+  public static Style Soft(Type t) {
+    var s = new Style(t);
+    s.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(13, 7, 13, 7)));
+    s.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(1)));
+    s.Setters.Add(new Setter(FrameworkElement.CursorProperty, System.Windows.Input.Cursors.Hand));
+    var b = new FrameworkElementFactory(typeof(Border), "b");
+    b.SetValue(Border.CornerRadiusProperty, new CornerRadius(10));
+    b.SetValue(Border.BackgroundProperty, new TemplateBindingExtension(Control.BackgroundProperty));
+    b.SetValue(Border.BorderBrushProperty, new TemplateBindingExtension(Control.BorderBrushProperty));
+    b.SetValue(Border.BorderThicknessProperty, new TemplateBindingExtension(Control.BorderThicknessProperty));
+    b.SetValue(Border.PaddingProperty, new TemplateBindingExtension(Control.PaddingProperty));
+    var cp = new FrameworkElementFactory(typeof(ContentPresenter));
+    cp.SetValue(FrameworkElement.HorizontalAlignmentProperty, HorizontalAlignment.Center);
+    cp.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
+    b.AppendChild(cp);
+    var tpl = new ControlTemplate(t) { VisualTree = b };
+    var hov = new Trigger { Property = UIElement.IsMouseOverProperty, Value = true }; hov.Setters.Add(new Setter(UIElement.OpacityProperty, 0.78, "b"));
+    tpl.Triggers.Add(hov);
+    s.Setters.Add(new Setter(Control.TemplateProperty, tpl));
+    return s;
+  }
+  public static void Tint(Control c, Color bg, Color fg, Color border) { c.Background = new SolidColorBrush(bg); c.Foreground = new SolidColorBrush(fg); c.BorderBrush = new SolidColorBrush(border); }
+  static Style Input(Type t) {
+    var s = new Style(t);
+    s.Setters.Add(new Setter(Control.BackgroundProperty, Brushes.White));
+    s.Setters.Add(new Setter(Control.BorderBrushProperty, new SolidColorBrush(Color.FromRgb(214, 222, 233))));
+    s.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(1)));
+    s.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(10, 7, 10, 7)));
+    var bd = new FrameworkElementFactory(typeof(Border), "bd");
+    bd.SetValue(Border.CornerRadiusProperty, new CornerRadius(10));
+    bd.SetValue(Border.BackgroundProperty, new TemplateBindingExtension(Control.BackgroundProperty));
+    bd.SetValue(Border.BorderBrushProperty, new TemplateBindingExtension(Control.BorderBrushProperty));
+    bd.SetValue(Border.BorderThicknessProperty, new TemplateBindingExtension(Control.BorderThicknessProperty));
+    bd.SetValue(Border.PaddingProperty, new TemplateBindingExtension(Control.PaddingProperty));
+    var sv = new FrameworkElementFactory(typeof(ScrollViewer), "PART_ContentHost");
+    sv.SetValue(UIElement.FocusableProperty, false);
+    sv.SetValue(ScrollViewer.HorizontalScrollBarVisibilityProperty, ScrollBarVisibility.Hidden);
+    sv.SetValue(ScrollViewer.VerticalScrollBarVisibilityProperty, ScrollBarVisibility.Hidden);
+    bd.AppendChild(sv);
+    var tpl = new ControlTemplate(t) { VisualTree = bd };
+    var foc = new Trigger { Property = UIElement.IsKeyboardFocusWithinProperty, Value = true }; foc.Setters.Add(new Setter(Border.BorderBrushProperty, Accent, "bd"));
+    tpl.Triggers.Add(foc);
+    s.Setters.Add(new Setter(Control.TemplateProperty, tpl)); return s;
+  }
   static Style Switch() {
     var s = new Style(typeof(CheckBox));
     s.Setters.Add(new Setter(FrameworkElement.CursorProperty, System.Windows.Input.Cursors.Hand));
-    s.Setters.Add(new Setter(Control.ForegroundProperty, new SolidColorBrush(Color.FromRgb(31, 41, 55))));
+    s.Setters.Add(new Setter(Control.ForegroundProperty, new SolidColorBrush(Color.FromRgb(30, 41, 59))));
     var root = new FrameworkElementFactory(typeof(StackPanel)); root.SetValue(StackPanel.OrientationProperty, Orientation.Horizontal); root.SetValue(Panel.BackgroundProperty, Brushes.Transparent);
     var track = new FrameworkElementFactory(typeof(Border), "track");
     track.SetValue(FrameworkElement.WidthProperty, 42.0); track.SetValue(FrameworkElement.HeightProperty, 22.0); track.SetValue(Border.CornerRadiusProperty, new CornerRadius(11));
-    track.SetValue(Border.BackgroundProperty, new SolidColorBrush(Color.FromRgb(203, 213, 225))); track.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
+    track.SetValue(Border.BackgroundProperty, new SolidColorBrush(Color.FromRgb(214, 222, 233))); track.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
     var thumb = new FrameworkElementFactory(typeof(System.Windows.Shapes.Ellipse), "thumb");
     thumb.SetValue(FrameworkElement.WidthProperty, 16.0); thumb.SetValue(FrameworkElement.HeightProperty, 16.0); thumb.SetValue(System.Windows.Shapes.Shape.FillProperty, Brushes.White);
     thumb.SetValue(FrameworkElement.MarginProperty, new Thickness(3)); thumb.SetValue(FrameworkElement.HorizontalAlignmentProperty, HorizontalAlignment.Left);
@@ -63,7 +109,9 @@ public static class Theme {
   }
   public static void Apply(Application app) {
     app.Resources[typeof(CheckBox)] = Switch();
-    app.Resources[typeof(Button)] = Make(typeof(Button), Color.FromRgb(37, 99, 235));
+    app.Resources[typeof(TextBox)] = Input(typeof(TextBox));
+    app.Resources[typeof(PasswordBox)] = Input(typeof(PasswordBox));
+    app.Resources[typeof(Button)] = Make(typeof(Button), Color.FromRgb(88, 128, 196));
     app.Resources[typeof(ToggleButton)] = Make(typeof(ToggleButton), Color.FromRgb(22, 163, 74), Color.FromRgb(220, 38, 38));
   }
 }
@@ -236,29 +284,52 @@ public static class Program {
 public class MainWin : Window {
   Config C; Func<UIElement>? cur; readonly List<Rule> opened = new(); List<(string N, string E)>? inst; ContentControl host = new(); TextBlock status = new(); DispatcherTimer? tmr;
   public MainWin(Config c) {
-    C = c; Title = "DeviceGuard – מנהל חסימות"; Width = 1050; Height = 720; FlowDirection = FlowDirection.RightToLeft; FontSize = 14; Background = new SolidColorBrush(Color.FromRgb(243, 244, 246)); FontFamily = new FontFamily("Segoe UI");
-    var tg = new ToggleButton { IsChecked = C.Master, Padding = new Thickness(14, 6, 14, 6), Margin = new Thickness(0, 0, 8, 0) };
-    void Lbl() => tg.Content = tg.IsChecked == true ? Theme.IconText("\uE72E", "החסימות פעילות – לחץ להשבתה") : Theme.IconText("\uE785", "החסימות מושבתות – לחץ להפעלה");
+    C = c; Title = "DeviceGuard – מנהל חסימות"; Width = 1050; Height = 720; FlowDirection = FlowDirection.RightToLeft; FontSize = 14; Background = new SolidColorBrush(Color.FromRgb(248, 250, 252)); FontFamily = new FontFamily("Segoe UI"); Foreground = new SolidColorBrush(Color.FromRgb(30, 41, 59));
+    var tg = new ToggleButton { IsChecked = C.Master, Padding = new Thickness(14, 6, 14, 6), Margin = new Thickness(0, 0, 8, 0), Style = Theme.Soft(typeof(ToggleButton)) };
+    void Lbl() {
+      bool on = tg.IsChecked == true; var fg = on ? Color.FromRgb(21, 128, 61) : Color.FromRgb(185, 28, 28);
+      Theme.Tint(tg, on ? Color.FromRgb(240, 250, 244) : Color.FromRgb(254, 242, 242), fg, on ? Color.FromRgb(187, 229, 203) : Color.FromRgb(245, 198, 198));
+      tg.Content = on ? Theme.IconText("\uE72E", "החסימות פעילות – לחץ להשבתה", new SolidColorBrush(fg)) : Theme.IconText("\uE785", "החסימות מושבתות – לחץ להפעלה", new SolidColorBrush(fg));
+    }
     Lbl(); tg.Click += async (s, e) => { C.Master = tg.IsChecked == true; Lbl(); await Do(); };
     var ap = Btn("החל שינויים", () => { }, "\uE73E"); ap.Click += async (s, e) => await Do();
     var un = Btn("פתיחה זמנית (30 דק׳)", () => { }, "\uE785");
+    var softFg = Color.FromRgb(52, 90, 158); var softBr = new SolidColorBrush(softFg);
+    foreach (var (sb, sg, st) in new[] { (ap, "\uE73E", "החל שינויים"), (un, "\uE785", "פתיחה זמנית (30 דק׳)") }) { sb.Style = Theme.Soft(typeof(Button)); Theme.Tint(sb, Color.FromRgb(238, 243, 252), softFg, Color.FromRgb(206, 220, 242)); sb.Content = Theme.IconText(sg, st, softBr); }
     un.Click += async (s, e) => {
       var k = Ask("קוד ברירת מחדל"); if (k == null) return; if (!Config.Check(k, C.DefaultCode)) { MessageBox.Show(C.DefaultCode == null ? "לא הוגדר קוד ברירת מחדל (חלון 1)" : "קוד שגוי"); return; }
       IsEnabled = false; await Task.Run(() => Enforcer.Revert(C)); C.Save(); IsEnabled = true;
       tmr?.Stop(); tmr = new DispatcherTimer { Interval = TimeSpan.FromMinutes(30) }; tmr.Tick += async (a, b) => { tmr.Stop(); await Do(); }; tmr.Start(); status.Text = "החסימות פתוחות זמנית";
     };
     var top = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0), Background = Brushes.White };
-    top.Children.Add(tg); top.Children.Add(ap); top.Children.Add(un); top.Children.Add(SearchBox()); top.Children.Add(status); foreach (FrameworkElement ch in top.Children) { ch.Margin = new Thickness(8, 10, 0, 10); ch.VerticalAlignment = VerticalAlignment.Center; }
-    var side = new StackPanel { Width = 210, Background = new SolidColorBrush(Color.FromRgb(17, 24, 39)) };
+    top.Children.Add(tg); top.Children.Add(ap); top.Children.Add(un); top.Children.Add(SearchBox()); top.Children.Add(status); status.Foreground = new SolidColorBrush(Color.FromRgb(100, 116, 139)); status.FontSize = 13; foreach (FrameworkElement ch in top.Children) { ch.Margin = new Thickness(8, 10, 0, 10); ch.VerticalAlignment = VerticalAlignment.Center; }
+    var line = new SolidColorBrush(Color.FromRgb(229, 231, 235));
+    var side = new Border { Width = 92, Background = Brushes.White, BorderBrush = line, BorderThickness = new Thickness(0, 0, 1, 0) };
+    var sideSp = new StackPanel(); side.Child = sideSp;
     var pages = new (string, string, Func<UIElement>)[] { ("הגדרות כלליות", "\uE713", P1), ("תוכנות מותקנות", "\uE71D", P2), ("תוכנות ניידות", "\uE8A7", P3), ("סוגי קבצים", "\uE8A5", P4), ("קבצים ותיקיות", "\uE8B7", P5) };
-    var logo = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(18, 22, 18, 14) };
-    logo.Children.Add(Theme.Glyph("\uE72E", 22, Brushes.White)); logo.Children.Add(new TextBlock { Text = "  DeviceGuard", Foreground = Brushes.White, FontSize = 20, FontWeight = FontWeights.Bold });
-    side.Children.Add(logo);
-    var nav = new List<Button>();
-    foreach (var (n, g, f) in pages) { var b = new Button { Content = Theme.IconText(g, n), Padding = new Thickness(14, 13, 14, 13), Margin = new Thickness(10, 4, 10, 0), Background = Brushes.Transparent, FontSize = 15, HorizontalContentAlignment = HorizontalAlignment.Left }; nav.Add(b); b.Click += (s, e) => { foreach (var x in nav) x.Background = Brushes.Transparent; b.Background = Theme.Accent; cur = f; host.Content = f(); }; side.Children.Add(b); }
-    nav[0].Background = Theme.Accent;
-    var root = new DockPanel(); DockPanel.SetDock(top, Dock.Top); DockPanel.SetDock(side, Dock.Left); // ב-RTL: מופיע מימין
-    root.Children.Add(top); root.Children.Add(side); root.Children.Add(host); Content = root; host.Content = P1(); Closing += (s, e) => { foreach (var r in opened) if (C.Master && r.On) Enforcer.Relock(r); };
+    sideSp.Children.Add(new Border { Width = 42, Height = 42, CornerRadius = new CornerRadius(13), Background = Theme.SideAccent, Margin = new Thickness(0, 20, 0, 18), HorizontalAlignment = HorizontalAlignment.Center, Child = Theme.Glyph("\uE72E", 21, Brushes.White) });
+    int selIdx = 0; var paints = new List<Action>();
+    var mute = new SolidColorBrush(Color.FromRgb(107, 114, 128)); var selBg = new SolidColorBrush(Color.FromRgb(239, 246, 255)); var hoverBg = new SolidColorBrush(Color.FromRgb(243, 244, 246));
+    for (int i = 0; i < pages.Length; i++) {
+      int k = i; var (n, g, f) = pages[i];
+      var ic = Theme.Glyph(g, 20, mute);
+      var tx = new TextBlock { Text = n, FontSize = 11, FontWeight = FontWeights.SemiBold, Foreground = mute, TextAlignment = TextAlignment.Center, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 6, 0, 0) };
+      var col = new StackPanel { HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center }; col.Children.Add(ic); col.Children.Add(tx);
+      var item = new Border { CornerRadius = new CornerRadius(12), Padding = new Thickness(4, 10, 4, 10), Margin = new Thickness(8, 2, 8, 2), Background = Brushes.Transparent, Child = col };
+      var bar = new Border { Width = 3, CornerRadius = new CornerRadius(2), Background = Theme.SideAccent, HorizontalAlignment = HorizontalAlignment.Left, Margin = new Thickness(0, 14, 0, 14), Visibility = Visibility.Collapsed };
+      var cell = new Grid { Background = Brushes.Transparent, Cursor = System.Windows.Input.Cursors.Hand }; cell.Children.Add(item); cell.Children.Add(bar);
+      void Paint() { bool sel = selIdx == k; item.Background = sel ? selBg : Brushes.Transparent; ic.Foreground = tx.Foreground = sel ? Theme.SideAccent : mute; bar.Visibility = sel ? Visibility.Visible : Visibility.Collapsed; }
+      paints.Add(Paint);
+      cell.MouseEnter += (s, e) => { if (selIdx != k) item.Background = hoverBg; };
+      cell.MouseLeave += (s, e) => Paint();
+      cell.MouseLeftButtonUp += (s, e) => { selIdx = k; foreach (var pt in paints) pt(); cur = f; host.Content = f(); };
+      sideSp.Children.Add(cell);
+    }
+    foreach (var pt in paints) pt();
+    PreviewKeyDown += (s, e) => { if (e.Key == System.Windows.Input.Key.F && System.Windows.Input.Keyboard.Modifiers == System.Windows.Input.ModifierKeys.Control) { sbox?.Focus(); sbox?.SelectAll(); e.Handled = true; } };
+    var topBar = new Border { Child = top, Background = Brushes.White, BorderBrush = line, BorderThickness = new Thickness(0, 0, 0, 1) };
+    var root = new DockPanel(); DockPanel.SetDock(topBar, Dock.Top); DockPanel.SetDock(side, Dock.Left); // ב-RTL: מופיע מימין
+    root.Children.Add(topBar); root.Children.Add(side); root.Children.Add(host); Content = root; host.Content = P1(); Closing += (s, e) => { foreach (var r in opened) if (C.Master && r.On) Enforcer.Relock(r); };
   }
   async Task Do() {
     if (C.Master && C.DefaultCode == null && C.All().Any(r => r.On && r.Mode == Mode.Code && r.OwnCode == null)) { MessageBox.Show("יש חסימות בקוד שאין להן קוד. הגדר קוד ברירת מחדל (חלון 1) או קוד נפרד לכל חסימה."); return; }
@@ -272,7 +343,7 @@ public class MainWin : Window {
 
   // ---------- דיאלוגים ----------
   public static string? Ask(string title, bool confirm = false) {
-    var w = new Window { Title = title, SizeToContent = SizeToContent.WidthAndHeight, WindowStartupLocation = WindowStartupLocation.CenterScreen, FlowDirection = FlowDirection.RightToLeft, ResizeMode = ResizeMode.NoResize, Topmost = true };
+    var w = new Window { Title = title, SizeToContent = SizeToContent.WidthAndHeight, WindowStartupLocation = WindowStartupLocation.CenterScreen, FlowDirection = FlowDirection.RightToLeft, ResizeMode = ResizeMode.NoResize, Topmost = true, Background = new SolidColorBrush(Color.FromRgb(248, 250, 252)), FontFamily = new FontFamily("Segoe UI"), FontSize = 14 };
     var sp = new StackPanel { Margin = new Thickness(16) }; var a = new PasswordBox { Width = 240, Margin = new Thickness(0, 4, 0, 8) }; var b = new PasswordBox { Width = 240, Margin = new Thickness(0, 4, 0, 8) };
     sp.Children.Add(new TextBlock { Text = title }); sp.Children.Add(a);
     if (confirm) { sp.Children.Add(new TextBlock { Text = "אימות הקוד" }); sp.Children.Add(b); }
@@ -281,7 +352,7 @@ public class MainWin : Window {
     sp.Children.Add(ok); w.Content = sp; w.ShowDialog(); return res;
   }
   public static List<string>? Pick(string title, IEnumerable<(string L, string V)> opts, IEnumerable<string> sel) {
-    var w = new Window { Title = title, Width = 420, Height = 520, WindowStartupLocation = WindowStartupLocation.CenterScreen, FlowDirection = FlowDirection.RightToLeft };
+    var w = new Window { Title = title, Width = 420, Height = 520, WindowStartupLocation = WindowStartupLocation.CenterScreen, FlowDirection = FlowDirection.RightToLeft, Background = new SolidColorBrush(Color.FromRgb(248, 250, 252)), FontFamily = new FontFamily("Segoe UI"), FontSize = 14 };
     var lb = new StackPanel(); var boxes = opts.Select(o => new CheckBox { Content = o.L, Tag = o.V, IsChecked = sel.Contains(o.V), Margin = new Thickness(6) }).ToList(); boxes.ForEach(x => lb.Children.Add(x));
     List<string>? res = null; var ok = new Button { Content = "אישור", IsDefault = true, Margin = new Thickness(8), Padding = new Thickness(10, 4, 10, 4) };
     ok.Click += (s, e) => { res = boxes.Where(x => x.IsChecked == true).Select(x => (string)x.Tag).ToList(); w.Close(); };
@@ -290,11 +361,11 @@ public class MainWin : Window {
 
   // ---------- רכיבי UI ----------
   static UIElement Segment(string[] labels, int sel, Action<int> changed) {
-    var outer = new Border { Background = new SolidColorBrush(Color.FromRgb(229, 231, 235)), CornerRadius = new CornerRadius(8), Padding = new Thickness(2), Margin = new Thickness(0, 4, 12, 4), VerticalAlignment = VerticalAlignment.Center };
+    var outer = new Border { Background = new SolidColorBrush(Color.FromRgb(238, 242, 247)), CornerRadius = new CornerRadius(10), Padding = new Thickness(3), Margin = new Thickness(0, 4, 12, 4), VerticalAlignment = VerticalAlignment.Center };
     var sp = new StackPanel { Orientation = Orientation.Horizontal }; var items = new List<Border>();
-    void Paint() { for (int i = 0; i < items.Count; i++) { items[i].Background = i == sel ? Brushes.White : Brushes.Transparent; ((TextBlock)items[i].Child).Foreground = i == sel ? Brushes.Black : Brushes.Gray; } }
+    void Paint() { for (int i = 0; i < items.Count; i++) { items[i].Background = i == sel ? Brushes.White : Brushes.Transparent; ((TextBlock)items[i].Child).Foreground = new SolidColorBrush(i == sel ? Color.FromRgb(30, 41, 59) : Color.FromRgb(100, 116, 139)); } }
     for (int i = 0; i < labels.Length; i++) {
-      int k = i; var bd = new Border { CornerRadius = new CornerRadius(6), Padding = new Thickness(12, 5, 12, 5), Cursor = System.Windows.Input.Cursors.Hand, Background = Brushes.Transparent, Child = new TextBlock { Text = labels[i], FontSize = 13 } };
+      int k = i; var bd = new Border { CornerRadius = new CornerRadius(8), Padding = new Thickness(12, 5, 12, 5), Cursor = System.Windows.Input.Cursors.Hand, Background = Brushes.Transparent, Child = new TextBlock { Text = labels[i], FontSize = 13 } };
       bd.MouseLeftButtonUp += (s, e) => { sel = k; Paint(); changed(k); }; items.Add(bd); sp.Children.Add(bd);
     }
     Paint(); outer.Child = sp; return outer;
@@ -313,13 +384,13 @@ public class MainWin : Window {
     hid.Click += (s, e) => { r.Hidden = hid.IsChecked == true; C.Save(); };
     p.Children.Add(on); p.Children.Add(seg); p.Children.Add(sep); p.Children.Add(hid); if (canOpen) { ob = Btn("פתח בקוד", () => OpenWithCode(r), "\uE785"); ob.Margin = m12; p.Children.Add(ob); } V();
     if (wl != null) { var b = Btn("רשימה לבנה", () => { var x = Pick("רשימה לבנה – " + r.Name, wl(), r.White); if (x != null) { r.White = x; C.Save(); } }, "\uE8FD"); b.Margin = m12; p.Children.Add(b); }
-    if (remove != null) { var d = new Button { Content = Theme.Glyph("\uE74D", 15, Brushes.White), Background = new SolidColorBrush(Color.FromRgb(220, 38, 38)), Padding = new Thickness(10, 7, 10, 7), Margin = new Thickness(0, 4, 0, 4) }; d.Click += (s, e) => remove(); p.Children.Add(d); }
-    return new Border { Child = p, Background = Brushes.White, CornerRadius = new CornerRadius(12), Padding = new Thickness(14, 10, 14, 10), Margin = new Thickness(0, 0, 0, 10), Effect = new System.Windows.Media.Effects.DropShadowEffect { BlurRadius = 10, ShadowDepth = 1, Opacity = 0.07 } };
+    if (remove != null) { var d = new Button { Content = Theme.Glyph("\uE74D", 15, new SolidColorBrush(Color.FromRgb(185, 28, 28))), Style = Theme.Soft(typeof(Button)), Padding = new Thickness(10, 7, 10, 7), Margin = new Thickness(0, 4, 0, 4) }; Theme.Tint(d, Color.FromRgb(254, 242, 242), Color.FromRgb(185, 28, 28), Color.FromRgb(245, 198, 198)); d.Click += (s, e) => remove(); p.Children.Add(d); }
+    return new Border { Child = p, Background = Brushes.White, CornerRadius = new CornerRadius(14), Padding = new Thickness(16, 12, 16, 12), Margin = new Thickness(0, 0, 0, 12), BorderBrush = new SolidColorBrush(Color.FromRgb(230, 235, 242)), BorderThickness = new Thickness(1), Effect = new System.Windows.Media.Effects.DropShadowEffect { BlurRadius = 16, ShadowDepth = 2, Opacity = 0.05, Color = Color.FromRgb(30, 41, 59) } };
   }
   static ScrollViewer Page(string title, string glyph, params UIElement[] items) {
     var sp = new StackPanel { Margin = new Thickness(28, 22, 28, 22) };
     var h = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 18) };
-    h.Children.Add(Theme.Badge(glyph)); h.Children.Add(new TextBlock { Text = title, FontSize = 24, FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(Color.FromRgb(17, 24, 39)), VerticalAlignment = VerticalAlignment.Center });
+    h.Children.Add(Theme.Badge(glyph)); h.Children.Add(new TextBlock { Text = title, FontSize = 22, FontWeight = FontWeights.SemiBold, Foreground = new SolidColorBrush(Color.FromRgb(30, 41, 59)), VerticalAlignment = VerticalAlignment.Center });
     sp.Children.Add(h); foreach (var i in items) sp.Children.Add(i); return new ScrollViewer { Content = sp, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
   }
   static Button Btn(string t, Action a, string? glyph = null) {
@@ -337,12 +408,23 @@ public class MainWin : Window {
     if (!File.Exists(g)) { MessageBox.Show("יש ללחוץ 'החל שינויים' קודם"); return; }
     Process.Start(new ProcessStartInfo(g, "--open " + r.Id) { UseShellExecute = false });
   }
+  TextBox? sbox;
   UIElement SearchBox() {
-    var sp = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
-    var tb = new TextBox { Width = 220, Padding = new Thickness(8, 6, 8, 6), VerticalContentAlignment = VerticalAlignment.Center, ToolTip = "חיפוש בתוכנה" };
-    sp.Children.Add(new Border { Background = new SolidColorBrush(Color.FromRgb(229, 231, 235)), CornerRadius = new CornerRadius(8), Padding = new Thickness(8, 0, 8, 0), Child = Theme.Glyph("\uE721", 15, Brushes.Gray) }); sp.Children.Add(tb);
-    tb.TextChanged += (s, e) => { var q = tb.Text.Trim(); host.Content = q.Length == 0 ? (cur ?? (Func<UIElement>)P1)() : Search(q); };
-    return sp;
+    var tb = new TextBox { Width = 240, BorderThickness = new Thickness(0), Background = Brushes.Transparent, Padding = new Thickness(0, 9, 0, 9), VerticalContentAlignment = VerticalAlignment.Center, FontSize = 13.5, ToolTip = "חיפוש בתוכנה (Ctrl+F)" }; sbox = tb;
+    var gray = new SolidColorBrush(Color.FromRgb(156, 163, 175));
+    var ph = new TextBlock { Text = "חיפוש הגדרה... (Ctrl+F)", Foreground = gray, FontSize = 13.5, IsHitTestVisible = false, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(5, 0, 5, 0) };
+    var clr = Theme.Glyph("\uE711", 11, gray); clr.Cursor = System.Windows.Input.Cursors.Hand; clr.Visibility = Visibility.Collapsed; clr.Margin = new Thickness(6, 0, 0, 0); clr.Background = Brushes.Transparent;
+    var ico = Theme.Glyph("\uE721", 14, gray); ico.Margin = new Thickness(0, 0, 8, 0);
+    var g = new Grid(); g.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); g.ColumnDefinitions.Add(new ColumnDefinition()); g.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+    Grid.SetColumn(ico, 0); Grid.SetColumn(tb, 1); Grid.SetColumn(ph, 1); Grid.SetColumn(clr, 2);
+    g.Children.Add(ico); g.Children.Add(tb); g.Children.Add(ph); g.Children.Add(clr);
+    var edge = new SolidColorBrush(Color.FromRgb(229, 231, 235));
+    var box = new Border { Background = new SolidColorBrush(Color.FromRgb(249, 250, 251)), BorderBrush = edge, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(10), Padding = new Thickness(12, 0, 12, 0), Child = g };
+    tb.GotKeyboardFocus += (s, e) => { box.BorderBrush = Theme.Accent; box.Background = Brushes.White; };
+    tb.LostKeyboardFocus += (s, e) => { box.BorderBrush = edge; box.Background = new SolidColorBrush(Color.FromRgb(249, 250, 251)); };
+    clr.MouseLeftButtonUp += (s, e) => { tb.Clear(); tb.Focus(); };
+    tb.TextChanged += (s, e) => { var q = tb.Text.Trim(); ph.Visibility = tb.Text.Length == 0 ? Visibility.Visible : Visibility.Collapsed; clr.Visibility = tb.Text.Length == 0 ? Visibility.Collapsed : Visibility.Visible; host.Content = q.Length == 0 ? (cur ?? (Func<UIElement>)P1)() : Search(q); };
+    return box;
   }
   UIElement Search(string q) {
     bool M(string t) => t.Contains(q, StringComparison.CurrentCultureIgnoreCase);
@@ -454,7 +536,7 @@ public class MainWin : Window {
       foreach (var p in Process.GetProcesses()) { try { var f = p.MainModule?.FileName; if (f != null && !f.StartsWith(Environment.GetFolderPath(Environment.SpecialFolder.Windows), StringComparison.OrdinalIgnoreCase) && !f.StartsWith(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), StringComparison.OrdinalIgnoreCase) && !f.StartsWith(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), StringComparison.OrdinalIgnoreCase) && !l.Contains(f)) l.Add(f); } catch { } }
       return l.Select(f => (System.IO.Path.GetFileName(f) + "  —  " + f, f));
     };
-    var drop = new Border { BorderBrush = Brushes.Gray, BorderThickness = new Thickness(2), Height = 90, Margin = new Thickness(0, 12, 0, 0), AllowDrop = true, Background = Brushes.WhiteSmoke, Child = new TextBlock { Text = "גרור לכאן תוכנה ניידת כדי להוסיפה לרשימה הלבנה", HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center } };
+    var drop = new Border { BorderBrush = new SolidColorBrush(Color.FromRgb(203, 213, 225)), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(14), Height = 90, Margin = new Thickness(0, 12, 0, 0), AllowDrop = true, Background = new SolidColorBrush(Color.FromRgb(252, 253, 254)), Child = new TextBlock { Text = "גרור לכאן תוכנה ניידת כדי להוסיפה לרשימה הלבנה", HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center } };
     drop.Drop += (s, e) => { if (e.Data.GetData(DataFormats.FileDrop) is string[] fs) { foreach (var f in fs) if (!C.Portable.White.Contains(f)) C.Portable.White.Add(f); C.Save(); MessageBox.Show($"נוספו {fs.Length} פריטים"); } };
     var warn = new TextBlock { Text = "חסימת ניידות חוסמת הרצה מכל מקום מחוץ ל-Windows ו-Program Files (כולל אפליקציות שמותקנות בתיקיית המשתמש). חסימה זו היא גמורה בלבד.", TextWrapping = TextWrapping.Wrap, Foreground = Brushes.Gray, Margin = new Thickness(0, 8, 0, 0) };
     return Page("תוכנות ניידות", "\uE8A7", Row(C.Portable, opts, false, null, "\uE8A7"), drop, warn);

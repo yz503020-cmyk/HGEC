@@ -1,6 +1,15 @@
-using System.Diagnostics; using System.IO; using System.Text.Json; using System.Windows; using System.Windows.Controls; using System.Windows.Controls.Primitives;
+using System.Collections.Concurrent; using System.Diagnostics; using System.IO; using System.Text.Json; using System.Threading; using System.Threading.Tasks; using System.Windows; using System.Windows.Controls; using System.Windows.Controls.Primitives;
 using System.Windows.Interop; using System.Windows.Media; using System.Windows.Media.Imaging; using System.Windows.Threading; using Microsoft.Win32;
 namespace DG;
+// מריץ את Enforcer.Apply על תהליכון STA ייעודי, כדי שיצירת קיצורי דרך (COM) תהיה אמינה בוודאות
+public class StaTaskScheduler : TaskScheduler, IDisposable {
+  readonly BlockingCollection<Task> q = new(); readonly Thread t;
+  public StaTaskScheduler() { t = new Thread(() => { foreach (var task in q.GetConsumingEnumerable()) TryExecuteTask(task); }); t.SetApartmentState(ApartmentState.STA); t.IsBackground = true; t.Start(); }
+  protected override IEnumerable<Task>? GetScheduledTasks() => null;
+  protected override void QueueTask(Task task) => q.Add(task);
+  protected override bool TryExecuteTaskInline(Task task, bool prev) => false;
+  public void Dispose() => q.CompleteAdding();
+}
 public static class Theme {
   public static readonly Brush Accent = new SolidColorBrush(Color.FromRgb(37, 99, 235));
   static Style Make(Type t, Color bg, Color? offBg = null) {
@@ -65,6 +74,8 @@ public static class Program {
   static readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool> tokens = new();
   static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (int N, DateTime Until)> fails = new();
   static DateTime authLock = DateTime.MinValue; static int authFails;
+  static readonly ConcurrentDictionary<int, bool> authPid = new();   // תהליכים שכבר עברו קוד דרך IFEO – לא לבקש מהם קוד שוב
+  static readonly ConcurrentDictionary<int, bool> promptedPid = new();   // תהליכים שכבר קיבלו חלון קוד תגובתי – לא לפתוח עוד אחד לאותו תהליך
   class GuardService : System.ServiceProcess.ServiceBase {
     public GuardService() { ServiceName = "DeviceGuard"; }
     protected override void OnStart(string[] a) { new Thread(Watch) { IsBackground = true }.Start(); }
@@ -105,6 +116,7 @@ public static class Program {
               fails[p[1]] = n >= 5 ? (0, DateTime.UtcNow.AddSeconds(60)) : (n, DateTime.MinValue); return "BAD";
             }
             fails.TryRemove(p[1], out _); Enforcer.Unlock(r); lease[p[1]] = DateTime.UtcNow; return "OK"; }
+        case "AUTHPID": if (p.Length > 1 && int.TryParse(p[1], out var apid)) authPid[apid] = true; return "OK";
         case "PING": if (lease.ContainsKey(p[1])) lease[p[1]] = DateTime.UtcNow; return "OK";
         case "RELOCK": {
             if (lease.TryRemove(p[1], out _)) { var c = Config.Load(); var r = c.Find(p[1]); if (r != null && c.Master && r.On) Enforcer.Relock(r); }
@@ -137,28 +149,47 @@ public static class Program {
     var q = new System.Collections.Concurrent.ConcurrentQueue<(string P, int T, DateTime At)>();
     var fsw = new List<FileSystemWatcher>();
     void Add(string p) { if (curMap.ContainsKey(System.IO.Path.GetExtension(p).TrimStart('.').ToLowerInvariant())) q.Enqueue((p, 0, DateTime.UtcNow.AddSeconds(2))); }
-    foreach (var dr in DriveInfo.GetDrives().Where(x => x.DriveType == DriveType.Fixed && x.IsReady)) {
+    var watched = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    void Watch1(string root) {
+      if (!watched.Add(root)) return;
       try {
-        var w = new FileSystemWatcher(dr.RootDirectory.FullName) { IncludeSubdirectories = true, NotifyFilter = NotifyFilters.FileName, InternalBufferSize = 65536 };
+        var w = new FileSystemWatcher(root) { IncludeSubdirectories = true, NotifyFilter = NotifyFilters.FileName, InternalBufferSize = 65536 };
         w.Created += (s, e) => Add(e.FullPath); w.Renamed += (s, e) => Add(e.FullPath); w.EnableRaisingEvents = true; fsw.Add(w);
       } catch { }
     }
+    foreach (var dr in DriveInfo.GetDrives().Where(x => (x.DriveType == DriveType.Fixed || x.DriveType == DriveType.Removable) && x.IsReady)) Watch1(dr.RootDirectory.FullName);
     var cfg = System.IO.Path.Combine(Config.Dir, "config.json"); var stamp = DateTime.MinValue; var c = new Config(); var kill = new HashSet<string>(StringComparer.OrdinalIgnoreCase); var lastScan = DateTime.MinValue;
+    var codeKill = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);   // שם תהליך → מזהה חוק, לתוכנות בחסימת קוד (רשת ביטחון לתוכנות שה-IFEO לא תופס, כמו אפליקציות Store)
+    var gateExe = System.IO.Path.Combine(Config.Dir, "DeviceGuardWatch.exe");
     while (true) {
       try {
+        foreach (var dr in DriveInfo.GetDrives().Where(x => (x.DriveType == DriveType.Fixed || x.DriveType == DriveType.Removable) && x.IsReady)) {   // כונן חיצוני חדש שחובר – להתחיל לעקוב אחריו ולסרוק מיד
+          if (watched.Contains(dr.RootDirectory.FullName)) continue;
+          Watch1(dr.RootDirectory.FullName);
+          if (curMap.Count > 0) Enforcer.ScanNew(curMap);
+        }
         var ts = File.GetLastWriteTimeUtc(cfg);
         if (ts != stamp) {   // טוען מחדש רק כשהקובץ השתנה
           stamp = ts; c = Config.Load(); kill.Clear();
-          if (c.Master) foreach (var r in c.Programs.Where(r => r.On && r.Mode == Mode.Full)) {
+          codeKill.Clear();
+          if (c.Master) foreach (var r in c.Programs.Where(r => r.On)) {
             var n = System.IO.Path.GetFileNameWithoutExtension(r.Path);
             if (n.Equals("DeviceGuard", StringComparison.OrdinalIgnoreCase) || n.Equals("DeviceGuardWatch", StringComparison.OrdinalIgnoreCase)) continue;
-            kill.Add(n); if (alias.TryGetValue(n, out var al)) foreach (var x in al) kill.Add(x);
+            if (r.Mode == Mode.Full) { kill.Add(n); if (alias.TryGetValue(n, out var al)) foreach (var x in al) kill.Add(x); }
+            else { codeKill[n] = r.Id; if (alias.TryGetValue(n, out var al)) foreach (var x in al) codeKill[x] = r.Id; }
           }
           curMap = c.Master ? Enforcer.ExtMap(c) : new();
         }
         foreach (var kv in lease.ToArray()) if ((DateTime.UtcNow - kv.Value).TotalSeconds > 15 && lease.TryRemove(kv.Key, out _)) { var lr = c.Find(kv.Key); if (lr != null && c.Master && lr.On) Enforcer.Relock(lr); }
         if (c.Master) {
-          if (kill.Count > 0) foreach (var pr in Process.GetProcesses()) { try { if (kill.Contains(pr.ProcessName)) pr.Kill(); } catch { } finally { pr.Dispose(); } }
+          if (kill.Count > 0 || codeKill.Count > 0) foreach (var pr in Process.GetProcesses()) {
+            try {
+              if (kill.Contains(pr.ProcessName)) { pr.Kill(); continue; }
+              // תוכנה בחסימת קוד שרצה בכל זאת (לא נתפסה מראש ב-IFEO, כמו אפליקציות Store): לבקש קוד מהמשתמש המחובר, אחרת לסגור
+              if (codeKill.TryGetValue(pr.ProcessName, out var ruleId) && !authPid.ContainsKey(pr.Id) && promptedPid.TryAdd(pr.Id, true))
+                UserSession.Launch(gateExe, $"--promptkill {ruleId} {pr.Id}");
+            } catch { } finally { pr.Dispose(); }
+          }
           int cnt = q.Count;
           for (int i = 0; i < cnt && q.TryDequeue(out var it); i++) {
             if (it.At > DateTime.UtcNow) { q.Enqueue(it); continue; }
@@ -167,15 +198,21 @@ public static class Program {
           if (curMap.Count > 0 && (DateTime.UtcNow - lastScan).TotalMinutes >= 10) { lastScan = DateTime.UtcNow; Enforcer.ScanNew(curMap); }
           if ((DateTime.UtcNow - ts).TotalSeconds > 5) Enforcer.Heal(c);
         } else { while (q.TryDequeue(out _)) { } }
+        if (DateTime.UtcNow.Second == 0) {   // ניקוי תקופתי של מזהי תהליכים שכבר לא רצים (כדי שמספר pid לא יישאר מסומן לנצח)
+          foreach (var pid in authPid.Keys.ToArray()) if (!Alive(pid)) authPid.TryRemove(pid, out _);
+          foreach (var pid in promptedPid.Keys.ToArray()) if (!Alive(pid)) promptedPid.TryRemove(pid, out _);
+        }
       } catch { }
       Thread.Sleep(1000);
     }
   }
+  static bool Alive(int pid) { try { Process.GetProcessById(pid); return true; } catch { return false; } }
   [STAThread] public static void Main(string[] args) {
     if (args.Contains("--service")) { System.ServiceProcess.ServiceBase.Run(new GuardService()); return; }
     if (args.Contains("--watch")) { Watch(); return; }
     if (args.Length >= 2 && args[0] == "--gate") { GateMode.RunGate(args); return; }
     if (args.Length == 2 && args[0] == "--open") { GateMode.OpenFlow(args[1]); return; }
+    if (args.Length == 3 && args[0] == "--promptkill") { GateMode.PromptKill(args); return; }
     if (!IsAdmin()) { try { Process.Start(new ProcessStartInfo(Environment.ProcessPath!) { UseShellExecute = true, Verb = "runas" }); } catch { } return; }
     RunUi();
   }
@@ -223,7 +260,15 @@ public class MainWin : Window {
     var root = new DockPanel(); DockPanel.SetDock(top, Dock.Top); DockPanel.SetDock(side, Dock.Left); // ב-RTL: מופיע מימין
     root.Children.Add(top); root.Children.Add(side); root.Children.Add(host); Content = root; host.Content = P1(); Closing += (s, e) => { foreach (var r in opened) if (C.Master && r.On) Enforcer.Relock(r); };
   }
-  async Task Do() { if (C.Master && C.DefaultCode == null && C.All().Any(r => r.On && r.Mode == Mode.Code && r.OwnCode == null)) { MessageBox.Show("יש חסימות בקוד שאין להן קוד. הגדר קוד ברירת מחדל (חלון 1) או קוד נפרד לכל חסימה."); return; } status.Text = "מחיל..."; IsEnabled = false; try { await Task.Run(() => Enforcer.Apply(C)); status.Text = "הוחל ✓"; } catch (Exception x) { status.Text = "שגיאה: " + x.Message; } IsEnabled = true; }
+  async Task Do() {
+    if (C.Master && C.DefaultCode == null && C.All().Any(r => r.On && r.Mode == Mode.Code && r.OwnCode == null)) { MessageBox.Show("יש חסימות בקוד שאין להן קוד. הגדר קוד ברירת מחדל (חלון 1) או קוד נפרד לכל חסימה."); return; }
+    status.Text = "מחיל..."; IsEnabled = false;
+    try {
+      await Task.Factory.StartNew(() => Enforcer.Apply(C), CancellationToken.None, TaskCreationOptions.None, new StaTaskScheduler());
+      status.Text = "הוחל ✓";
+    } catch (Exception x) { status.Text = "שגיאה: " + x.Message; MessageBox.Show("שגיאה בהחלת החסימות: " + x.Message); }
+    IsEnabled = true;
+  }
 
   // ---------- דיאלוגים ----------
   public static string? Ask(string title, bool confirm = false) {
@@ -317,7 +362,11 @@ public class MainWin : Window {
   UIElement P1() {
     var all = new CheckBox { Content = "החסימות יחולו על כל המשתמשים במחשב (אחרת – רק על משתמש זה)", IsChecked = C.AllUsers, Margin = new Thickness(0, 8, 0, 8) }; all.Click += (s, e) => { C.AllUsers = all.IsChecked == true; C.Save(); };
     var code = Btn("הגדר / שנה קוד ברירת מחדל לחסימות", () => { var k = Ask("קוד ברירת מחדל", true); if (k != null) { C.DefaultCode = Config.Hash(k); C.Save(); MessageBox.Show("הקוד נשמר"); } });
-    var net = () => System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces().Where(n => n.OperationalStatus == System.Net.NetworkInformation.OperationalStatus.Up && n.NetworkInterfaceType != System.Net.NetworkInformation.NetworkInterfaceType.Loopback).Select(n => (n.Name, n.Name));
+    var net = () => {
+      var items = System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces().Where(n => n.NetworkInterfaceType != System.Net.NetworkInformation.NetworkInterfaceType.Loopback).Select(n => (n.Name, n.Name)).ToList();
+      items.AddRange(WifiSsids());
+      return items.AsEnumerable();
+    };
     var usb = () => { try { using var s = new System.Management.ManagementObjectSearcher("SELECT Caption FROM Win32_DiskDrive WHERE InterfaceType='USB'"); return s.Get().Cast<System.Management.ManagementBaseObject>().Select(o => ((string)o["Caption"], (string)o["Caption"])).ToList().AsEnumerable(); } catch { return Enumerable.Empty<(string, string)>(); } };
     var exp = Btn("ייצוא הגדרות…", Export); var imp = Btn("ייבוא הגדרות…", Import);
     var un2 = Btn("הסרת שירות ההגנה (בקוד כניסה)", () => {
@@ -348,6 +397,14 @@ public class MainWin : Window {
   }
 
   // ---------- חלון 2 ----------
+    static string RunCmd(string exe, string args) { try { var p = Process.Start(new ProcessStartInfo(exe, args) { CreateNoWindow = true, UseShellExecute = false, RedirectStandardOutput = true })!; var o = p.StandardOutput.ReadToEnd(); p.WaitForExit(); return o; } catch { return ""; } }
+  // שמות רשתות Wi-Fi: גם רשתות שבטווח כרגע וגם רשתות ששמורות במחשב (כדי שאפשר יהיה לבחור אותן לרשימה הלבנה גם אם אינן בטווח כרגע)
+  static IEnumerable<(string, string)> WifiSsids() {
+    var names = new HashSet<string>();
+    foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(RunCmd("netsh", "wlan show networks"), @"SSID\s+\d+\s*:\s*(.+)")) { var n = m.Groups[1].Value.Trim(); if (n.Length > 0) names.Add(n); }
+    foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(RunCmd("netsh", "wlan show profiles"), @"All User Profile\s*:\s*(.+)")) { var n = m.Groups[1].Value.Trim(); if (n.Length > 0) names.Add(n); }
+    return names.Select(n => ("רשת Wi-Fi: " + n, "ssid:" + n));
+  }
   static List<(string N, string E)> Installed() {
     var res = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
     foreach (var (h, v) in new[] { (RegistryHive.LocalMachine, RegistryView.Registry64), (RegistryHive.LocalMachine, RegistryView.Registry32), (RegistryHive.CurrentUser, RegistryView.Default) }) {
@@ -370,11 +427,23 @@ public class MainWin : Window {
     foreach (var (n, f) in new[] { ("Word", "WINWORD.EXE"), ("Excel", "EXCEL.EXE"), ("PowerPoint", "POWERPNT.EXE"), ("Outlook", "OUTLOOK.EXE"), ("Access", "MSACCESS.EXE") }) {
       var p = System.IO.Path.Combine(pf, @"Microsoft Office\root\Office16", f); if (File.Exists(p)) res.TryAdd(p, "Microsoft " + n);
     }
-    return res.Where(x => !x.Key.EndsWith("DeviceGuard.exe", StringComparison.OrdinalIgnoreCase)).Select(x => (x.Value, x.Key)).OrderBy(x => x.Value).ToList();
+    try {   // תפריט התחל: תופס גם תוכנות שהזיהוי לפי רשימת ההתקנות מפספס
+      dynamic sh = Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell")!)!;
+      foreach (var dir in new[] { Environment.GetFolderPath(Environment.SpecialFolder.CommonStartMenu), Environment.GetFolderPath(Environment.SpecialFolder.StartMenu) }) {
+        if (!Directory.Exists(dir)) continue;
+        foreach (var lnk in Directory.EnumerateFiles(dir, "*.lnk", SearchOption.AllDirectories)) {
+          string? target = null; try { dynamic l = sh.CreateShortcut(lnk); target = (string)l.TargetPath; } catch { }
+          if (string.IsNullOrEmpty(target) || !target.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) || !File.Exists(target)) continue;
+          res.TryAdd(target, System.IO.Path.GetFileNameWithoutExtension(lnk));
+        }
+      }
+    } catch { }
+    return res.Where(x => !x.Key.EndsWith("DeviceGuard.exe", StringComparison.OrdinalIgnoreCase) && !x.Key.EndsWith("DeviceGuardWatch.exe", StringComparison.OrdinalIgnoreCase)).Select(x => (x.Value, x.Key)).OrderBy(x => x.Value).ToList();
   }
   UIElement P2() {
     var items = new List<UIElement>();
     foreach (var (n, e) in Installed()) items.Add(ProgRow(n, e));
+    items.Add(new TextBlock { Text = "התוכנה סורקת תוכנות מותקנות ותפריט התחל. יישום שחסר מהרשימה אפשר לחסום ישירות דרך תיקיית הקבצים שלו בחלון 5.", Foreground = Brushes.Gray, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 10, 0, 0) });
     return Page("תוכנות מותקנות", "\uE71D", items.ToArray());
   }
 

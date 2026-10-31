@@ -1,9 +1,10 @@
-using System.Diagnostics; using System.IO; using System.Security.AccessControl; using System.Security.Principal; using System.Text; using Microsoft.Win32;
+using System.Diagnostics; using System.IO; using System.Security.AccessControl; using System.Security.Principal; using System.Text; using System.Threading; using Microsoft.Win32;
 namespace DG;
 public static class Enforcer {
   const string IFEO = @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\";
   const string EXP = @"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer";
   const string SAFER = @"SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers";
+  const string DEVREST = @"SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions";
   static string GateExe => System.IO.Path.Combine(Config.Dir, "DeviceGuardWatch.exe");
   static readonly RegistryView[] Views = { RegistryView.Registry64, RegistryView.Registry32 };
 
@@ -21,16 +22,37 @@ public static class Enforcer {
     var self = Environment.ProcessPath ?? "";
 
     // 1) פעולות PowerShell (לפני חסימת powershell עצמו)
-    if (c.Net.On)
-      foreach (var n in Lines(PS("(Get-NetAdapter | ? Status -eq 'Up').Name")).Where(n => !c.Net.White.Contains(n))) {
+    if (c.Net.On) {
+      var ssidWhite = c.Net.White.Where(w => w.StartsWith("ssid:")).Select(w => w[5..]).ToList();
+      var adapterWhite = c.Net.White.Where(w => !w.StartsWith("ssid:")).ToList();
+      // מתאמי רשת שאינם Wi-Fi (Ethernet וכדומה): נחסמים כולם חוץ מהרשימה הלבנה, כמו קודם
+      foreach (var n in Lines(PS("(Get-NetAdapter | ? { $_.PhysicalMediaType -notlike '*802.11*' -and $_.InterfaceDescription -notmatch 'Wireless|Wi-Fi' }).Name")).Where(n => !adapterWhite.Contains(n))) {
         PS($"Disable-NetAdapter -Name '{n}' -Confirm:$false"); c.Applied.Add("net|" + n);
       }
+      // Wi-Fi: חסימה לפי שם הרשת (SSID). חוסם את כל הרשתות, כולל כאלה שלא היו זמינות בזמן ההחלה, חוץ מהרשימה הלבנה
+      if (Lines(PS("(Get-NetAdapter | ? { $_.PhysicalMediaType -like '*802.11*' -or $_.InterfaceDescription -match 'Wireless|Wi-Fi' }).Name")).Length > 0) {
+        PS("netsh wlan add filter permission=denyall networktype=infrastructure"); c.Applied.Add("wlanfilter|denyall");
+        foreach (var ssid in ssidWhite) { PS($"netsh wlan add filter permission=allow ssid=\"{ssid.Replace("\"", "")}\" networktype=infrastructure"); c.Applied.Add("wlanfilter|allow|" + ssid); }
+      }
+    }
     if (c.Usb.On) {
       foreach (var l in Lines(PS("Get-PnpDevice -PresentOnly | ? InstanceId -like 'USBSTOR*' | % { $_.InstanceId + '|' + $_.FriendlyName }"))) {
         var q = l.Split('|', 2); if (q.Length < 2 || c.Usb.White.Contains(q[1])) continue;
         PS($"Disable-PnpDevice -InstanceId '{q[0]}' -Confirm:$false"); c.Applied.Add("usb|" + q[0]);
       }
       if (c.Usb.White.Count == 0) { using var k = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\USBSTOR", true); k?.SetValue("Start", 4); c.Applied.Add("usbstor"); }
+      // חסימה ברמת המדיניות: חלה גם על התקנים שעדיין לא חוברו למחשב (לא רק מה שמחובר כרגע)
+      using (var k = Registry.LocalMachine.CreateSubKey(DEVREST)) {
+        k.SetValue("DenyRemovableDevices", 1, RegistryValueKind.DWord); c.Applied.Add("devrestrict");
+        if (c.Usb.White.Count > 0) {
+          k.SetValue("AllowDeviceIDs", 1, RegistryValueKind.DWord); k.SetValue("AllowDeviceIDsRetroactive", 1, RegistryValueKind.DWord);
+          using var ak = k.CreateSubKey("AllowDeviceIDs"); int ai = 1;
+          foreach (var l in Lines(PS("Get-PnpDevice -PresentOnly | ? InstanceId -like 'USBSTOR*' | % { $hw = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName DEVPKEY_Device_HardwareIds -ErrorAction SilentlyContinue).Data -join ';'; $_.FriendlyName + '|' + $hw }"))) {
+            var q = l.Split('|', 2); if (q.Length < 2 || !c.Usb.White.Contains(q[0])) continue;
+            foreach (var hw in q[1].Split(';', StringSplitOptions.RemoveEmptyEntries)) ak.SetValue((ai++).ToString(), hw);
+          }
+        }
+      }
     }
     // 2) הגדרות מחשב
     var s = c.Settings;
@@ -67,7 +89,7 @@ public static class Enforcer {
     void M(Rule r, string[] e) { if (r.On) foreach (var x in e) map[x] = r; }
     M(c.Movies, Config.Vid); M(c.Songs, Config.Aud); M(c.Images, Config.Img);
     foreach (var r in c.Exts.Where(r => r.On)) map[r.Path.TrimStart('.').ToLowerInvariant()] = r;
-    if (map.Count > 0) foreach (var d in DriveInfo.GetDrives().Where(d => d.DriveType == DriveType.Fixed && d.IsReady)) Scan(d.RootDirectory.FullName, map, c);
+    if (map.Count > 0) foreach (var d in DriveInfo.GetDrives().Where(d => (d.DriveType == DriveType.Fixed || d.DriveType == DriveType.Removable) && d.IsReady)) Scan(d.RootDirectory.FullName, map, c);
     if (c.Applied.Any(x => x.StartsWith("hid|"))) {   // מונע הצגת קבצים מוסתרים בסייר הקבצים
       try {
         using (var k = Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")) { k.SetValue("Hidden", 2); k.SetValue("ShowSuperHidden", 0); }
@@ -79,7 +101,14 @@ public static class Enforcer {
     c.Save();
   }
 
-  static bool Protected(string p) => p.StartsWith(Config.Dir, StringComparison.OrdinalIgnoreCase) || p.StartsWith(AppContext.BaseDirectory, StringComparison.OrdinalIgnoreCase);
+  // מגן על התוכנה עצמה: אי אפשר לחסום את תיקיית ההגדרות, את תיקיית ההרצה, תיקייה שמכילה אותן, או קובץ בשם התוכנה בכל מיקום
+  static bool Protected(string p) {
+    var t = p.TrimEnd('\\'); var cd = Config.Dir.TrimEnd('\\'); var bd = AppContext.BaseDirectory.TrimEnd('\\');
+    bool Covers(string a, string b) => a.Equals(b, StringComparison.OrdinalIgnoreCase) || a.StartsWith(b + "\\", StringComparison.OrdinalIgnoreCase) || b.StartsWith(a + "\\", StringComparison.OrdinalIgnoreCase);
+    return Covers(t, cd) || Covers(t, bd)
+      || System.IO.Path.GetFileName(t).Equals("DeviceGuard.exe", StringComparison.OrdinalIgnoreCase)
+      || System.IO.Path.GetFileName(t).Equals("DeviceGuardWatch.exe", StringComparison.OrdinalIgnoreCase);
+  }
   static void Ifeo(Config c, string exe, Rule r) {
     if (exe.Equals("DeviceGuard.exe", StringComparison.OrdinalIgnoreCase) || exe.Equals("DeviceGuardWatch.exe", StringComparison.OrdinalIgnoreCase)) return;
     foreach (var v in Views) { using var b = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, v); using var k = b.CreateSubKey(IFEO + exe); k.SetValue("Debugger", $"\"{GateExe}\" --gate {r.Id}"); }
@@ -132,7 +161,7 @@ public static class Enforcer {
       File.AppendAllText(WatchLog, $"{p}|{(int)a}\n"); return true;
     } catch { return false; }
   }
-  public static void ScanNew(Dictionary<string, Rule> map) { foreach (var d in DriveInfo.GetDrives().Where(d => d.DriveType == DriveType.Fixed && d.IsReady)) ScanN(d.RootDirectory.FullName, map); }
+  public static void ScanNew(Dictionary<string, Rule> map) { foreach (var d in DriveInfo.GetDrives().Where(d => (d.DriveType == DriveType.Fixed || d.DriveType == DriveType.Removable) && d.IsReady)) ScanN(d.RootDirectory.FullName, map); }
   static void ScanN(string dir, Dictionary<string, Rule> map) {
     try {
       foreach (var f in Directory.EnumerateFiles(dir)) if (map.TryGetValue(System.IO.Path.GetExtension(f).TrimStart('.').ToLowerInvariant(), out var r)) BlockNewFile(r, f);
@@ -155,17 +184,23 @@ public static class Enforcer {
 
   static void Sc(string a) { Process.Start(new ProcessStartInfo("sc.exe", a) { CreateNoWindow = true, UseShellExecute = false })!.WaitForExit(); }
   // התקנה חד-פעמית של שירות מערכת מוגן; בהמשך הוא רק מקבל עדכון של Gate.exe
+  static void InstallService() {
+    Directory.CreateDirectory(Config.Dir);
+    var wd = GateExe; File.Copy(Environment.ProcessPath!, wd, true);
+    Sc($"create DeviceGuard binPath= \"\\\"{wd}\\\" --service\" start= auto obj= LocalSystem DisplayName= \"DeviceGuard Protection\"");
+    Sc("failure DeviceGuard reset= 0 actions= restart/1000/restart/1000/restart/1000");
+    Sc("start DeviceGuard");
+    for (int i = 0; i < 20 && !Config.Up(); i++) Thread.Sleep(500);
+    Sc("sdset DeviceGuard D:(A;;GA;;;SY)(A;;CCLCSWRPLOCRRC;;;BA)(A;;CCLCSWLOCRRC;;;IU)");
+    if (Config.Token == null && Program.Code != null) Config.Auth(Program.Code);
+  }
+  // מתקין את השירות אם אינו קיים, ומעדכן אותו אוטומטית אם הוא מגרסה ישנה (בלי צורך בפעולה ידנית)
   public static void EnsureService() {
-    if (!Config.Up()) {
-      Directory.CreateDirectory(Config.Dir);
-      var wd = GateExe; File.Copy(Environment.ProcessPath!, wd, true);
-      Sc($"create DeviceGuard binPath= \"\\\"{wd}\\\" --service\" start= auto obj= LocalSystem DisplayName= \"DeviceGuard Protection\"");
-      Sc("failure DeviceGuard reset= 0 actions= restart/1000/restart/1000/restart/1000");
-      Sc("start DeviceGuard");
-      for (int i = 0; i < 20 && !Config.Up(); i++) Thread.Sleep(500);
-      Sc("sdset DeviceGuard D:(A;;GA;;;SY)(A;;CCLCSWRPLOCRRC;;;BA)(A;;CCLCSWLOCRRC;;;IU)");
-      if (Config.Token == null && Program.Code != null) Config.Auth(Program.Code);
-    } else if (Config.Pipe("VER") != "2") throw new InvalidOperationException("שירות ההגנה הקיים הוא מגרסה ישנה. הסר אותו (חלון 1, 'הסרת שירות ההגנה') ואז לחץ 'החל שינויים'.");
+    if (!Config.Up()) { InstallService(); return; }
+    if (Config.Pipe("VER") == "2") return;
+    Sc("stop DeviceGuard"); for (int i = 0; i < 10 && Config.Up(); i++) Thread.Sleep(500);
+    Sc("delete DeviceGuard"); Thread.Sleep(1000);
+    InstallService();
   }
   // קיצור דרך עם אותו שם, שפותח חלון קוד (הפריט עצמו נעול ומוסתר)
   static void MakeLnk(Config c, Rule r) {
@@ -201,6 +236,11 @@ public static class Enforcer {
               using (var k = Registry.CurrentUser.OpenSubKey(EXP, true)) k?.DeleteValue("NoFolderOptions", false);
               break; }
           case "safer": Registry.LocalMachine.DeleteSubKeyTree(SAFER, false); break;
+          case "devrestrict": Registry.LocalMachine.DeleteSubKeyTree(DEVREST, false); break;
+          case "wlanfilter":
+            if (p.Length > 1 && p[1] == "denyall") PS("netsh wlan delete filter permission=denyall networktype=infrastructure");
+            else if (p.Length > 2 && p[1] == "allow") PS($"netsh wlan delete filter permission=allow ssid=\"{p[2].Replace("\"", "")}\" networktype=infrastructure");
+            break;
         }
       } catch { }
     }

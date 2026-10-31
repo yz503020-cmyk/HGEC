@@ -31,7 +31,7 @@ static class UserSession {
     if (enabled) return; enabled = true;
     try {
       if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, out var tok)) return;
-      try { if (LookupPrivilegeValue(null, "SeTcbPrivilege", out var luid)) { var tp = new TOKEN_PRIVILEGES { Count = 1, Priv = new LUID_AND_ATTR { Luid = luid, Attributes = SE_PRIVILEGE_ENABLED } }; AdjustTokenPrivileges(tok, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero); }
+      try { if (LookupPrivilegeValue(null, "SeTcbPrivilege", out var luid)) { var tp = new TOKEN_PRIVILEGES { Count = 1, Priv = new LUID_AND_ATTR { Luid = luid, Attributes = SE_PRIVILEGE_ENABLED } }; AdjustTokenPrivileges(tok, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero); } }
       finally { CloseHandle(tok); }
     } catch { }
   }

@@ -9,7 +9,7 @@ public class Rule {
 }
 public class Config {
   public string? AppCode, DefaultCode, OwnerUser;
-  public bool Master = true, AllUsers = true, Terms;
+  public bool Master = true, AllUsers = true, Terms, Harden = true;   // Harden: חיזוק חסימת קבצים – מונע מבעל הקובץ לשנות את ההרשאות
   public Rule Settings = new() { Name = "חסימת הגדרות המחשב" }, Install = new() { Name = "חסימת התקנת תוכנות" },
     Net = new() { Name = "חסימת חיבור לרשת" }, Usb = new() { Name = "חסימת התקנים חיצוניים" },
     Portable = new() { Name = "חסימת תוכנות ניידות" }, Movies = new() { Name = "חסימת סרטים" },
@@ -30,7 +30,7 @@ public class Config {
   public static string? Pipe(string msg, int ms = 3000) {
     try { using var p = new NamedPipeClientStream(".", "DeviceGuard.Unlock", PipeDirection.InOut); p.Connect(ms); var w = new StreamWriter(p) { AutoFlush = true }; var r = new StreamReader(p); w.WriteLine(msg); return r.ReadLine(); } catch { return null; }
   }
-  public static bool Up() => Pipe("HELLO", 800) == "OK";
+  public static bool Up() => Pipe("HELLO", 3000) == "OK";
   public static bool Auth(string code) { var t = Pipe("AUTH|" + code); if (t != null && t.StartsWith("TOKEN|")) { Token = t[6..]; return true; } return false; }
   public void Save() {
     var json = JsonSerializer.Serialize(this, O);

@@ -160,22 +160,19 @@ public static class Program {
             var json = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(p[2]));
             if (System.Text.Json.JsonSerializer.Deserialize<Config>(json, Config.O) == null) return "ERR";
             var tmp = cfgPath + ".tmp"; File.WriteAllText(tmp, json); File.Move(tmp, cfgPath, true); return "OK"; }
-        case "COPY": {
-            if (p.Length < 4 || !tokens.ContainsKey(p[1]) || p[3] != "Gate.exe") return "DENY";
-            File.Copy(p[2], System.IO.Path.Combine(Config.Dir, "Gate.exe"), true); return "OK"; }
         case "OPEN": {
             var c = Config.Load(); var r = c.Find(p[1]);
-            if (r == null || !r.On || !c.Master || r.Mode != Mode.Code || !c.Paths.Contains(r)) return "ERR";
+            if (r == null || !r.On || !c.Master || r.Mode != Mode.Code || !(c.Paths.Contains(r) || Enforcer.IsExt(c, r))) return "ERR";
             if (fails.TryGetValue(p[1], out var f) && DateTime.UtcNow < f.Until) return "LOCK";
             if (!c.CodeOk(r, string.Join("|", p.Skip(2)))) {
               var n = (fails.TryGetValue(p[1], out var f2) ? f2.N : 0) + 1;
               fails[p[1]] = n >= 5 ? (0, DateTime.UtcNow.AddSeconds(60)) : (n, DateTime.MinValue); return "BAD";
             }
-            fails.TryRemove(p[1], out _); Enforcer.Unlock(r); lease[p[1]] = DateTime.UtcNow; return "OK"; }
+            fails.TryRemove(p[1], out _); Enforcer.Unlock(r, c); lease[p[1]] = DateTime.UtcNow; return "OK"; }
         case "AUTHPID": if (p.Length > 1 && int.TryParse(p[1], out var apid)) authPid[apid] = true; return "OK";
         case "PING": if (lease.ContainsKey(p[1])) lease[p[1]] = DateTime.UtcNow; return "OK";
         case "RELOCK": {
-            if (lease.TryRemove(p[1], out _)) { var c = Config.Load(); var r = c.Find(p[1]); if (r != null && c.Master && r.On) Enforcer.Relock(r); }
+            if (lease.TryRemove(p[1], out _)) { var c = Config.Load(); var r = c.Find(p[1]); if (r != null && c.Master && r.On) Enforcer.Relock(r, c); }
             return "OK"; }
         case "UNINSTALL": {
             if (p.Length < 2 || !tokens.ContainsKey(p[1])) return "DENY";
@@ -214,7 +211,13 @@ public static class Program {
       } catch { }
     }
     foreach (var dr in DriveInfo.GetDrives().Where(x => (x.DriveType == DriveType.Fixed || x.DriveType == DriveType.Removable) && x.IsReady)) Watch1(dr.RootDirectory.FullName);
-    var cfg = System.IO.Path.Combine(Config.Dir, "config.json"); var stamp = DateTime.MinValue; var c = new Config(); var kill = new HashSet<string>(StringComparer.OrdinalIgnoreCase); var lastScan = DateTime.MinValue;
+    var cfg = System.IO.Path.Combine(Config.Dir, "config.json"); var stamp = DateTime.MinValue; var c = new Config(); var kill = new HashSet<string>(StringComparer.OrdinalIgnoreCase); var lastScan = DateTime.MinValue; var ifeo = new List<(string Exe, string Id)>(); var lastHeal = DateTime.MinValue;
+    bool pendingDone = false; Task scanTask = Task.CompletedTask; CancellationTokenSource? scanCts = null;
+    void StartScan(Dictionary<string, Rule> map, bool release, string? root = null) {   // סריקה אחת ברקע בכל פעם; שינוי הגדרות מבטל סריקה קודמת
+      if (release) scanCts?.Cancel();
+      var cts = release || scanCts == null ? (scanCts = new CancellationTokenSource()) : scanCts; var prev = scanTask;
+      scanTask = Task.Run(() => { try { prev.Wait(); } catch { } if (cts.IsCancellationRequested) return; try { if (release) Enforcer.ReleaseStale(map); Enforcer.ScanNew(map, cts.Token, root); } catch { } });
+    }
     var codeKill = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);   // שם תהליך → מזהה חוק, לתוכנות בחסימת קוד (רשת ביטחון לתוכנות שה-IFEO לא תופס, כמו אפליקציות Store)
     var gateExe = System.IO.Path.Combine(Config.Dir, "DeviceGuardWatch.exe");
     while (true) {
@@ -223,7 +226,7 @@ public static class Program {
         foreach (var dr in DriveInfo.GetDrives().Where(x => (x.DriveType == DriveType.Fixed || x.DriveType == DriveType.Removable) && x.IsReady)) {   // כונן חיצוני חדש שחובר – להתחיל לעקוב אחריו ולסרוק מיד
           if (watched.Contains(dr.RootDirectory.FullName)) continue;
           Watch1(dr.RootDirectory.FullName);
-          if (curMap.Count > 0) Enforcer.ScanNew(curMap);
+          if (curMap.Count > 0) StartScan(curMap, false, dr.RootDirectory.FullName);
         }
         } catch { }   // תקלה בסריקת כוננים לא תעצור את חסימת התוכנות
         var ts = File.GetLastWriteTimeUtc(cfg);
@@ -236,9 +239,11 @@ public static class Program {
             if (r.Mode == Mode.Full) { kill.Add(n); if (alias.TryGetValue(n, out var al)) foreach (var x in al) kill.Add(x); }
             else { codeKill[n] = r.Id; if (alias.TryGetValue(n, out var al)) foreach (var x in al) codeKill[x] = r.Id; }
           }
-          curMap = c.Master ? Enforcer.ExtMap(c) : new();
+          curMap = c.Master ? Enforcer.ExtMap(c) : new(); ifeo = Enforcer.IfeoList(c); Enforcer.Harden = c.Harden;
+          if (!pendingDone) { pendingDone = true; Enforcer.RelockPending(c); }   // אם השירות הופעל מחדש בזמן שקבצים היו פתוחים בקוד – נועלים אותם שוב
+          StartScan(curMap, true); lastScan = DateTime.UtcNow;   // חסימת קבצים קיימים ברקע, בלי לעכב את החלון או את חסימת התוכנות
         }
-        foreach (var kv in lease.ToArray()) if ((DateTime.UtcNow - kv.Value).TotalSeconds > 15 && lease.TryRemove(kv.Key, out _)) { var lr = c.Find(kv.Key); if (lr != null && c.Master && lr.On) Enforcer.Relock(lr); }
+        foreach (var kv in lease.ToArray()) if ((DateTime.UtcNow - kv.Value).TotalSeconds > 15 && lease.TryRemove(kv.Key, out _)) { var lr = c.Find(kv.Key); if (lr != null && c.Master && lr.On) Enforcer.Relock(lr, c); }
         if (c.Master) {
           if (kill.Count > 0 || codeKill.Count > 0) foreach (var pr in Process.GetProcesses()) {
             try {
@@ -253,8 +258,8 @@ public static class Program {
             if (it.At > DateTime.UtcNow) { q.Enqueue(it); continue; }
             if (curMap.TryGetValue(System.IO.Path.GetExtension(it.P).TrimStart('.').ToLowerInvariant(), out var rr) && !Enforcer.BlockNewFile(rr, it.P) && it.T < 5) q.Enqueue((it.P, it.T + 1, DateTime.UtcNow.AddSeconds(3)));
           }
-          if (curMap.Count > 0 && (DateTime.UtcNow - lastScan).TotalMinutes >= 10) { lastScan = DateTime.UtcNow; Enforcer.ScanNew(curMap); }
-          if ((DateTime.UtcNow - ts).TotalSeconds > 5) Enforcer.Heal(c);
+          if (curMap.Count > 0 && scanTask.IsCompleted && (DateTime.UtcNow - lastScan).TotalMinutes >= 10) { lastScan = DateTime.UtcNow; StartScan(curMap, false); }
+          if ((DateTime.UtcNow - ts).TotalSeconds > 5 && (DateTime.UtcNow - lastHeal).TotalSeconds >= 5) { lastHeal = DateTime.UtcNow; Enforcer.Heal(ifeo); }
         } else { while (q.TryDequeue(out _)) { } }
         if (DateTime.UtcNow.Second == 0) {   // ניקוי תקופתי של מזהי תהליכים שכבר לא רצים (כדי שמספר pid לא יישאר מסומן לנצח)
           foreach (var pid in authPid.Keys.ToArray()) if (!Alive(pid)) authPid.TryRemove(pid, out _);
@@ -270,6 +275,7 @@ public static class Program {
     if (args.Contains("--watch")) { Watch(); return; }
     if (args.Length >= 2 && args[0] == "--gate") { GateMode.RunGate(args); return; }
     if (args.Length == 2 && args[0] == "--open") { GateMode.OpenFlow(args[1]); return; }
+    if (args.Length == 2 && args[0] == "--openext") { GateMode.OpenExt(args[1]); return; }
     if (args.Length == 3 && args[0] == "--promptkill") { GateMode.PromptKill(args); return; }
     if (!IsAdmin()) { try { Process.Start(new ProcessStartInfo(Environment.ProcessPath!) { UseShellExecute = true, Verb = "runas" }); } catch { } return; }
     RunUi();
@@ -504,6 +510,7 @@ public class MainWin : Window {
   static readonly (string, string)[] SettingsPages = { ("תצוגה", "display"), ("קול", "sound"), ("התראות", "notifications"), ("אחסון", "storagesense"), ("Bluetooth", "bluetooth"), ("מדפסות", "printers"), ("עכבר", "mousetouchpad"), ("Wi-Fi", "network-wifi"), ("Ethernet", "network-ethernet"), ("פרטיות", "privacy"), ("Windows Update", "windowsupdate"), ("התאמה אישית", "personalization-background"), ("תאריך ושעה", "dateandtime"), ("שפה ואזור", "regionlanguage"), ("נגישות", "easeofaccess-display"), ("אודות", "about"), ("אפליקציות ותכונות", "appsfeatures"), ("אפליקציות ברירת מחדל", "defaultapps") };
   UIElement P1() {
     var all = new CheckBox { Content = "החסימות יחולו על כל המשתמשים במחשב (אחרת – רק על משתמש זה)", IsChecked = C.AllUsers, Margin = new Thickness(0, 8, 0, 8) }; all.Click += (s, e) => { C.AllUsers = all.IsChecked == true; C.Save(); };
+    var hard = new CheckBox { Content = "חיזוק חסימת קבצים: מונע מבעל הקובץ לשנות הרשאות ולהסיר את החסימה (יחול אחרי 'החל שינויים')", IsChecked = C.Harden, Margin = new Thickness(0, 0, 0, 8) }; hard.Click += (s, e) => { C.Harden = hard.IsChecked == true; C.Save(); };
     var code = Btn("הגדר / שנה קוד ברירת מחדל לחסימות", () => { var k = Ask("קוד ברירת מחדל", true); if (k != null) { C.DefaultCode = Config.Hash(k); C.Save(); MessageBox.Show("הקוד נשמר"); } });
     var net = () => {
       var items = System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces().Where(n => n.NetworkInterfaceType != System.Net.NetworkInformation.NetworkInterfaceType.Loopback).Select(n => (n.Name, n.Name)).ToList();
@@ -523,7 +530,7 @@ public class MainWin : Window {
     Theme.Tipped(exp, "שומר את ההגדרות לקובץ, לגיבוי או להעברה למחשב אחר.");
     Theme.Tipped(imp, "טוען הגדרות מקובץ שיוצא קודם. אחרי הטעינה לוחצים 'החל שינויים'.");
     Theme.Tipped(un2, "מכבה את כל החסימות ומסיר את שירות ההגנה מהמחשב, אחרי הקשת קוד הכניסה.");
-    return Page("הגדרות כלליות", "\uE713", code, all, Row(C.Settings, () => SettingsPages, false, null, "\uE713"), Row(C.Install, null, false, null, "\uE896"), Row(C.Net, net, false, null, "\uE774"), Row(C.Usb, usb, false, null, "\uE88E"), new StackPanel { Orientation = Orientation.Horizontal, Children = { exp, imp, un2 } }, note);
+    return Page("הגדרות כלליות", "\uE713", code, all, hard, Row(C.Settings, () => SettingsPages, false, null, "\uE713"), Row(C.Install, null, false, null, "\uE896"), Row(C.Net, net, false, null, "\uE774"), Row(C.Usb, usb, false, null, "\uE88E"), new StackPanel { Orientation = Orientation.Horizontal, Children = { exp, imp, un2 } }, note);
   }
   Dictionary<string, object> Sections() => new() { ["1"] = new { C.AllUsers, C.Settings, C.Install, C.Net, C.Usb }, ["2"] = C.Programs, ["3"] = C.Portable, ["4"] = new { C.Movies, C.Songs, C.Images, C.Exts }, ["5"] = C.Paths };
   void Export() {

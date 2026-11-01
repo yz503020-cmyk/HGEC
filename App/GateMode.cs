@@ -87,6 +87,30 @@ static class GateMode {
     using var mx = new Mutex(false, "Local\\DG.Open." + id); bool got = false;
     try { got = mx.WaitOne(0); if (!got) return; OpenFlowCore(id); } finally { if (got) mx.ReleaseMutex(); }
   }
+  // פתיחת סיומות (תמונות/שירים/סרטים) בקוד: אחרי קוד נכון הקבצים משוחררים כל זמן שהחלון הזה פתוח, וכשסוגרים אותו הם ננעלים שוב
+  public static void OpenExt(string id) {
+    using var mx = new Mutex(false, "Local\\DG.OpenExt." + id); bool got = false;
+    try { got = mx.WaitOne(0); if (!got) return; OpenExtCore(id); } finally { if (got) mx.ReleaseMutex(); }
+  }
+  static void OpenExtCore(string id) {
+    var c = Config.Load(); var r = c.Find(id); if (r == null) return;
+    Init();
+    if (!c.Master || !r.On || r.Mode != Mode.Code) { Msg("החסימה הזו אינה פעילה בקוד."); return; }
+    var need = r.OwnCode != null ? "הקוד הנפרד של הפריט הזה" : "קוד ברירת המחדל (שהוגדר בחלון 1)";
+    while (true) {
+      var code = MainWin.Ask("נדרש " + need); if (code == null) return;
+      var resp = Config.Pipe("OPEN|" + id + "|" + code);
+      if (resp == "OK") break;
+      Msg(resp == null ? "שירות ההגנה אינו פעיל. פתח את התוכנה ולחץ 'החל שינויים'." : resp == "LOCK" ? "יותר מדי ניסיונות. נסה שוב בעוד דקה." : resp == "BAD" ? "קוד שגוי. יש להקיש את " + need + "." : "שגיאה (" + resp + "). ודא שהחסימה פעילה ולחץ 'החל שינויים'.");
+      if (resp == null || resp == "LOCK" || resp == "ERR") return;
+    }
+    var w = new Window { Title = "DeviceGuard", ResizeMode = ResizeMode.CanMinimize, SizeToContent = SizeToContent.WidthAndHeight, WindowStartupLocation = WindowStartupLocation.CenterScreen, FlowDirection = FlowDirection.RightToLeft, FontFamily = new FontFamily("Segoe UI"), Background = new SolidColorBrush(Color.FromRgb(248, 250, 252)) };
+    w.Content = new TextBlock { Text = r.Name + " פתוחה כל זמן שהחלון הזה פתוח. סגור את החלון כדי לנעול שוב.", TextWrapping = TextWrapping.Wrap, Width = 300, Margin = new Thickness(20) };
+    var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
+    timer.Tick += (s, e) => Config.Pipe("PING|" + id);
+    timer.Start(); w.ShowDialog(); timer.Stop();
+    Config.Pipe("RELOCK|" + id);
+  }
   static void OpenFlowCore(string id) {
     var c = Config.Load(); var r = c.Find(id); if (r == null) return;
     if (!c.Master || !r.On) { Shell(r.Path); return; }

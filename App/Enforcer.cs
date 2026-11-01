@@ -5,6 +5,7 @@ public static class Enforcer {
   const string EXP = @"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer";
   const string SAFER = @"SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers";
   const string DEVREST = @"SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions";
+  public static int Blocked, Failed; public static string? LastErr;   // תוצאת החסימה האחרונה (לחיווי בחלון)
   static string GateExe => System.IO.Path.Combine(Config.Dir, "DeviceGuardWatch.exe");
   static readonly RegistryView[] Views = { RegistryView.Registry64, RegistryView.Registry32 };
 
@@ -12,11 +13,12 @@ public static class Enforcer {
     var p = Process.Start(new ProcessStartInfo("powershell.exe", "-NoProfile -EncodedCommand " + Convert.ToBase64String(Encoding.Unicode.GetBytes(cmd))) { CreateNoWindow = true, UseShellExecute = false, RedirectStandardOutput = true })!;
     var o = p.StandardOutput.ReadToEnd(); p.WaitForExit(); return o;
   }
+  static void PSAll(List<string> cmds) { if (cmds.Count > 0) PS(string.Join("\n", cmds)); }
   static void Schtasks(string a) { Process.Start(new ProcessStartInfo("schtasks.exe", a) { CreateNoWindow = true, UseShellExecute = false })!.WaitForExit(); }
   static string[] Lines(string s) => s.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
   public static void Apply(Config c) {
-    Revert(c);
+    Revert(c, true); Blocked = 0; Failed = 0; LastErr = null;
     if (!c.Master) { c.Save(); return; }
     EnsureService();
     var self = Environment.ProcessPath ?? "";
@@ -25,21 +27,25 @@ public static class Enforcer {
     if (c.Net.On) {
       var ssidWhite = c.Net.White.Where(w => w.StartsWith("ssid:")).Select(w => w[5..]).ToList();
       var adapterWhite = c.Net.White.Where(w => !w.StartsWith("ssid:")).ToList();
-      // מתאמי רשת שאינם Wi-Fi (Ethernet וכדומה): נחסמים כולם חוץ מהרשימה הלבנה, כמו קודם
-      foreach (var n in Lines(PS("(Get-NetAdapter | ? { $_.PhysicalMediaType -notlike '*802.11*' -and $_.InterfaceDescription -notmatch 'Wireless|Wi-Fi' }).Name")).Where(n => !adapterWhite.Contains(n))) {
-        PS($"Disable-NetAdapter -Name '{n}' -Confirm:$false"); c.Applied.Add("net|" + n);
-      }
+      // שאילתה אחת לכל המתאמים, וכל הפקודות רצות יחד בהפעלת PowerShell אחת (מהיר בהרבה)
+      var nl = Lines(PS("Get-NetAdapter | % { $w = ($_.PhysicalMediaType -like '*802.11*' -or $_.InterfaceDescription -match 'Wireless|Wi-Fi'); $(if ($w) { 'W' } else { 'E' }) + '|' + $_.Status + '|' + $_.Name }"));
+      var netCmds = new List<string>();
+      // מתאמי רשת שאינם Wi-Fi (Ethernet וכדומה): נחסמים כולם חוץ מהרשימה הלבנה; מתאם שכבר מושבת לא נוגעים בו שוב
+      foreach (var l in nl) { var q = l.Split('|', 3); if (q.Length < 3 || q[0] != "E" || adapterWhite.Contains(q[2])) continue; if (q[1] != "Disabled") netCmds.Add($"Disable-NetAdapter -Name '{q[2]}' -Confirm:$false"); c.Applied.Add("net|" + q[2]); }
       // Wi-Fi: חסימה לפי שם הרשת (SSID). חוסם את כל הרשתות, כולל כאלה שלא היו זמינות בזמן ההחלה, חוץ מהרשימה הלבנה
-      if (Lines(PS("(Get-NetAdapter | ? { $_.PhysicalMediaType -like '*802.11*' -or $_.InterfaceDescription -match 'Wireless|Wi-Fi' }).Name")).Length > 0) {
-        PS("netsh wlan add filter permission=denyall networktype=infrastructure"); c.Applied.Add("wlanfilter|denyall");
-        foreach (var ssid in ssidWhite) { PS($"netsh wlan add filter permission=allow ssid=\"{ssid.Replace("\"", "")}\" networktype=infrastructure"); c.Applied.Add("wlanfilter|allow|" + ssid); }
+      if (nl.Any(l => l.StartsWith("W|"))) {
+        netCmds.Add("netsh wlan add filter permission=denyall networktype=infrastructure"); c.Applied.Add("wlanfilter|denyall");
+        foreach (var ssid in ssidWhite) { netCmds.Add($"netsh wlan add filter permission=allow ssid=\"{ssid.Replace("\"", "")}\" networktype=infrastructure"); c.Applied.Add("wlanfilter|allow|" + ssid); }
       }
+      PSAll(netCmds);
     }
     if (c.Usb.On) {
+      var usbCmds = new List<string>();
       foreach (var l in Lines(PS("Get-PnpDevice -PresentOnly | ? InstanceId -like 'USBSTOR*' | % { $_.InstanceId + '|' + $_.FriendlyName }"))) {
         var q = l.Split('|', 2); if (q.Length < 2 || c.Usb.White.Contains(q[1])) continue;
-        PS($"Disable-PnpDevice -InstanceId '{q[0]}' -Confirm:$false"); c.Applied.Add("usb|" + q[0]);
+        usbCmds.Add($"Disable-PnpDevice -InstanceId '{q[0]}' -Confirm:$false"); c.Applied.Add("usb|" + q[0]);
       }
+      PSAll(usbCmds);
       if (c.Usb.White.Count == 0) { using var k = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\USBSTOR", true); k?.SetValue("Start", 4); c.Applied.Add("usbstor"); }
       // חסימה ברמת המדיניות: חלה גם על התקנים שעדיין לא חוברו למחשב (לא רק מה שמחובר כרגע)
       using (var k = Registry.LocalMachine.CreateSubKey(DEVREST)) {
@@ -89,7 +95,7 @@ public static class Enforcer {
     void M(Rule r, string[] e) { if (r.On) foreach (var x in e) map[x] = r; }
     M(c.Movies, Config.Vid); M(c.Songs, Config.Aud); M(c.Images, Config.Img);
     foreach (var r in c.Exts.Where(r => r.On)) map[r.Path.TrimStart('.').ToLowerInvariant()] = r;
-    if (map.Count > 0) foreach (var d in DriveInfo.GetDrives().Where(d => (d.DriveType == DriveType.Fixed || d.DriveType == DriveType.Removable) && d.IsReady)) Scan(d.RootDirectory.FullName, map, c);
+    if (map.Count > 0) foreach (var d in DriveInfo.GetDrives().Where(d => (d.DriveType == DriveType.Fixed || d.DriveType == DriveType.Removable) && d.IsReady)) ScanRoot(d.RootDirectory.FullName, map, c);
     if (c.Applied.Any(x => x.StartsWith("hid|"))) {   // מונע הצגת קבצים מוסתרים בסייר הקבצים
       try {
         using (var k = Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced")) { k.SetValue("Hidden", 2); k.SetValue("ShowSuperHidden", 0); }
@@ -114,7 +120,7 @@ public static class Enforcer {
     foreach (var v in Views) { using var b = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, v); using var k = b.CreateSubKey(IFEO + exe); k.SetValue("Debugger", $"\"{GateExe}\" --gate {r.Id}"); }
     c.Applied.Add("ifeo|" + exe + "|" + r.Id);
   }
-  static void Hide(Config c, string p) { try { var a = File.GetAttributes(p); File.SetAttributes(p, a | FileAttributes.Hidden | FileAttributes.System); c.Applied.Add($"hid|{p}|{(int)a}"); } catch { } }
+  static void Hide(Config c, string p) { try { var a = File.GetAttributes(p); File.SetAttributes(p, a | FileAttributes.Hidden | FileAttributes.System); lock (c.Applied) c.Applied.Add($"hid|{p}|{(int)a}"); } catch { } }
   static FileSystemAccessRule Deny(bool dir) => new(new SecurityIdentifier(WellKnownSidType.WorldSid, null),
     FileSystemRights.ReadData | FileSystemRights.ExecuteFile | FileSystemRights.Delete,
     dir ? InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit : InheritanceFlags.None, PropagationFlags.None, AccessControlType.Deny);
@@ -124,8 +130,8 @@ public static class Enforcer {
       if ((r.Hidden && r.Mode == Mode.Full) || (r.Mode == Mode.Code && c.Paths.Contains(r))) Hide(c, p);
       if (dir) { var i = new DirectoryInfo(p); var s = i.GetAccessControl(); s.AddAccessRule(Deny(true)); i.SetAccessControl(s); }
       else { var i = new FileInfo(p); var s = i.GetAccessControl(); s.AddAccessRule(Deny(false)); i.SetAccessControl(s); }
-      c.Applied.Add("acl|" + p);
-    } catch { }
+      lock (c.Applied) c.Applied.Add("acl|" + p); Interlocked.Increment(ref Blocked);
+    } catch (Exception x) { Interlocked.Increment(ref Failed); LastErr = x.Message; }
   }
   static void Scan(string dir, Dictionary<string, Rule> map, Config c) {
     try {
@@ -137,6 +143,17 @@ public static class Enforcer {
         if ((File.GetAttributes(d) & FileAttributes.ReparsePoint) != 0) continue;
         Scan(d, map, c);
       }
+    } catch { }
+  }
+
+  // סריקה מקבילית של תיקיות הדיסק (מהירה בהרבה מסריקה רציפה)
+  static void ScanRoot(string dir, Dictionary<string, Rule> map, Config c) {
+    try {
+      foreach (var f in Directory.EnumerateFiles(dir))
+        if (map.TryGetValue(System.IO.Path.GetExtension(f).TrimStart('.').ToLowerInvariant(), out var r) && !Protected(f)) Block(c, r, f);
+      bool Ok(string d) { try { return !SkipDirs.Contains(System.IO.Path.GetFileName(d), StringComparer.OrdinalIgnoreCase) && (File.GetAttributes(d) & FileAttributes.ReparsePoint) == 0; } catch { return false; } }
+      var subs = Directory.EnumerateDirectories(dir).Where(Ok).ToList();
+      Parallel.ForEach(subs, new ParallelOptions { MaxDegreeOfParallelism = 8 }, d => Scan(d, map, c));
     } catch { }
   }
 
@@ -197,7 +214,7 @@ public static class Enforcer {
   // מתקין את השירות אם אינו קיים, ומעדכן אותו אוטומטית אם הוא מגרסה ישנה (בלי צורך בפעולה ידנית)
   public static void EnsureService() {
     if (!Config.Up()) { InstallService(); return; }
-    if (Config.Pipe("VER") == "2") return;
+    if (Config.Pipe("VER") == "3") return;
     Sc("stop DeviceGuard"); for (int i = 0; i < 10 && Config.Up(); i++) Thread.Sleep(500);
     Sc("delete DeviceGuard"); Thread.Sleep(1000);
     InstallService();
@@ -214,19 +231,28 @@ public static class Enforcer {
     } catch { }
   }
 
-  public static void Revert(Config c) {
-    foreach (var e in c.Applied.OrderBy(x => x.StartsWith("task") ? 0 : x.StartsWith("ifeo") ? 1 : 2).ToList()) {
+  static void RevertFile(string e) {
+    var p = e.Split('|');
+    if (p[0] == "acl") {
+      bool dir = Directory.Exists(p[1]);
+      if (dir) { var i = new DirectoryInfo(p[1]); var s = i.GetAccessControl(); s.RemoveAccessRule(Deny(true)); i.SetAccessControl(s); }
+      else { var i = new FileInfo(p[1]); var s = i.GetAccessControl(); s.RemoveAccessRule(Deny(false)); i.SetAccessControl(s); }
+    } else File.SetAttributes(p[1], (FileAttributes)int.Parse(p[2]));
+  }
+  // soft = קריאה מתוך Apply: מתאמי רשת שעתידים להישאר חסומים לא מופעלים ונחסמים מחדש (חוסך ניתוק וחיבור מיותרים)
+  public static void Revert(Config c, bool soft = false) {
+    var keepAd = soft && c.Master && c.Net.On ? c.Net.White.Where(w => !w.StartsWith("ssid:")).ToHashSet() : null;
+    var ps = new List<string>();
+    var all = c.Applied.OrderBy(x => x.StartsWith("task") ? 0 : x.StartsWith("ifeo") ? 1 : 2).ToList();
+    foreach (var e in all) {
       var p = e.Split('|');
+      if (p[0] == "acl" || p[0] == "hid") continue;
       try {
         switch (p[0]) {
           case "ifeo": foreach (var v in Views) { using var b = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, v); using var k = b.OpenSubKey(IFEO + p[1], true); k?.DeleteValue("Debugger", false); } break;
-          case "acl": { bool dir = Directory.Exists(p[1]);
-              if (dir) { var i = new DirectoryInfo(p[1]); var s = i.GetAccessControl(); s.RemoveAccessRule(Deny(true)); i.SetAccessControl(s); }
-              else { var i = new FileInfo(p[1]); var s = i.GetAccessControl(); s.RemoveAccessRule(Deny(false)); i.SetAccessControl(s); } break; }
-          case "hid": File.SetAttributes(p[1], (FileAttributes)int.Parse(p[2])); break;
           case "reg": { using var k = (p[1] == "HKLM" ? Registry.LocalMachine : Registry.CurrentUser).OpenSubKey(p[2], true); k?.DeleteValue(p[3], false); break; }
-          case "net": PS($"Enable-NetAdapter -Name '{p[1]}' -Confirm:$false"); break;
-          case "usb": PS($"Enable-PnpDevice -InstanceId '{p[1]}' -Confirm:$false"); break;
+          case "net": if (keepAd != null && !keepAd.Contains(p[1])) break; ps.Add($"Enable-NetAdapter -Name '{p[1]}' -Confirm:$false"); break;
+          case "usb": ps.Add($"Enable-PnpDevice -InstanceId '{p[1]}' -Confirm:$false"); break;
           case "usbstor": { using var k = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\USBSTOR", true); k?.SetValue("Start", 3); break; }
           case "lnk": File.Delete(p[1]); break;
           case "task": Schtasks("/End /TN DeviceGuardWatch"); Schtasks("/Delete /TN DeviceGuardWatch /F"); break;
@@ -238,18 +264,22 @@ public static class Enforcer {
           case "safer": Registry.LocalMachine.DeleteSubKeyTree(SAFER, false); break;
           case "devrestrict": Registry.LocalMachine.DeleteSubKeyTree(DEVREST, false); break;
           case "wlanfilter":
-            if (p.Length > 1 && p[1] == "denyall") PS("netsh wlan delete filter permission=denyall networktype=infrastructure");
-            else if (p.Length > 2 && p[1] == "allow") PS($"netsh wlan delete filter permission=allow ssid=\"{p[2].Replace("\"", "")}\" networktype=infrastructure");
+            if (p.Length > 1 && p[1] == "denyall") ps.Add("netsh wlan delete filter permission=denyall networktype=infrastructure");
+            else if (p.Length > 2 && p[1] == "allow") ps.Add($"netsh wlan delete filter permission=allow ssid=\"{p[2].Replace("\"", "")}\" networktype=infrastructure");
             break;
         }
       } catch { }
     }
+    try { PSAll(ps); } catch { }
+    try {   // שחרור קבצים ותיקיות במקביל (כל נתיב בנפרד, לפי הסדר שבו נחסם)
+      Parallel.ForEach(all.Where(x => x.StartsWith("acl|") || x.StartsWith("hid|")).GroupBy(x => x.Split('|')[1]), new ParallelOptions { MaxDegreeOfParallelism = 8 }, g => { foreach (var e in g) { try { RevertFile(e); } catch { } } });
+    } catch { }
     try {   // קבצים שנחסמו אוטומטית על ידי שירות הרקע
       if (File.Exists(WatchLog)) {
-        foreach (var l in File.ReadAllLines(WatchLog)) {
-          var i = l.LastIndexOf('|'); if (i < 0) continue; var p = l[..i];
-          try { var fi = new FileInfo(p); if (!fi.Exists) continue; var s = fi.GetAccessControl(); s.RemoveAccessRule(Deny(false)); fi.SetAccessControl(s); File.SetAttributes(p, (FileAttributes)int.Parse(l[(i + 1)..])); } catch { }
-        }
+        Parallel.ForEach(File.ReadAllLines(WatchLog), new ParallelOptions { MaxDegreeOfParallelism = 8 }, l => {
+          var i = l.LastIndexOf('|'); if (i < 0) return; var p = l[..i];
+          try { var fi = new FileInfo(p); if (!fi.Exists) return; var s = fi.GetAccessControl(); s.RemoveAccessRule(Deny(false)); fi.SetAccessControl(s); File.SetAttributes(p, (FileAttributes)int.Parse(l[(i + 1)..])); } catch { }
+        });
         File.Delete(WatchLog);
       }
     } catch { }

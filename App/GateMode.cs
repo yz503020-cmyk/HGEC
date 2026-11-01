@@ -63,7 +63,13 @@ static class GateMode {
     var o = new Window { Topmost = true, ShowInTaskbar = false, WindowStyle = WindowStyle.None, Width = 0, Height = 0, Opacity = 0, WindowStartupLocation = WindowStartupLocation.CenterScreen };
     o.Show(); MessageBox.Show(o, t, "DeviceGuard", MessageBoxButton.OK, MessageBoxImage.Warning, MessageBoxResult.OK, MessageBoxOptions.RtlReading | MessageBoxOptions.RightAlign); o.Close();
   }
-  static void Shell(string path) { try { Process.Start(new ProcessStartInfo(path) { UseShellExecute = true }); } catch { } }
+  // תיקייה נפתחת ישירות ב-Explorer (כדי שלא יתפוס במקומה את הקיצור שנוצר לצידה); קובץ נפתח כרגיל
+  static void Shell(string path) {
+    try {
+      if (Directory.Exists(path)) Process.Start(new ProcessStartInfo("explorer.exe", "\"" + (path.Length > 3 ? path.TrimEnd('\\') : path) + "\"") { UseShellExecute = false });
+      else Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
+    } catch { }
+  }
   static bool FolderOpen(string path) {
     try {
       dynamic sh = Activator.CreateInstance(Type.GetTypeFromProgID("Shell.Application")!)!;
@@ -76,7 +82,12 @@ static class GateMode {
     return false;
   }
   // פתיחה בקוד: הפריט נפתח עד שסוגרים את החלון שלו, ואז ננעל שוב
+  // מופע אחד בלבד לכל פריט: אם כבר רץ חלון קוד לפריט הזה, לא נפתח עוד אחד
   public static void OpenFlow(string id) {
+    using var mx = new Mutex(false, "Local\\DG.Open." + id); bool got = false;
+    try { got = mx.WaitOne(0); if (!got) return; OpenFlowCore(id); } finally { if (got) mx.ReleaseMutex(); }
+  }
+  static void OpenFlowCore(string id) {
     var c = Config.Load(); var r = c.Find(id); if (r == null) return;
     if (!c.Master || !r.On) { Shell(r.Path); return; }
     Init();

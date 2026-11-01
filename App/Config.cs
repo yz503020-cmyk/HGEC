@@ -21,7 +21,7 @@ public class Config {
 
   public static readonly string[] Vid = "3g2 3gp amv asf avi avs cpk dif divx dv dvr-ms f4v fli flv gxv h264 m1v m2p m2t m2ts m2v m4v mkv mod mov mp2 mp4 mpe mpeg mpeg1 mpeg2 mpeg4 mpg mts mxf nd nvavi ogg ogm ps qt rm rmvb trp ts vfw vob wmv yuv".Split(' ');
   public static readonly string[] Aud = "aac ac3 amr ape flac m4r mmf mp2 mp3 ogg wav wma wv m4a".Split(' ');
-  public static readonly string[] Img = "bmp gif ico jpg png tga tif webp wmf nth".Split(' ');
+  public static readonly string[] Img = "bmp gif ico jpg jpeg jpe jfif png tga tif tiff webp wmf nth heic heif avif svg".Split(' ');
 
   public static readonly JsonSerializerOptions O = new() { IncludeFields = true, WriteIndented = true };
   public static string Dir = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "DeviceGuard");

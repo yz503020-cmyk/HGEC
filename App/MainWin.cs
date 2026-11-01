@@ -149,7 +149,7 @@ public static class Program {
       var p = line.Split('|', 4); var cfgPath = System.IO.Path.Combine(Config.Dir, "config.json");
       switch (p[0]) {
         case "HELLO": return "OK";
-        case "VER": return "2";
+        case "VER": return "3";
         case "AUTH": {
             if (DateTime.UtcNow < authLock) return "LOCK";
             if (Config.Check(string.Join("|", p.Skip(1)), Config.Load().AppCode)) { authFails = 0; var t = Guid.NewGuid().ToString("N"); tokens[t] = true; return "TOKEN|" + t; }
@@ -349,7 +349,7 @@ public class MainWin : Window {
     status.Text = "מחיל..."; IsEnabled = false;
     try {
       await Task.Factory.StartNew(() => Enforcer.Apply(C), CancellationToken.None, TaskCreationOptions.None, new StaTaskScheduler());
-      status.Text = "הוחל ✓";
+      status.Text = "הוחל ✓" + (Enforcer.Blocked > 0 || Enforcer.Failed > 0 ? $" (נחסמו {Enforcer.Blocked} קבצים" + (Enforcer.Failed > 0 ? $", נכשלו {Enforcer.Failed}: {Enforcer.LastErr}" : "") + ")" : "");
     } catch (Exception x) { status.Text = "שגיאה: " + x.Message; MessageBox.Show("שגיאה בהחלת החסימות: " + x.Message); }
     IsEnabled = true;
   }

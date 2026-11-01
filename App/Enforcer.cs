@@ -70,6 +70,7 @@ public static class Enforcer {
         var v = s.White.Count > 0 ? "SettingsPageVisibility" : "NoControlPanel";
         if (s.White.Count > 0) k.SetValue(v, "showonly:" + string.Join(";", s.White)); else k.SetValue(v, 1, RegistryValueKind.DWord);
         c.Applied.Add($"reg|{h}|{EXP}|{v}");
+        if (s.White.Count > 0) Ifeo(c, "control.exe", s);   // עם רשימה לבנה נחסמת רק אפליקציית ההגדרות החדשה, ולכן לוח הבקרה הישן נחסם בנפרד
       }
     }
     if (c.Install.On) Ifeo(c, "msiexec.exe", c.Install);
@@ -124,11 +125,28 @@ public static class Enforcer {
   static FileSystemAccessRule Deny(bool dir) => new(new SecurityIdentifier(WellKnownSidType.WorldSid, null),
     FileSystemRights.ReadData | FileSystemRights.ExecuteFile | FileSystemRights.Delete,
     dir ? InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit : InheritanceFlags.None, PropagationFlags.None, AccessControlType.Deny);
+  // ---- חסימת תיקייה כולל כל התיקיות שבתוכה (גם כאלה שלא ירשו את החסימה, למשל כשהירושה בהן כבויה) ----
+  static List<string> ListDirs(string root) {   // חייב לרוץ לפני החסימה, כי אחריה אי אפשר לרשום את תוכן התיקייה
+    var all = new List<string>();
+    void Walk(string d) { string[] subs; try { subs = Directory.GetDirectories(d); } catch { return; } foreach (var x in subs) { try { if ((File.GetAttributes(x) & FileAttributes.ReparsePoint) != 0) continue; } catch { continue; } all.Add(x); Walk(x); } }
+    Walk(root); return all;
+  }
+  static bool HasDeny(string d, bool inherited) {
+    try { return new DirectoryInfo(d).GetAccessControl().GetAccessRules(true, inherited, typeof(SecurityIdentifier)).Cast<FileSystemAccessRule>().Any(x => x.AccessControlType == AccessControlType.Deny && x.IdentityReference.Value == "S-1-1-0" && (x.FileSystemRights & FileSystemRights.ListDirectory) != 0); } catch { return false; }
+  }
+  static void DenySubs(List<string> subs) {
+    Parallel.ForEach(subs, new ParallelOptions { MaxDegreeOfParallelism = 8 }, d => { try { if (HasDeny(d, true)) return; var i = new DirectoryInfo(d); var s = i.GetAccessControl(); s.AddAccessRule(Deny(true)); i.SetAccessControl(s); } catch { } });
+  }
+  static void UnwalkDir(string d, bool root = true) {   // משחרר מלמעלה למטה: קודם התיקייה עצמה, ואז אפשר לרשום את מה שבתוכה
+    try { if (root || HasDeny(d, false)) { var i = new DirectoryInfo(d); var s = i.GetAccessControl(); s.RemoveAccessRule(Deny(true)); i.SetAccessControl(s); } } catch { }
+    string[] subs; try { subs = Directory.GetDirectories(d); } catch { return; }
+    foreach (var x in subs) { try { if ((File.GetAttributes(x) & FileAttributes.ReparsePoint) == 0) UnwalkDir(x, false); } catch { } }
+  }
   static void Block(Config c, Rule r, string p) {
     try {
       bool dir = Directory.Exists(p); if (!dir && !File.Exists(p)) return;
       if ((r.Hidden && r.Mode == Mode.Full) || (r.Mode == Mode.Code && c.Paths.Contains(r))) Hide(c, p);
-      if (dir) { var i = new DirectoryInfo(p); var s = i.GetAccessControl(); s.AddAccessRule(Deny(true)); i.SetAccessControl(s); }
+      if (dir) { var subs = ListDirs(p); var i = new DirectoryInfo(p); var s = i.GetAccessControl(); s.AddAccessRule(Deny(true)); i.SetAccessControl(s); DenySubs(subs); }
       else { var i = new FileInfo(p); var s = i.GetAccessControl(); s.AddAccessRule(Deny(false)); i.SetAccessControl(s); }
       lock (c.Applied) c.Applied.Add("acl|" + p); Interlocked.Increment(ref Blocked);
     } catch (Exception x) { Interlocked.Increment(ref Failed); LastErr = x.Message; }
@@ -196,8 +214,8 @@ public static class Enforcer {
     }
   }
   // פתיחה / נעילה מחדש של פריט בודד (חסימה בקוד)
-  public static void Unlock(Rule r) { try { if (Directory.Exists(r.Path)) { var i = new DirectoryInfo(r.Path); var s = i.GetAccessControl(); s.RemoveAccessRule(Deny(true)); i.SetAccessControl(s); } else { var i = new FileInfo(r.Path); var s = i.GetAccessControl(); s.RemoveAccessRule(Deny(false)); i.SetAccessControl(s); } } catch { } }
-  public static void Relock(Rule r) { try { if (Directory.Exists(r.Path)) { var i = new DirectoryInfo(r.Path); var s = i.GetAccessControl(); s.AddAccessRule(Deny(true)); i.SetAccessControl(s); } else if (File.Exists(r.Path)) { var i = new FileInfo(r.Path); var s = i.GetAccessControl(); s.AddAccessRule(Deny(false)); i.SetAccessControl(s); } } catch { } }
+  public static void Unlock(Rule r) { try { if (Directory.Exists(r.Path)) UnwalkDir(r.Path); else { var i = new FileInfo(r.Path); var s = i.GetAccessControl(); s.RemoveAccessRule(Deny(false)); i.SetAccessControl(s); } } catch { } }
+  public static void Relock(Rule r) { try { if (Directory.Exists(r.Path)) { var subs = ListDirs(r.Path); var i = new DirectoryInfo(r.Path); var s = i.GetAccessControl(); s.AddAccessRule(Deny(true)); i.SetAccessControl(s); DenySubs(subs); } else if (File.Exists(r.Path)) { var i = new FileInfo(r.Path); var s = i.GetAccessControl(); s.AddAccessRule(Deny(false)); i.SetAccessControl(s); } } catch { } }
 
   static void Sc(string a) { Process.Start(new ProcessStartInfo("sc.exe", a) { CreateNoWindow = true, UseShellExecute = false })!.WaitForExit(); }
   // התקנה חד-פעמית של שירות מערכת מוגן; בהמשך הוא רק מקבל עדכון של Gate.exe
@@ -235,7 +253,7 @@ public static class Enforcer {
     var p = e.Split('|');
     if (p[0] == "acl") {
       bool dir = Directory.Exists(p[1]);
-      if (dir) { var i = new DirectoryInfo(p[1]); var s = i.GetAccessControl(); s.RemoveAccessRule(Deny(true)); i.SetAccessControl(s); }
+      if (dir) UnwalkDir(p[1]);
       else { var i = new FileInfo(p[1]); var s = i.GetAccessControl(); s.RemoveAccessRule(Deny(false)); i.SetAccessControl(s); }
     } else File.SetAttributes(p[1], (FileAttributes)int.Parse(p[2]));
   }

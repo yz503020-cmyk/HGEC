@@ -219,11 +219,13 @@ public static class Program {
     var gateExe = System.IO.Path.Combine(Config.Dir, "DeviceGuardWatch.exe");
     while (true) {
       try {
+        try {
         foreach (var dr in DriveInfo.GetDrives().Where(x => (x.DriveType == DriveType.Fixed || x.DriveType == DriveType.Removable) && x.IsReady)) {   // כונן חיצוני חדש שחובר – להתחיל לעקוב אחריו ולסרוק מיד
           if (watched.Contains(dr.RootDirectory.FullName)) continue;
           Watch1(dr.RootDirectory.FullName);
           if (curMap.Count > 0) Enforcer.ScanNew(curMap);
         }
+        } catch { }   // תקלה בסריקת כוננים לא תעצור את חסימת התוכנות
         var ts = File.GetLastWriteTimeUtc(cfg);
         if (ts != stamp) {   // טוען מחדש רק כשהקובץ השתנה
           stamp = ts; c = Config.Load(); kill.Clear();

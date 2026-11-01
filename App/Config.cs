@@ -9,7 +9,7 @@ public class Rule {
 }
 public class Config {
   public string? AppCode, DefaultCode, OwnerUser;
-  public bool Master = true, AllUsers = true;
+  public bool Master = true, AllUsers = true, Terms;
   public Rule Settings = new() { Name = "חסימת הגדרות המחשב" }, Install = new() { Name = "חסימת התקנת תוכנות" },
     Net = new() { Name = "חסימת חיבור לרשת" }, Usb = new() { Name = "חסימת התקנים חיצוניים" },
     Portable = new() { Name = "חסימת תוכנות ניידות" }, Movies = new() { Name = "חסימת סרטים" },

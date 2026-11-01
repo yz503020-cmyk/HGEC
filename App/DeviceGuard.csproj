@@ -2,7 +2,7 @@
   <PropertyGroup>
     <OutputType>WinExe</OutputType><TargetFramework>net8.0-windows</TargetFramework>
     <UseWPF>true</UseWPF><Nullable>enable</Nullable><ImplicitUsings>enable</ImplicitUsings>
-    <AssemblyName>DeviceGuard</AssemblyName><ApplicationManifest>app.manifest</ApplicationManifest>
+    <AssemblyName>DeviceGuard</AssemblyName><ApplicationManifest>app.manifest</ApplicationManifest><ApplicationIcon>icon.ico</ApplicationIcon>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
   </PropertyGroup>
   <ItemGroup>

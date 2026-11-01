@@ -43,6 +43,14 @@ public static class Theme {
     sp.Children.Add(new TextBlock { Text = text, VerticalAlignment = VerticalAlignment.Center }); return sp;
   }
   public static UIElement Badge(string g) => new Border { Width = 38, Height = 38, CornerRadius = new CornerRadius(12), Background = new SolidColorBrush(Color.FromRgb(238, 243, 252)), Margin = new Thickness(0, 0, 12, 0), VerticalAlignment = VerticalAlignment.Center, Child = Glyph(g, 18, Accent) };
+  // בועת הסבר כהה ומעוגלת
+  public static ToolTip Tip(string text) => new ToolTip {
+    Background = Brushes.Transparent, BorderThickness = new Thickness(0), Padding = new Thickness(0), HasDropShadow = false, Placement = PlacementMode.Bottom, FlowDirection = FlowDirection.RightToLeft,
+    Content = new Border { Background = new SolidColorBrush(Color.FromRgb(51, 65, 85)), CornerRadius = new CornerRadius(12), Padding = new Thickness(14, 10, 14, 10), MaxWidth = 320, Margin = new Thickness(0, 4, 0, 0),
+      Child = new TextBlock { Text = text, Foreground = Brushes.White, FontSize = 13, LineHeight = 20, TextWrapping = TextWrapping.Wrap } } };
+  public static T Tipped<T>(T e, string text) where T : FrameworkElement { e.ToolTip = Tip(text); ToolTipService.SetInitialShowDelay(e, 200); ToolTipService.SetShowDuration(e, 60000); return e; }
+  // אייקון ⓘ שמציג בועת הסבר במעבר עכבר
+  public static Border Info(string text) => Tipped(new Border { Width = 22, Height = 22, Background = Brushes.Transparent, Cursor = System.Windows.Input.Cursors.Help, VerticalAlignment = VerticalAlignment.Center, Child = Glyph("\uE946", 15, Accent) }, text);
   // סגנון עדין (רקע בהיר, מסגרת דקה) ללחצנים בסרגל העליון
   public static Style Soft(Type t) {
     var s = new Style(t);
@@ -277,6 +285,7 @@ public static class Program {
         while (true) { var k = MainWin.Ask("הזן קוד כניסה"); if (k == null) return; if (Config.Check(k, c.AppCode)) { Code = k; break; } MessageBox.Show("קוד שגוי"); }
       }
       if (Code != null && Config.Up() && !Config.Auth(Code)) MessageBox.Show("האימות מול שירות ההגנה נכשל");
+      if (!c.Terms) { if (!MainWin.TermsDialog()) return; c.Terms = true; try { c.Save(); } catch { } }
       var w = new MainWin(c); app.MainWindow = w; app.ShutdownMode = ShutdownMode.OnMainWindowClose; app.Run(w);
     } catch (Exception x) { MessageBox.Show(x.ToString(), "DeviceGuard – שגיאה"); }
   }
@@ -296,6 +305,9 @@ public class MainWin : Window {
     var un = Btn("פתיחה זמנית (30 דק׳)", () => { }, "\uE785");
     var softFg = Color.FromRgb(52, 90, 158); var softBr = new SolidColorBrush(softFg);
     foreach (var (sb, sg, st) in new[] { (ap, "\uE73E", "החל שינויים"), (un, "\uE785", "פתיחה זמנית (30 דק׳)") }) { sb.Style = Theme.Soft(typeof(Button)); Theme.Tint(sb, Color.FromRgb(238, 243, 252), softFg, Color.FromRgb(206, 220, 242)); sb.Content = Theme.IconText(sg, st, softBr); }
+    Theme.Tipped(tg, "המתג הראשי: הפעלה או השבתה של כל החסימות בבת אחת. השינוי מוחל מיד.");
+    Theme.Tipped(ap, "מחיל על המחשב את כל החסימות וההגדרות שבחרת. יש ללחוץ עליו אחרי שינוי.");
+    Theme.Tipped(un, "פותח את כל החסימות ל-30 דקות אחרי הקשת קוד ברירת המחדל, ואחר כך הן חוזרות אוטומטית.");
     un.Click += async (s, e) => {
       var k = Ask("קוד ברירת מחדל"); if (k == null) return; if (!Config.Check(k, C.DefaultCode)) { MessageBox.Show(C.DefaultCode == null ? "לא הוגדר קוד ברירת מחדל (חלון 1)" : "קוד שגוי"); return; }
       IsEnabled = false; await Task.Run(() => Enforcer.Revert(C)); C.Save(); IsEnabled = true;
@@ -307,7 +319,7 @@ public class MainWin : Window {
     var side = new Border { Width = 92, Background = Brushes.White, BorderBrush = line, BorderThickness = new Thickness(0, 0, 1, 0) };
     var sideSp = new StackPanel(); side.Child = sideSp;
     var pages = new (string, string, Func<UIElement>)[] { ("הגדרות כלליות", "\uE713", P1), ("תוכנות מותקנות", "\uE71D", P2), ("תוכנות ניידות", "\uE8A7", P3), ("סוגי קבצים", "\uE8A5", P4), ("קבצים ותיקיות", "\uE8B7", P5) };
-    sideSp.Children.Add(new Border { Width = 42, Height = 42, CornerRadius = new CornerRadius(13), Background = Theme.SideAccent, Margin = new Thickness(0, 20, 0, 18), HorizontalAlignment = HorizontalAlignment.Center, Child = Theme.Glyph("\uE72E", 21, Brushes.White) });
+    var logoImg = new Image { Source = Logo.Src, Width = 54, Height = 54, Margin = new Thickness(0, 18, 0, 16), HorizontalAlignment = HorizontalAlignment.Center }; RenderOptions.SetBitmapScalingMode(logoImg, BitmapScalingMode.HighQuality); sideSp.Children.Add(logoImg);
     int selIdx = 0; var paints = new List<Action>();
     var mute = new SolidColorBrush(Color.FromRgb(107, 114, 128)); var selBg = new SolidColorBrush(Color.FromRgb(239, 246, 255)); var hoverBg = new SolidColorBrush(Color.FromRgb(243, 244, 246));
     for (int i = 0; i < pages.Length; i++) {
@@ -329,7 +341,8 @@ public class MainWin : Window {
     PreviewKeyDown += (s, e) => { if (e.Key == System.Windows.Input.Key.F && System.Windows.Input.Keyboard.Modifiers == System.Windows.Input.ModifierKeys.Control) { sbox?.Focus(); sbox?.SelectAll(); e.Handled = true; } };
     var topBar = new Border { Child = top, Background = Brushes.White, BorderBrush = line, BorderThickness = new Thickness(0, 0, 0, 1) };
     var root = new DockPanel(); DockPanel.SetDock(topBar, Dock.Top); DockPanel.SetDock(side, Dock.Left); // ב-RTL: מופיע מימין
-    root.Children.Add(topBar); root.Children.Add(side); root.Children.Add(host); Content = root; host.Content = P1(); Closing += (s, e) => { foreach (var r in opened) if (C.Master && r.On) Enforcer.Relock(r); };
+    var foot = new TextBlock { Text = "האחריות על המשתמש בלבד, בעז\"ה שישמש לדברים חיובים.", FontSize = 12, Foreground = new SolidColorBrush(Color.FromRgb(148, 163, 184)), HorizontalAlignment = HorizontalAlignment.Center, TextAlignment = TextAlignment.Center, Margin = new Thickness(0, 7, 0, 9) }; DockPanel.SetDock(foot, Dock.Bottom);
+    root.Children.Add(foot); root.Children.Add(topBar); root.Children.Add(side); root.Children.Add(host); Content = root; host.Content = P1(); Closing += (s, e) => { foreach (var r in opened) if (C.Master && r.On) Enforcer.Relock(r); };
   }
   async Task Do() {
     if (C.Master && C.DefaultCode == null && C.All().Any(r => r.On && r.Mode == Mode.Code && r.OwnCode == null)) { MessageBox.Show("יש חסימות בקוד שאין להן קוד. הגדר קוד ברירת מחדל (חלון 1) או קוד נפרד לכל חסימה."); return; }
@@ -374,7 +387,7 @@ public class MainWin : Window {
     if (glyph == null && remove != null) glyph = Directory.Exists(r.Path) ? "\uE8B7" : "\uE8A5";
     var p = new WrapPanel { VerticalAlignment = VerticalAlignment.Center }; var m12 = new Thickness(0, 4, 12, 4);
     if (glyph != null) p.Children.Add(Theme.Badge(glyph));
-    var on = new CheckBox { Content = r.Name, IsChecked = r.On, MinWidth = 280, FontWeight = FontWeights.SemiBold, VerticalAlignment = VerticalAlignment.Center, Margin = m12 }; on.Click += (s, e) => { r.On = on.IsChecked == true; C.Save(); };
+    var on = new CheckBox { Content = r.Name, IsChecked = r.On, FontWeight = FontWeights.SemiBold, VerticalAlignment = VerticalAlignment.Center }; on.Click += (s, e) => { if (ReferenceEquals(r, C.Net) && on.IsChecked == true && !NetWarn()) { on.IsChecked = false; return; } r.On = on.IsChecked == true; C.Save(); };
     var sep = new CheckBox { Content = "קוד נפרד", IsChecked = r.OwnCode != null, VerticalAlignment = VerticalAlignment.Center, Margin = m12 };
     var hid = new CheckBox { Content = "נסתר", IsChecked = r.Hidden, VerticalAlignment = VerticalAlignment.Center, Margin = m12 };
     Button? ob = null;
@@ -382,11 +395,57 @@ public class MainWin : Window {
     var seg = Segment(new[] { "חסימה גמורה", "חסימה בקוד" }, (int)r.Mode, i => { r.Mode = (Mode)i; V(); C.Save(); });
     sep.Click += (s, e) => { if (sep.IsChecked == true) { var k = Ask("קוד נפרד עבור: " + r.Name, true); if (k == null) { sep.IsChecked = false; return; } r.OwnCode = Config.Hash(k); } else r.OwnCode = null; C.Save(); };
     hid.Click += (s, e) => { r.Hidden = hid.IsChecked == true; C.Save(); };
-    p.Children.Add(on); p.Children.Add(seg); p.Children.Add(sep); p.Children.Add(hid); if (canOpen) { ob = Btn("פתח בקוד", () => OpenWithCode(r), "\uE785"); ob.Margin = m12; p.Children.Add(ob); } V();
-    if (wl != null) { var b = Btn("רשימה לבנה", () => { var x = Pick("רשימה לבנה – " + r.Name, wl(), r.White); if (x != null) { r.White = x; C.Save(); } }, "\uE8FD"); b.Margin = m12; p.Children.Add(b); }
-    if (remove != null) { var d = new Button { Content = Theme.Glyph("\uE74D", 15, new SolidColorBrush(Color.FromRgb(185, 28, 28))), Style = Theme.Soft(typeof(Button)), Padding = new Thickness(10, 7, 10, 7), Margin = new Thickness(0, 4, 0, 4) }; Theme.Tint(d, Color.FromRgb(254, 242, 242), Color.FromRgb(185, 28, 28), Color.FromRgb(245, 198, 198)); d.Click += (s, e) => remove(); p.Children.Add(d); }
+    var head = new StackPanel { Orientation = Orientation.Horizontal, MinWidth = 280, Margin = m12, VerticalAlignment = VerticalAlignment.Center }; head.Children.Add(on);
+    var rt = RuleTip(r); if (rt != null) { var inf = Theme.Info(rt); inf.Margin = new Thickness(8, 0, 0, 0); head.Children.Add(inf); }
+    Theme.Tipped((FrameworkElement)seg, "חסימה גמורה – הפריט חסום לחלוטין ואי אפשר לפתוח אותו.\nחסימה בקוד – מי שמקיש את הקוד הנכון יכול לפתוח אותו.");
+    Theme.Tipped(sep, "משתמש בקוד מיוחד לפריט הזה, במקום בקוד ברירת המחדל.");
+    Theme.Tipped(hid, "מסתיר את הפריט כך שלא יופיע בסייר הקבצים. פועל בחסימה גמורה.");
+    p.Children.Add(head); p.Children.Add(seg); p.Children.Add(sep); p.Children.Add(hid); if (canOpen) { ob = Btn("פתח בקוד", () => OpenWithCode(r), "\uE785"); ob.Margin = m12; Theme.Tipped(ob, "פותח את הפריט אחרי הקשת קוד, ונועל אותו שוב אוטומטית כשסוגרים אותו."); p.Children.Add(ob); } V();
+    if (wl != null) { var b = Btn("רשימה לבנה", () => { var x = Pick("רשימה לבנה – " + r.Name, wl(), r.White); if (x != null) { r.White = x; C.Save(); } }, "\uE8FD"); b.Margin = m12; Theme.Tipped(b, WlTip(r)); p.Children.Add(b); }
+    if (remove != null) { var d = new Button { Content = Theme.Glyph("\uE74D", 15, new SolidColorBrush(Color.FromRgb(185, 28, 28))), Style = Theme.Soft(typeof(Button)), Padding = new Thickness(10, 7, 10, 7), Margin = new Thickness(0, 4, 0, 4) }; Theme.Tint(d, Color.FromRgb(254, 242, 242), Color.FromRgb(185, 28, 28), Color.FromRgb(245, 198, 198)); d.Click += (s, e) => remove(); Theme.Tipped(d, "מסיר את הפריט מהרשימה ומבטל את החסימה שלו."); p.Children.Add(d); }
     return new Border { Child = p, Background = Brushes.White, CornerRadius = new CornerRadius(14), Padding = new Thickness(16, 12, 16, 12), Margin = new Thickness(0, 0, 0, 12), BorderBrush = new SolidColorBrush(Color.FromRgb(230, 235, 242)), BorderThickness = new Thickness(1), Effect = new System.Windows.Media.Effects.DropShadowEffect { BlurRadius = 16, ShadowDepth = 2, Opacity = 0.05, Color = Color.FromRgb(30, 41, 59) } };
   }
+  // חלון אישור אחריות – מופיע פעם אחת בלבד, בהפעלה הראשונה אחרי הקשת הקוד
+  public static bool TermsDialog() {
+    bool ok = false;
+    var w = new Window { Title = "DeviceGuard", Topmost = true, WindowStartupLocation = WindowStartupLocation.CenterScreen, ResizeMode = ResizeMode.NoResize, SizeToContent = SizeToContent.Height, Width = 420, FlowDirection = FlowDirection.RightToLeft, Background = new SolidColorBrush(Color.FromRgb(248, 250, 252)), FontFamily = new FontFamily("Segoe UI"), Foreground = new SolidColorBrush(Color.FromRgb(30, 41, 59)) };
+    var sp = new StackPanel { Margin = new Thickness(28, 24, 28, 24) };
+    sp.Children.Add(new Border { Width = 52, Height = 52, CornerRadius = new CornerRadius(16), Background = new SolidColorBrush(Color.FromRgb(238, 243, 252)), HorizontalAlignment = HorizontalAlignment.Center, Child = Theme.Glyph("\uE72E", 26, Theme.Accent) });
+    sp.Children.Add(new TextBlock { Text = "שים לב", FontSize = 20, FontWeight = FontWeights.SemiBold, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 14, 0, 10) });
+    sp.Children.Add(new TextBlock { Text = "השימוש בתוכנה על אחריות המשתמש בלבד", FontSize = 15, LineHeight = 24, TextWrapping = TextWrapping.Wrap, TextAlignment = TextAlignment.Center, Margin = new Thickness(0, 0, 0, 22) });
+    var b = new Button { Content = "אני מאשר", IsDefault = true, FontSize = 15, Padding = new Thickness(40, 9, 40, 9), HorizontalAlignment = HorizontalAlignment.Center }; b.Click += (s, e) => { ok = true; w.Close(); };
+    sp.Children.Add(b); w.Content = sp; w.ShowDialog(); return ok;
+  }
+  // אזהרה שמופיעה בהפעלת חסימת חיבור לרשת; מחזיר true רק אחרי שלוחצים "הבנתי"
+  bool NetWarn() {
+    bool ok = false;
+    var w = new Window { Title = "שים לב", Owner = this, WindowStartupLocation = WindowStartupLocation.CenterOwner, ResizeMode = ResizeMode.NoResize, ShowInTaskbar = false, SizeToContent = SizeToContent.Height, Width = 440, FlowDirection = FlowDirection.RightToLeft, Background = new SolidColorBrush(Color.FromRgb(248, 250, 252)), FontFamily = new FontFamily("Segoe UI"), Foreground = new SolidColorBrush(Color.FromRgb(30, 41, 59)) };
+    var sp = new StackPanel { Margin = new Thickness(28, 24, 28, 24) };
+    sp.Children.Add(new Border { Width = 52, Height = 52, CornerRadius = new CornerRadius(16), Background = new SolidColorBrush(Color.FromRgb(254, 243, 199)), HorizontalAlignment = HorizontalAlignment.Center, Child = Theme.Glyph("\uE7BA", 26, new SolidColorBrush(Color.FromRgb(180, 83, 9))) });
+    sp.Children.Add(new TextBlock { Text = "שים לב", FontSize = 20, FontWeight = FontWeights.SemiBold, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 14, 0, 10) });
+    sp.Children.Add(new TextBlock { Text = "חוץ מחסימה זו יש להתקין תעודת אבטחה - נטפרי וכדו' (החוסם את חיבור המחשב לאינטרנט ללא סינון) ואין להסתמך רק על חסימה זו, אינטרנט ללא סינון מסוכן מאד !", FontSize = 15, LineHeight = 24, TextWrapping = TextWrapping.Wrap, TextAlignment = TextAlignment.Center, Margin = new Thickness(0, 0, 0, 22) });
+    var b = new Button { Content = "הבנתי", IsDefault = true, FontSize = 15, Padding = new Thickness(40, 9, 40, 9), HorizontalAlignment = HorizontalAlignment.Center }; b.Click += (s, e) => { ok = true; w.Close(); };
+    sp.Children.Add(b); w.Content = sp; w.ShowDialog(); return ok;
+  }
+  string? RuleTip(Rule r) {
+    if (ReferenceEquals(r, C.Settings)) return "חוסם את הגישה להגדרות המחשב וללוח הבקרה. בחסימה גמורה אפשר להשאיר דפי הגדרות מסוימים פתוחים ברשימה הלבנה. בחסימה בקוד נדרש קוד כדי להיכנס להגדרות.";
+    if (ReferenceEquals(r, C.Install)) return "חוסם התקנה של תוכנות באמצעות מתקין Windows (קובצי MSI). בחסימה בקוד נדרש קוד כדי להתקין.";
+    if (ReferenceEquals(r, C.Net)) return "חוסם חיבור לרשת: מתאמי רשת קוויים מושבתים, ובכרטיס Wi-Fi נחסמות כל הרשתות – גם כאלה שלא היו זמינות בזמן ההחלה. ברשימה הלבנה אפשר להשאיר מתאם או רשת Wi-Fi מסוימת מותרים.";
+    if (ReferenceEquals(r, C.Usb)) return "חוסם את כל ההתקנים החיצוניים (דיסק און קי, דיסק נייד) – גם כאלה שעדיין לא חוברו למחשב. ברשימה הלבנה מופיעים ההתקנים המחוברים כרגע: התקן שתבחר ייזכר ויורשה גם בחיבורים הבאים, ושאר ההתקנים יישארו חסומים.";
+    if (ReferenceEquals(r, C.Portable)) return "חוסם הרצת תוכנות מכל מקום מחוץ ל-Windows ול-Program Files, כולל אפליקציות שמותקנות בתיקיית המשתמש. אפשר להתיר תוכנות מסוימות ברשימה הלבנה. החסימה היא גמורה בלבד.";
+    if (ReferenceEquals(r, C.Movies)) return "חוסם קובצי וידאו (כגון mp4, avi, mkv) בכל הכוננים, וגם קבצים חדשים שיתווספו בהמשך.";
+    if (ReferenceEquals(r, C.Songs)) return "חוסם קובצי שמע ושירים (כגון mp3, wav, flac) בכל הכוננים, וגם קבצים חדשים שיתווספו בהמשך.";
+    if (ReferenceEquals(r, C.Images)) return "חוסם קובצי תמונות (כגון jpg, png, gif) בכל הכוננים, וגם קבצים חדשים שיתווספו בהמשך.";
+    if (C.Paths.Contains(r)) return "חוסם גישה לקובץ או לתיקייה הזו: קריאה, הפעלה ומחיקה. בחסימה בקוד הפריט מוסתר ונפתח רק דרך הכפתור 'פתח בקוד'.";
+    if (C.Exts.Contains(r)) return "חוסם את כל הקבצים בסיומת הזו בכל הכוננים, וגם קבצים חדשים שיתווספו בהמשך.";
+    if (!string.IsNullOrEmpty(r.Path)) return "חוסם את הפעלת התוכנה הזו. בחסימה גמורה היא לא נפתחת, ובחסימה בקוד נדרש קוד כדי להפעיל אותה.";
+    return null;
+  }
+  string WlTip(Rule r) =>
+    ReferenceEquals(r, C.Usb) ? "ההתקנים המחוברים כרגע מוצגים ברשימה. התקן שתסמן ייזכר ויורשה גם בחיבורים הבאים, ושאר ההתקנים יישארו חסומים." :
+    ReferenceEquals(r, C.Net) ? "בחר מתאמי רשת או רשתות Wi-Fi שיישארו מותרים. כל השאר ייחסמו." :
+    ReferenceEquals(r, C.Settings) ? "בחר דפי הגדרות שיישארו פתוחים. כל השאר ייחסמו." :
+    "פריטים שתסמן ברשימה הלבנה לא ייחסמו.";
   static ScrollViewer Page(string title, string glyph, params UIElement[] items) {
     var sp = new StackPanel { Margin = new Thickness(28, 22, 28, 22) };
     var h = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 18) };
@@ -457,6 +516,11 @@ public class MainWin : Window {
       C.Master = false; Enforcer.Apply(C); Config.Pipe("UNINSTALL|" + Config.Token); Config.Token = null; MessageBox.Show("השירות יוסר בעוד מספר שניות");
     }, "\uE74D");
     var note = new TextBlock { Text = "הערה: רשימה לבנה של הגדרות/רשת/התקנים פועלת בחסימה גמורה.", Foreground = Brushes.Gray, Margin = new Thickness(0, 8, 0, 0), TextWrapping = TextWrapping.Wrap };
+    Theme.Tipped(all, "מסומן: החסימות פועלות בכל חשבונות המשתמשים במחשב. לא מסומן: רק בחשבון המשתמש הנוכחי.");
+    Theme.Tipped(code, "קוד ברירת המחדל משמש לפתיחת כל חסימה בקוד שלא הוגדר לה קוד נפרד.");
+    Theme.Tipped(exp, "שומר את ההגדרות לקובץ, לגיבוי או להעברה למחשב אחר.");
+    Theme.Tipped(imp, "טוען הגדרות מקובץ שיוצא קודם. אחרי הטעינה לוחצים 'החל שינויים'.");
+    Theme.Tipped(un2, "מכבה את כל החסימות ומסיר את שירות ההגנה מהמחשב, אחרי הקשת קוד הכניסה.");
     return Page("הגדרות כלליות", "\uE713", code, all, Row(C.Settings, () => SettingsPages, false, null, "\uE713"), Row(C.Install, null, false, null, "\uE896"), Row(C.Net, net, false, null, "\uE774"), Row(C.Usb, usb, false, null, "\uE88E"), new StackPanel { Orientation = Orientation.Horizontal, Children = { exp, imp, un2 } }, note);
   }
   Dictionary<string, object> Sections() => new() { ["1"] = new { C.AllUsers, C.Settings, C.Install, C.Net, C.Usb }, ["2"] = C.Programs, ["3"] = C.Portable, ["4"] = new { C.Movies, C.Songs, C.Images, C.Exts }, ["5"] = C.Paths };
@@ -539,6 +603,7 @@ public class MainWin : Window {
     var drop = new Border { BorderBrush = new SolidColorBrush(Color.FromRgb(203, 213, 225)), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(14), Height = 90, Margin = new Thickness(0, 12, 0, 0), AllowDrop = true, Background = new SolidColorBrush(Color.FromRgb(252, 253, 254)), Child = new TextBlock { Text = "גרור לכאן תוכנה ניידת כדי להוסיפה לרשימה הלבנה", HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center } };
     drop.Drop += (s, e) => { if (e.Data.GetData(DataFormats.FileDrop) is string[] fs) { foreach (var f in fs) if (!C.Portable.White.Contains(f)) C.Portable.White.Add(f); C.Save(); MessageBox.Show($"נוספו {fs.Length} פריטים"); } };
     var warn = new TextBlock { Text = "חסימת ניידות חוסמת הרצה מכל מקום מחוץ ל-Windows ו-Program Files (כולל אפליקציות שמותקנות בתיקיית המשתמש). חסימה זו היא גמורה בלבד.", TextWrapping = TextWrapping.Wrap, Foreground = Brushes.Gray, Margin = new Thickness(0, 8, 0, 0) };
+    Theme.Tipped(drop, "גרור לכאן תוכנה ניידת והיא תתווסף לרשימה הלבנה ותורשה לפעול.");
     return Page("תוכנות ניידות", "\uE8A7", Row(C.Portable, opts, false, null, "\uE8A7"), drop, warn);
   }
 

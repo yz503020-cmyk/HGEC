@@ -14,6 +14,8 @@ public class Config {
     Net = new() { Name = "חסימת חיבור לרשת" }, Usb = new() { Name = "חסימת התקנים חיצוניים" },
     Portable = new() { Name = "חסימת תוכנות ניידות" }, Movies = new() { Name = "חסימת סרטים" },
     Songs = new() { Name = "חסימת שירים" }, Images = new() { Name = "חסימת תמונות" };
+  public Rule NetApps = new() { Name = "חסימת חיבור לרשת לפי תוכנה" };   // חלון "רשת": רשימת התוכנות נשמרת ב-NetApps.White
+  public bool NetAppsWhite;   // false = רשימה שחורה (התוכנות ברשימה נחסמות), true = רשימה לבנה (רק התוכנות ברשימה מתחברות)
   public List<Rule> Programs = new(), Exts = new(), Paths = new();
   public List<string> Applied = new();
   public IEnumerable<Rule> All() => new[] { Settings, Install, Net, Usb, Portable, Movies, Songs, Images }.Concat(Programs).Concat(Exts).Concat(Paths);

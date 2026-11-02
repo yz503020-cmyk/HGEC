@@ -149,7 +149,7 @@ public static class Program {
       var p = line.Split('|', 4); var cfgPath = System.IO.Path.Combine(Config.Dir, "config.json");
       switch (p[0]) {
         case "HELLO": return "OK";
-        case "VER": return "3";
+        case "VER": return "4";
         case "AUTH": {
             if (DateTime.UtcNow < authLock) return "LOCK";
             if (Config.Check(string.Join("|", p.Skip(1)), Config.Load().AppCode)) { authFails = 0; var t = Guid.NewGuid().ToString("N"); tokens[t] = true; return "TOKEN|" + t; }
@@ -169,6 +169,7 @@ public static class Program {
               fails[p[1]] = n >= 5 ? (0, DateTime.UtcNow.AddSeconds(60)) : (n, DateTime.MinValue); return "BAD";
             }
             fails.TryRemove(p[1], out _); Enforcer.Unlock(r, c); lease[p[1]] = DateTime.UtcNow; return "OK"; }
+        case "SCAN": return $"{Enforcer.ScanId}|{Enforcer.ScanStartTicks}|{Enforcer.ScanDone}|{Enforcer.ScanTotal}|{(Enforcer.ScanRunning ? 1 : 0)}|{(Enforcer.ScanFinished ? 1 : 0)}";
         case "AUTHPID": if (p.Length > 1 && int.TryParse(p[1], out var apid)) authPid[apid] = true; return "OK";
         case "PING": if (lease.ContainsKey(p[1])) lease[p[1]] = DateTime.UtcNow; return "OK";
         case "RELOCK": {
@@ -211,7 +212,7 @@ public static class Program {
       } catch { }
     }
     foreach (var dr in DriveInfo.GetDrives().Where(x => (x.DriveType == DriveType.Fixed || x.DriveType == DriveType.Removable) && x.IsReady)) Watch1(dr.RootDirectory.FullName);
-    var cfg = System.IO.Path.Combine(Config.Dir, "config.json"); var stamp = DateTime.MinValue; var c = new Config(); var kill = new HashSet<string>(StringComparer.OrdinalIgnoreCase); var lastScan = DateTime.MinValue; var ifeo = new List<(string Exe, string Id)>(); var lastHeal = DateTime.MinValue;
+    var cfg = System.IO.Path.Combine(Config.Dir, "config.json"); var stamp = DateTime.MinValue; var c = new Config(); var kill = new HashSet<string>(StringComparer.OrdinalIgnoreCase); var lastScan = DateTime.MinValue; var ifeo = new List<(string Exe, string Id)>(); var lastHeal = DateTime.MinValue; var lastNetHeal = DateTime.UtcNow;
     bool pendingDone = false; Task scanTask = Task.CompletedTask; CancellationTokenSource? scanCts = null;
     void StartScan(Dictionary<string, Rule> map, bool release, string? root = null) {   // סריקה אחת ברקע בכל פעם; שינוי הגדרות מבטל סריקה קודמת
       if (release) scanCts?.Cancel();
@@ -260,6 +261,7 @@ public static class Program {
           }
           if (curMap.Count > 0 && scanTask.IsCompleted && (DateTime.UtcNow - lastScan).TotalMinutes >= 10) { lastScan = DateTime.UtcNow; StartScan(curMap, false); }
           if ((DateTime.UtcNow - ts).TotalSeconds > 5 && (DateTime.UtcNow - lastHeal).TotalSeconds >= 5) { lastHeal = DateTime.UtcNow; Enforcer.Heal(ifeo); }
+          if (c.NetApps.On && (DateTime.UtcNow - ts).TotalSeconds > 20 && (DateTime.UtcNow - lastNetHeal).TotalSeconds >= 30) { lastNetHeal = DateTime.UtcNow; var cc = c; Task.Run(() => Enforcer.NetHeal(cc)); }
         } else { while (q.TryDequeue(out _)) { } }
         if (DateTime.UtcNow.Second == 0) {   // ניקוי תקופתי של מזהי תהליכים שכבר לא רצים (כדי שמספר pid לא יישאר מסומן לנצח)
           foreach (var pid in authPid.Keys.ToArray()) if (!Alive(pid)) authPid.TryRemove(pid, out _);
@@ -299,6 +301,7 @@ public static class Program {
   }
 }
 public class MainWin : Window {
+  Border scanBar = null!, scanFill = null!; TextBlock scanTxt = null!; DispatcherTimer? scanTmr; bool scanBusy; long scanFrom; const double ScanW = 150;
   Config C; Func<UIElement>? cur; readonly List<Rule> opened = new(); List<(string N, string E)>? inst; ContentControl host = new(); TextBlock status = new(); DispatcherTimer? tmr;
   public MainWin(Config c) {
     C = c; Title = "DeviceGuard – מנהל חסימות"; Width = 1050; Height = 720; FlowDirection = FlowDirection.RightToLeft; FontSize = 14; Background = new SolidColorBrush(Color.FromRgb(248, 250, 252)); FontFamily = new FontFamily("Segoe UI"); Foreground = new SolidColorBrush(Color.FromRgb(30, 41, 59));
@@ -321,12 +324,13 @@ public class MainWin : Window {
       IsEnabled = false; await Task.Run(() => Enforcer.Revert(C)); C.Save(); IsEnabled = true;
       tmr?.Stop(); tmr = new DispatcherTimer { Interval = TimeSpan.FromMinutes(30) }; tmr.Tick += async (a, b) => { tmr.Stop(); await Do(); }; tmr.Start(); status.Text = "החסימות פתוחות זמנית";
     };
+    InitScanBar();
     var top = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0), Background = Brushes.White };
-    top.Children.Add(tg); top.Children.Add(ap); top.Children.Add(un); top.Children.Add(SearchBox()); top.Children.Add(status); status.Foreground = new SolidColorBrush(Color.FromRgb(100, 116, 139)); status.FontSize = 13; foreach (FrameworkElement ch in top.Children) { ch.Margin = new Thickness(8, 10, 0, 10); ch.VerticalAlignment = VerticalAlignment.Center; }
+    top.Children.Add(tg); top.Children.Add(ap); top.Children.Add(un); top.Children.Add(SearchBox()); top.Children.Add(status); top.Children.Add(scanBar); status.Foreground = new SolidColorBrush(Color.FromRgb(100, 116, 139)); status.FontSize = 13; foreach (FrameworkElement ch in top.Children) { ch.Margin = new Thickness(8, 10, 0, 10); ch.VerticalAlignment = VerticalAlignment.Center; }
     var line = new SolidColorBrush(Color.FromRgb(229, 231, 235));
     var side = new Border { Width = 92, Background = Brushes.White, BorderBrush = line, BorderThickness = new Thickness(0, 0, 1, 0) };
     var sideSp = new StackPanel(); side.Child = sideSp;
-    var pages = new (string, string, Func<UIElement>)[] { ("הגדרות כלליות", "\uE713", P1), ("תוכנות מותקנות", "\uE71D", P2), ("תוכנות ניידות", "\uE8A7", P3), ("סוגי קבצים", "\uE8A5", P4), ("קבצים ותיקיות", "\uE8B7", P5) };
+    var pages = new (string, string, Func<UIElement>)[] { ("הגדרות כלליות", "\uE713", P1), ("תוכנות מותקנות", "\uE71D", P2), ("תוכנות ניידות", "\uE8A7", P3), ("סוגי קבצים", "\uE8A5", P4), ("קבצים ותיקיות", "\uE8B7", P5), ("רשת", "\uE774", P6) };
     var logoImg = new Image { Source = Logo.Src, Width = 54, Height = 54, Margin = new Thickness(0, 18, 0, 16), HorizontalAlignment = HorizontalAlignment.Center }; RenderOptions.SetBitmapScalingMode(logoImg, BitmapScalingMode.HighQuality); sideSp.Children.Add(logoImg);
     int selIdx = 0; var paints = new List<Action>();
     var mute = new SolidColorBrush(Color.FromRgb(107, 114, 128)); var selBg = new SolidColorBrush(Color.FromRgb(239, 246, 255)); var hoverBg = new SolidColorBrush(Color.FromRgb(243, 244, 246));
@@ -358,8 +362,39 @@ public class MainWin : Window {
     try {
       await Task.Factory.StartNew(() => Enforcer.Apply(C), CancellationToken.None, TaskCreationOptions.None, new StaTaskScheduler());
       status.Text = "הוחל ✓" + (Enforcer.Blocked > 0 || Enforcer.Failed > 0 ? $" (נחסמו {Enforcer.Blocked} קבצים" + (Enforcer.Failed > 0 ? $", נכשלו {Enforcer.Failed}: {Enforcer.LastErr}" : "") + ")" : "");
+      StartScanWatch();
     } catch (Exception x) { status.Text = "שגיאה: " + x.Message; MessageBox.Show("שגיאה בהחלת החסימות: " + x.Message); }
     IsEnabled = true;
+  }
+
+  // ---------- התקדמות חסימת הקבצים ברקע (הסריקה רצה בשירות, ולכן אפשר להמשיך להשתמש בתוכנה) ----------
+  void InitScanBar() {
+    scanFill = new Border { Background = new SolidColorBrush(Color.FromRgb(134, 214, 160)), CornerRadius = new CornerRadius(7), HorizontalAlignment = HorizontalAlignment.Left, Width = 0 };
+    scanTxt = new TextBlock { FontSize = 12, FontWeight = FontWeights.SemiBold, Foreground = new SolidColorBrush(Color.FromRgb(21, 101, 52)), HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
+    var g = new Grid(); g.Children.Add(scanFill); g.Children.Add(scanTxt);
+    scanBar = new Border { Width = ScanW, Height = 26, CornerRadius = new CornerRadius(8), Background = new SolidColorBrush(Color.FromRgb(236, 244, 239)), BorderBrush = new SolidColorBrush(Color.FromRgb(206, 228, 214)), BorderThickness = new Thickness(1), Child = g, Visibility = Visibility.Collapsed };
+    Theme.Tipped(scanBar, "התקדמות חסימת הקבצים ברקע. אפשר להמשיך להשתמש בתוכנה בזמן הסריקה.");
+  }
+  void ScanShow(double f, string t) { scanFill.Width = Math.Max(0, (ScanW - 2) * Math.Min(1, f)); scanTxt.Text = t; }
+  void StartScanWatch() {
+    scanTmr?.Stop();
+    if (!(C.Master && Enforcer.ExtMap(C).Count > 0)) { scanBar.Visibility = Visibility.Collapsed; return; }
+    try { scanFrom = File.GetLastWriteTimeUtc(System.IO.Path.Combine(Config.Dir, "config.json")).Ticks; } catch { scanFrom = DateTime.UtcNow.Ticks; }
+    scanBar.Visibility = Visibility.Visible; ScanShow(0, "מתחיל…"); int miss = 0; var t0 = DateTime.UtcNow;
+    var tm = scanTmr = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(700) };
+    tm.Tick += async (s, e) => {
+      if (scanBusy) return; scanBusy = true;
+      try {
+        var resp = await Task.Run(() => Config.Pipe("SCAN", 1500)); var q = resp?.Split('|');
+        if (q == null || q.Length < 6) { if (++miss >= 10) { tm.Stop(); ScanShow(0, "השירות לא זמין"); } return; }
+        miss = 0; long st = long.Parse(q[1]); int done = int.Parse(q[2]), total = int.Parse(q[3]);
+        if (st < scanFrom) { ScanShow(0, "מתחיל…"); if ((DateTime.UtcNow - t0).TotalMinutes > 3) { tm.Stop(); scanBar.Visibility = Visibility.Collapsed; } return; }
+        if (q[5] == "1") { ScanShow(1, "סיים"); tm.Stop(); var cc = C; _ = Task.Run(() => Enforcer.ClearViewerCaches(cc)); return; }
+        if (total <= 0) { ScanShow(0, "מכין…"); return; }
+        double f = (double)done / total; ScanShow(f, (int)(f * 100) + "%");
+      } catch { } finally { scanBusy = false; }
+    };
+    tm.Start();
   }
 
   // ---------- דיאלוגים ----------
@@ -498,6 +533,7 @@ public class MainWin : Window {
     var items = new List<UIElement>();
     foreach (var (r, g, f) in new[] { (C.Settings, "\uE713", false), (C.Install, "\uE896", false), (C.Net, "\uE774", false), (C.Usb, "\uE88E", false), (C.Portable, "\uE8A7", false), (C.Movies, "\uE714", true), (C.Songs, "\uE8D6", true), (C.Images, "\uE91B", true) })
       if (M(r.Name)) items.Add(Row(r, null, f, null, g));
+    if (M(C.NetApps.Name)) items.Add(NetAppsRow());
     inst ??= Installed();
     foreach (var (n, e) in inst.Where(x => M(x.N) || M(System.IO.Path.GetFileName(x.E)))) items.Add(ProgRow(n, e));
     foreach (var r in C.Exts.Where(x => M(x.Name) || M(x.Path)).ToList()) { var rr = r; items.Add(Row(rr, null, true, () => { C.Exts.Remove(rr); C.Save(); host.Content = Search(q); })); }
@@ -512,11 +548,6 @@ public class MainWin : Window {
     var all = new CheckBox { Content = "החסימות יחולו על כל המשתמשים במחשב (אחרת – רק על משתמש זה)", IsChecked = C.AllUsers, Margin = new Thickness(0, 8, 0, 8) }; all.Click += (s, e) => { C.AllUsers = all.IsChecked == true; C.Save(); };
     var hard = new CheckBox { Content = "חיזוק חסימת קבצים: מונע מבעל הקובץ לשנות הרשאות ולהסיר את החסימה (יחול אחרי 'החל שינויים')", IsChecked = C.Harden, Margin = new Thickness(0, 0, 0, 8) }; hard.Click += (s, e) => { C.Harden = hard.IsChecked == true; C.Save(); };
     var code = Btn("הגדר / שנה קוד ברירת מחדל לחסימות", () => { var k = Ask("קוד ברירת מחדל", true); if (k != null) { C.DefaultCode = Config.Hash(k); C.Save(); MessageBox.Show("הקוד נשמר"); } });
-    var net = () => {
-      var items = System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces().Where(n => n.NetworkInterfaceType != System.Net.NetworkInformation.NetworkInterfaceType.Loopback).Select(n => (n.Name, n.Name)).ToList();
-      items.AddRange(WifiSsids());
-      return items.AsEnumerable();
-    };
     var usb = () => { try { using var s = new System.Management.ManagementObjectSearcher("SELECT Caption FROM Win32_DiskDrive WHERE InterfaceType='USB'"); return s.Get().Cast<System.Management.ManagementBaseObject>().Select(o => ((string)o["Caption"], (string)o["Caption"])).ToList().AsEnumerable(); } catch { return Enumerable.Empty<(string, string)>(); } };
     var exp = Btn("ייצוא הגדרות…", Export); var imp = Btn("ייבוא הגדרות…", Import);
     var un2 = Btn("הסרת שירות ההגנה (בקוד כניסה)", () => {
@@ -530,11 +561,11 @@ public class MainWin : Window {
     Theme.Tipped(exp, "שומר את ההגדרות לקובץ, לגיבוי או להעברה למחשב אחר.");
     Theme.Tipped(imp, "טוען הגדרות מקובץ שיוצא קודם. אחרי הטעינה לוחצים 'החל שינויים'.");
     Theme.Tipped(un2, "מכבה את כל החסימות ומסיר את שירות ההגנה מהמחשב, אחרי הקשת קוד הכניסה.");
-    return Page("הגדרות כלליות", "\uE713", code, all, hard, Row(C.Settings, () => SettingsPages, false, null, "\uE713"), Row(C.Install, null, false, null, "\uE896"), Row(C.Net, net, false, null, "\uE774"), Row(C.Usb, usb, false, null, "\uE88E"), new StackPanel { Orientation = Orientation.Horizontal, Children = { exp, imp, un2 } }, note);
+    return Page("הגדרות כלליות", "\uE713", code, all, hard, Row(C.Settings, () => SettingsPages, false, null, "\uE713"), Row(C.Install, null, false, null, "\uE896"), Row(C.Usb, usb, false, null, "\uE88E"), new StackPanel { Orientation = Orientation.Horizontal, Children = { exp, imp, un2 } }, note);
   }
-  Dictionary<string, object> Sections() => new() { ["1"] = new { C.AllUsers, C.Settings, C.Install, C.Net, C.Usb }, ["2"] = C.Programs, ["3"] = C.Portable, ["4"] = new { C.Movies, C.Songs, C.Images, C.Exts }, ["5"] = C.Paths };
+  Dictionary<string, object> Sections() => new() { ["1"] = new { C.AllUsers, C.Settings, C.Install, C.Usb }, ["2"] = C.Programs, ["3"] = C.Portable, ["4"] = new { C.Movies, C.Songs, C.Images, C.Exts }, ["5"] = C.Paths, ["6"] = new { C.Net, C.NetApps, C.NetAppsWhite } };
   void Export() {
-    var sel = Pick("מה לייצא?", Enumerable.Range(1, 5).Select(i => ($"חלון {i}", i.ToString())), new[] { "1", "2", "3", "4", "5" }); if (sel == null || sel.Count == 0) return;
+    var sel = Pick("מה לייצא?", Enumerable.Range(1, 6).Select(i => ($"חלון {i}", i.ToString())), new[] { "1", "2", "3", "4", "5", "6" }); if (sel == null || sel.Count == 0) return;
     var d = new SaveFileDialog { Filter = "DeviceGuard|*.dgcfg", FileName = "settings.dgcfg" }; if (d.ShowDialog() != true) return;
     File.WriteAllText(d.FileName, JsonSerializer.Serialize(Sections().Where(k => sel.Contains(k.Key)).ToDictionary(k => k.Key, k => k.Value), Config.O));
   }
@@ -542,11 +573,12 @@ public class MainWin : Window {
     var d = new OpenFileDialog { Filter = "DeviceGuard|*.dgcfg" }; if (d.ShowDialog() != true) return;
     try {
       using var doc = JsonDocument.Parse(File.ReadAllText(d.FileName)); var r = doc.RootElement; T D<T>(JsonElement e, string n) => e.GetProperty(n).Deserialize<T>(Config.O)!;
-      if (r.TryGetProperty("1", out var a)) { C.AllUsers = a.GetProperty("AllUsers").GetBoolean(); C.Settings = D<Rule>(a, "Settings"); C.Install = D<Rule>(a, "Install"); C.Net = D<Rule>(a, "Net"); C.Usb = D<Rule>(a, "Usb"); }
+      if (r.TryGetProperty("1", out var a)) { C.AllUsers = a.GetProperty("AllUsers").GetBoolean(); C.Settings = D<Rule>(a, "Settings"); C.Install = D<Rule>(a, "Install"); if (a.TryGetProperty("Net", out var oldNet)) C.Net = oldNet.Deserialize<Rule>(Config.O)!; C.Usb = D<Rule>(a, "Usb"); }
       if (r.TryGetProperty("2", out var b)) C.Programs = b.Deserialize<List<Rule>>(Config.O)!;
       if (r.TryGetProperty("3", out var c3)) C.Portable = c3.Deserialize<Rule>(Config.O)!;
       if (r.TryGetProperty("4", out var e)) { C.Movies = D<Rule>(e, "Movies"); C.Songs = D<Rule>(e, "Songs"); C.Images = D<Rule>(e, "Images"); C.Exts = D<List<Rule>>(e, "Exts"); }
       if (r.TryGetProperty("5", out var f)) C.Paths = f.Deserialize<List<Rule>>(Config.O)!;
+      if (r.TryGetProperty("6", out var g6)) { C.Net = D<Rule>(g6, "Net"); C.NetApps = D<Rule>(g6, "NetApps"); C.NetAppsWhite = D<bool>(g6, "NetAppsWhite"); }
       C.Save(); host.Content = P1(); status.Text = "יובא – לחץ 'החל שינויים'";
     } catch (Exception x) { MessageBox.Show("קובץ לא תקין: " + x.Message); }
   }
@@ -633,5 +665,77 @@ public class MainWin : Window {
     var f = Btn("הוסף קובץ…", () => { var d = new OpenFileDialog { Multiselect = true }; if (d.ShowDialog() == true) foreach (var x in d.FileNames) AddP(x); });
     var g = Btn("הוסף תיקייה…", () => { var d = new OpenFolderDialog(); if (d.ShowDialog() == true) AddP(d.FolderName); });
     Fill(); return Page("קבצים ותיקיות", "\uE8B7", new StackPanel { Orientation = Orientation.Horizontal, Children = { f, g } }, list);
+  }
+
+  // ---------- חלון 6 ----------
+  UIElement P6() {
+    var net = () => {
+      var items = System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces().Where(n => n.NetworkInterfaceType != System.Net.NetworkInformation.NetworkInterfaceType.Loopback).Select(n => (n.Name, n.Name)).ToList();
+      items.AddRange(WifiSsids());
+      return items.AsEnumerable();
+    };
+    var note = new TextBlock { Text = "הערה: רשימה לבנה של מתאמי רשת ורשתות Wi-Fi פועלת בחסימה גמורה. חסימה לפי תוכנה פועלת דרך חומת האש של Windows, והתוכנה משחזרת את הכללים אוטומטית אם נמחקו.", Foreground = Brushes.Gray, Margin = new Thickness(0, 8, 0, 0), TextWrapping = TextWrapping.Wrap };
+    return Page("רשת", "\uE774", Row(C.Net, net, false, null, "\uE774"), NetAppsRow(), note);
+  }
+  // חסימת חיבור לרשת לפי תוכנה: רשימה שחורה (התוכנות ברשימה לא יתחברו) או רשימה לבנה (רק התוכנות ברשימה יתחברו)
+  UIElement NetAppsRow() {
+    var r = C.NetApps; var m12 = new Thickness(0, 4, 12, 4); var red = new SolidColorBrush(Color.FromRgb(185, 28, 28));
+    var p = new WrapPanel { VerticalAlignment = VerticalAlignment.Center };
+    p.Children.Add(Theme.Badge("\uE71B"));
+    var on = new CheckBox { Content = r.Name, IsChecked = r.On, FontWeight = FontWeights.SemiBold, VerticalAlignment = VerticalAlignment.Center }; on.Click += (s, e) => { r.On = on.IsChecked == true; C.Save(); };
+    var head = new StackPanel { Orientation = Orientation.Horizontal, MinWidth = 280, Margin = m12, VerticalAlignment = VerticalAlignment.Center }; head.Children.Add(on);
+    var inf = Theme.Info("חוסם חיבור לרשת של תוכנות מסוימות, דרך חומת האש של Windows. ברשימה שחורה – התוכנות שבחרת לא יתחברו לרשת. ברשימה לבנה – רק התוכנות שבחרת יתחברו לרשת. יש ללחוץ 'החל שינויים' אחרי כל שינוי."); inf.Margin = new Thickness(8, 0, 0, 0); head.Children.Add(inf);
+    var hint = new TextBlock { Foreground = Brushes.Gray, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 0) };
+    void H() { hint.Text = C.NetAppsWhite ? "רשימה לבנה: רק התוכנות שברשימה יוכלו להתחבר לרשת, וכל שאר התוכנות ייחסמו. שירותי הרשת הבסיסיים של Windows (DNS ו-DHCP) נשארים פעילים. אם הרשימה ריקה – כל התוכנות ייחסמו." : "רשימה שחורה: התוכנות שברשימה לא יוכלו להתחבר לרשת. כל שאר התוכנות מתחברות כרגיל."; }
+    var seg = Segment(new[] { "רשימה שחורה", "רשימה לבנה" }, C.NetAppsWhite ? 1 : 0, i => { C.NetAppsWhite = i == 1; C.Save(); H(); });
+    Theme.Tipped((FrameworkElement)seg, "רשימה שחורה – התוכנות שברשימה נחסמות מהרשת.\nרשימה לבנה – רק התוכנות שברשימה מורשות להתחבר לרשת.");
+    H();
+    var list = new StackPanel { Margin = new Thickness(0, 10, 0, 0) };
+    void Fill() {
+      list.Children.Clear();
+      if (r.White.Count == 0) list.Children.Add(new TextBlock { Text = "לא נוספו תוכנות לרשימה.", Foreground = Brushes.Gray });
+      foreach (var path in r.White.ToList()) {
+        var pp = path;
+        var img = new Image { Source = Icon(pp), Width = 22, Height = 22, Margin = new Thickness(0, 0, 10, 0) }; DockPanel.SetDock(img, Dock.Left);
+        var d = new Button { Content = Theme.Glyph("\uE74D", 14, red), Style = Theme.Soft(typeof(Button)), Padding = new Thickness(8, 5, 8, 5), Margin = new Thickness(10, 0, 0, 0) }; Theme.Tint(d, Color.FromRgb(254, 242, 242), Color.FromRgb(185, 28, 28), Color.FromRgb(245, 198, 198));
+        d.Click += (s, e) => { r.White.Remove(pp); C.Save(); Fill(); }; DockPanel.SetDock(d, Dock.Right); Theme.Tipped(d, "מסיר את התוכנה מהרשימה.");
+        var tx = new TextBlock { Text = pp.StartsWith("pkg:") ? "אפליקציית Store  —  " + pp[4..] : pp.StartsWith("svc:") ? "שירות  —  " + pp[4..] : System.IO.Path.GetFileName(pp) + "  —  " + pp, VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis, ToolTip = pp };
+        var dp = new DockPanel { Margin = new Thickness(0, 3, 0, 3) }; dp.Children.Add(img); dp.Children.Add(d); dp.Children.Add(tx); list.Children.Add(dp);
+      }
+    }
+    void AddFiles(IEnumerable<string> fs) {
+      foreach (var f in fs) if (f.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) && !r.White.Any(x => x.Equals(f, StringComparison.OrdinalIgnoreCase))) r.White.Add(f);
+      C.Save(); Fill();
+    }
+    var add = Btn("הוסף תוכנה…", () => { var d = new OpenFileDialog { Multiselect = true, Filter = "תוכנות (*.exe)|*.exe" }; if (d.ShowDialog() == true) AddFiles(d.FileNames); });
+    bool Kind(string x) => x.StartsWith("pkg:", StringComparison.Ordinal) || x.StartsWith("svc:", StringComparison.Ordinal);
+    void PickKind(string prefix, string title, List<(string, string)> opts) {   // בחירה מתוך סוג אחד של רשומות (אפליקציות Store או שירותים), בלי לגעת בשאר הרשימה
+      foreach (var x in r.White.Where(y => y.StartsWith(prefix, StringComparison.Ordinal))) if (!opts.Any(o => o.Item2 == x)) opts.Add((x[prefix.Length..], x));
+      var res = Pick(title, opts, r.White); if (res == null) return;
+      r.White = r.White.Where(y => !y.StartsWith(prefix, StringComparison.Ordinal)).Concat(res).ToList(); C.Save(); Fill();
+    }
+    var pick = Btn("בחר מהתוכנות המותקנות…", () => {
+      inst ??= Installed();
+      var opts = r.White.Where(x => !Kind(x)).Select(x => (System.IO.Path.GetFileName(x) + "  —  " + x, x)).Concat(inst.Where(x => !r.White.Contains(x.E, StringComparer.OrdinalIgnoreCase)).Select(x => (x.N + "  —  " + x.E, x.E))).ToList();
+      var res = Pick("תוכנות – " + r.Name, opts, r.White); if (res != null) { r.White = res.Concat(r.White.Where(Kind)).ToList(); C.Save(); Fill(); }
+    }, "\uE71D");
+    var store = Btn("בחר אפליקציות Store…", () => {
+      var opts = new List<(string, string)>();
+      var outp = RunCmd("powershell.exe", "-NoLogo -NoProfile -NonInteractive -EncodedCommand " + Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes("Get-AppxPackage | ? { -not $_.IsFramework -and -not $_.IsResourcePackage } | Sort-Object Name | % { $_.Name + '|' + $_.PackageFamilyName }")));
+      foreach (var ln in outp.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)) { var z = ln.Split('|'); if (z.Length == 2) opts.Add((z[0], "pkg:" + z[1])); }
+      PickKind("pkg:", "אפליקציות Store – " + r.Name, opts);
+    }, "\uE719");
+    var svc = Btn("בחר שירותים…", () => {
+      var opts = new List<(string, string)>();
+      try { foreach (var sv in System.ServiceProcess.ServiceController.GetServices().OrderBy(z => z.DisplayName).ToList()) { opts.Add((sv.DisplayName + "  —  " + sv.ServiceName, "svc:" + sv.ServiceName)); sv.Dispose(); } } catch { }
+      PickKind("svc:", "שירותים – " + r.Name, opts);
+    }, "\uE713");
+    Theme.Tipped(add, "מוסיף קובצי הרצה (exe) לרשימה."); Theme.Tipped(pick, "בחירת תוכנות מתוך התוכנות המותקנות במחשב."); Theme.Tipped(store, "בחירת אפליקציות שהותקנו מ-Microsoft Store (הן אינן נשלטות לפי נתיב קובץ)."); Theme.Tipped(svc, "בחירת שירותי Windows (למשל עדכוני Windows), גם אם הם רצים דרך svchost.");
+    var drop = new Border { BorderBrush = new SolidColorBrush(Color.FromRgb(203, 213, 225)), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(14), Height = 60, Margin = new Thickness(0, 10, 0, 0), AllowDrop = true, Background = new SolidColorBrush(Color.FromRgb(252, 253, 254)), Child = new TextBlock { Text = "גרור לכאן תוכנות (exe) כדי להוסיף אותן לרשימה", HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center } };
+    drop.Drop += (s, e) => { if (e.Data.GetData(DataFormats.FileDrop) is string[] fs) AddFiles(fs); };
+    Fill();
+    p.Children.Add(head); p.Children.Add(seg); p.Children.Add(add); p.Children.Add(pick); p.Children.Add(store); p.Children.Add(svc);
+    var body = new StackPanel(); body.Children.Add(p); body.Children.Add(hint); body.Children.Add(drop); body.Children.Add(list);
+    return new Border { Child = body, Background = Brushes.White, CornerRadius = new CornerRadius(14), Padding = new Thickness(16, 12, 16, 12), Margin = new Thickness(0, 0, 0, 12), BorderBrush = new SolidColorBrush(Color.FromRgb(230, 235, 242)), BorderThickness = new Thickness(1), Effect = new System.Windows.Media.Effects.DropShadowEffect { BlurRadius = 16, ShadowDepth = 2, Opacity = 0.05, Color = Color.FromRgb(30, 41, 59) } };
   }
 }

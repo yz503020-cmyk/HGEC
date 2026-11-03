@@ -1,9 +1,26 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <OutputType>WinExe</OutputType><TargetFramework>net8.0-windows</TargetFramework>
-    <UseWPF>true</UseWPF><Nullable>enable</Nullable><ImplicitUsings>enable</ImplicitUsings>
-    <AssemblyName>DeviceGuard</AssemblyName><ApplicationManifest>app.manifest</ApplicationManifest><ApplicationIcon>icon.ico</ApplicationIcon>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>DeviceGuard</AssemblyName>
+    <RootNamespace>DG</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>icon.ico</ApplicationIcon>
+    <Version>2.0.0</Version>
+    <Product>DeviceGuard</Product>
+    <Company>DeviceGuard</Company>
+    <Description>DeviceGuard device restrictions manager</Description>
+    <!-- אריזה לקובץ יחיד: האפליקציה והשער הם אותו קובץ (השירות מעתיק אותו ל-DeviceGuardWatch.exe) -->
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <DebugType>none</DebugType>
+    <!-- הפעלה מהירה יותר (חשוב לשער, שרץ בכל הפעלת תוכנה חסומה) -->
+    <TieredPGO>false</TieredPGO>
+    <PublishReadyToRun Condition="'$(RuntimeIdentifier)' != ''">true</PublishReadyToRun>
+    <NoWarn>$(NoWarn);CS8618;CS8600;CS8602;CS8604;CS8625;CS0649;CS0169</NoWarn>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="System.Management" Version="8.0.0" />

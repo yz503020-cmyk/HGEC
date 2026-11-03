@@ -1,4 +1,5 @@
 @echo off
+rem בנייה מקומית: Windows + .NET 8 SDK. התוצר: out\DeviceGuard.exe (קובץ יחיד; השער והשירות נוצרים ממנו אוטומטית)
 dotnet publish App\DeviceGuard.csproj -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -o out
-dotnet publish Gate\Gate.csproj -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -o out
-echo Portable folder: out\ (DeviceGuard.exe + Gate.exe)
+echo.
+echo Output: out\DeviceGuard.exe

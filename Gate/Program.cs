@@ -21,7 +21,7 @@ static unsafe class Program {
     try {
       using var p = new NamedPipeClientStream(".", "DeviceGuard.Unlock", PipeDirection.InOut); p.Connect(ms);
       var w = new StreamWriter(p) { AutoFlush = true }; var r = new StreamReader(p); w.WriteLine(msg);
-      var t = r.ReadLineAsync().AsTask(); return t.Wait(Math.Max(ms, 15000)) ? t.Result : null;
+      var t = r.ReadLineAsync(); return t.Wait(Math.Max(ms, 15000)) ? t.Result : null;
     } catch { return null; }
   }
   static bool Ok(nint h) => h != 0 && h != -1;

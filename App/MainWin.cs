@@ -210,7 +210,7 @@ public class MainWin : Window {
     var b = new Button { Content = glyph == null ? t : Theme.IconText(glyph, t), Margin = new Thickness(0, 4, 8, 4) }; b.Click += (s, e) => a(); return b;
   }
   static readonly Dictionary<string, ImageSource?> iconCache = new(StringComparer.OrdinalIgnoreCase);
-  static ImageSource? Icon(string exe) {
+  static new ImageSource? Icon(string exe) {
     if (iconCache.TryGetValue(exe, out var c)) return c;
     ImageSource? r = null;
     try { using var i = System.Drawing.Icon.ExtractAssociatedIcon(exe); if (i != null) { var b = Imaging.CreateBitmapSourceFromHIcon(i.Handle, Int32Rect.Empty, BitmapSizeOptions.FromEmptyOptions()); b.Freeze(); r = b; } } catch { }

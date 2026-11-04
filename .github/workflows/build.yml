@@ -19,8 +19,8 @@ jobs:
       SIGN_PFX_BASE64: ${{ secrets.SIGN_PFX_BASE64 }}
       SIGN_PFX_PASSWORD: ${{ secrets.SIGN_PFX_PASSWORD }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-dotnet@v5
         with: { dotnet-version: '10.0.x' }
       - name: Publish light gate (NativeAOT)
         shell: bash
@@ -38,7 +38,7 @@ jobs:
           $st = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName | Select-Object -Last 1
           & $st.FullName sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f "$env:RUNNER_TEMP\sign.pfx" /p $env:SIGN_PFX_PASSWORD out\DeviceGuard.exe
           Remove-Item "$env:RUNNER_TEMP\sign.pfx"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: DeviceGuard
           path: out/DeviceGuard.exe

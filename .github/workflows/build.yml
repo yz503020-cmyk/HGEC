@@ -15,12 +15,29 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      SIGN_PFX_BASE64: ${{ secrets.SIGN_PFX_BASE64 }}
+      SIGN_PFX_PASSWORD: ${{ secrets.SIGN_PFX_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
-        with: { dotnet-version: '8.0.x' }
-      - name: Publish
-        run: dotnet publish App/DeviceGuard.csproj -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -p:Version=2.0.${{ github.run_number }} -o out
+        with: { dotnet-version: '10.0.x' }
+      - name: Publish light gate (NativeAOT)
+        shell: bash
+        continue-on-error: true
+        run: dotnet publish Gate/DeviceGuardGate.csproj -c Release -r win-x64 -o Gate/out
+      - name: Publish app
+        shell: bash
+        run: dotnet publish App/DeviceGuard.csproj -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -p:Version=2.1.${{ github.run_number }} -o out
+      # חתימה דיגיטלית (אופציונלית – מקטינה זיהוי שגוי של אנטי-וירוס). דורשת סודות: SIGN_PFX_BASE64 ו-SIGN_PFX_PASSWORD
+      - name: Sign (optional)
+        if: ${{ env.SIGN_PFX_BASE64 != '' }}
+        shell: pwsh
+        run: |
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\sign.pfx", [Convert]::FromBase64String($env:SIGN_PFX_BASE64))
+          $st = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName | Select-Object -Last 1
+          & $st.FullName sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f "$env:RUNNER_TEMP\sign.pfx" /p $env:SIGN_PFX_PASSWORD out\DeviceGuard.exe
+          Remove-Item "$env:RUNNER_TEMP\sign.pfx"
       - uses: actions/upload-artifact@v4
         with:
           name: DeviceGuard

@@ -15,11 +15,15 @@ public static class Enforcer {
   public static bool InService;   // true כשרצים בתוך השירות (SYSTEM)
   public static readonly StaTaskScheduler Sta = new();   // תהליכון STA יחיד (יצירת קיצורים ב-COM, שימוש חוזר בין החלות)
   public static string GateExe => System.IO.Path.Combine(Config.Dir, "DeviceGuardWatch.exe");
+  // שער קל (NativeAOT) שמוטמע בקובץ הראשי: מכריע מהר אם להפעיל, ומפעיל את השער המלא רק כשצריך חלון קוד. אם הוא חסר – משתמשים בשער המלא
+  public static string LightGateExe => System.IO.Path.Combine(Config.Dir, "DeviceGuardGate.exe");
+  public static string GateCmd(string id) => $"\"{(File.Exists(LightGateExe) ? LightGateExe : GateExe)}\" --gate {id}";
   static void AddA(Config c, string e) { lock (c.Applied) c.Applied.Add(e); }
   static readonly int Par = Math.Min(16, Math.Max(4, Environment.ProcessorCount * 2));
   // חסימות קבצים שכבר קיימות מההחלה הקודמת: לא משחררים ונועלים מחדש, רק מדלגים (מה שלא נדרש יותר משוחרר בסוף)
   static readonly ConcurrentDictionary<string, byte> prevAcl = new(StringComparer.OrdinalIgnoreCase), prevUsb = new();
   static readonly ConcurrentDictionary<string, string> prevHid = new(StringComparer.OrdinalIgnoreCase);
+  static readonly ConcurrentDictionary<string, byte> prevNet = new(StringComparer.OrdinalIgnoreCase);   // מתאמי רשת שהושבתו על ידינו בהחלה הקודמת ונשארים מושבתים (שומרים שייכות לביטול)
   static readonly string CdT = Config.Dir.TrimEnd('\\'), BdT = AppContext.BaseDirectory.TrimEnd('\\');
   static readonly RegistryView[] Views = { RegistryView.Registry64, RegistryView.Registry32 };
   // תהליכי מערכת שלעולם לא חוסמים ולא סוגרים (חסימה שלהם מקריסה את המחשב)
@@ -45,8 +49,20 @@ public static class Enforcer {
     } catch { return (-1, ""); }
   }
   public static string RunExe(string exe, string args) => RunExe2(exe, args).Out;
-  static string Q(string s) => s.Replace("'", "''");   // מרכאות בודדות בתוך מחרוזת PowerShell
-  static string PS(string cmd) => RunExe("powershell.exe", "-NoLogo -NoProfile -NonInteractive -EncodedCommand " + Convert.ToBase64String(Encoding.Unicode.GetBytes(cmd)));
+  // מרכאות בודדות בתוך מחרוזת PowerShell. PowerShell מתייחס גם לגרשיים החכמים ‘ ’ ‚ ‛ כגרש, ולכן מכפילים גם אותם (אחרת שם כמו "John’s" שובר את הפקודה)
+  static string Q(string s) => s.Replace("'", "''").Replace("\u2018", "\u2018\u2018").Replace("\u2019", "\u2019\u2019").Replace("\u201A", "\u201A\u201A").Replace("\u201B", "\u201B\u201B");
+  static string PS(string cmd) {
+    var enc = Convert.ToBase64String(Encoding.Unicode.GetBytes(cmd));
+    if (enc.Length < 24000) return RunExe("powershell.exe", "-NoLogo -NoProfile -NonInteractive -EncodedCommand " + enc);
+    // סקריפט ארוך חורג ממגבלת שורת הפקודה של Windows (32K תווים), ולכן מועבר דרך קובץ זמני בתיקייה המוגנת
+    string? file = null;
+    try {
+      var dir = System.IO.Path.Combine(Config.Dir, "var"); Directory.CreateDirectory(dir);
+      file = System.IO.Path.Combine(dir, "ps-" + Guid.NewGuid().ToString("N") + ".ps1");
+      File.WriteAllText(file, cmd, new UTF8Encoding(true));
+      return RunExe("powershell.exe", "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" + file + "\"");
+    } catch { return ""; } finally { try { if (file != null) File.Delete(file); } catch { } }
+  }
   static void PSAll(List<string> cmds) { if (cmds.Count > 0) PS(string.Join("\n", cmds)); }
   static void Schtasks(string a) => RunExe("schtasks.exe", a);
   static void Netsh(string a) => RunExe("netsh.exe", a);
@@ -108,19 +124,19 @@ public static class Enforcer {
     try { Directory.CreateDirectory(System.IO.Path.GetDirectoryName(ApplyFlag)!); File.WriteAllText(ApplyFlag, "1"); } catch { }
     try { ApplyInner(c); } finally { try { File.Delete(ApplyFlag); } catch { } }
   }
-  public static void Release(Config c) { Revert(c); c.State = 0; c.Save(); }
+  public static void Release(Config c) { Revert(c); c.State = 0; c.Save(true); }
   static void ApplyInner(Config c) {
     SetSkip(c); Revert(c, true); Blocked = 0; Failed = 0; LastErr = null;
     try {
       PurgeIfeo();   // מנקה שערים יתומים שנשארו מהחלה שנכשלה
-      if (!c.Master) { FinishRevert(c); c.State = 0; c.Save(); return; }
+      if (!c.Master) { FinishRevert(c); c.State = 0; c.Save(true); return; }
       ApplyCore(c);
       FinishRevert(c);   // משחרר רק מה שכבר לא נדרש
-      c.State = 1; c.Save();
+      c.State = 1; c.Save(true);
       Alerts.Log("הוחלו חסימות", false);
-    } catch { try { FinishRevert(c); } catch { } try { c.Save(); } catch { } throw; }   // שומרים את מה שכבר הוחל, כדי שאפשר יהיה לבטל אותו
+    } catch { try { FinishRevert(c); } catch { } try { c.Save(true); } catch { } throw; }   // שומרים את מה שכבר הוחל, כדי שאפשר יהיה לבטל אותו
   }
-  public static void SetSkip(Config c) { Harden = c.Harden; SkipAppData = c.SkipAppData; Exclude = c.Exclude.ToArray(); }
+  public static void SetSkip(Config c) { Harden = c.Harden; SkipAppData = c.SkipAppData; Exclude = c.Exclude.ToArray(); IncludeRemovable = c.IncludeRemovable; SkipProgramDirs = c.SkipProgramDirs; }
   // סיכום קצר של מה שעומד להיות מוחל (לחלון האישור)
   public static string Describe(Config c) {
     if (!c.Master) return "החסימות מושבתות: כל החסימות הקיימות יוסרו.";
@@ -145,7 +161,7 @@ public static class Enforcer {
     var uh = UserHive(c);
     // שאילתות PowerShell רצות במקביל. חסימת סיומות (תמונות/שירים/סרטים) נעשית ברקע בשירות, ולכן ההחלה חוזרת מיד
     Task<string>? netT = c.Net.On ? Task.Run(() => PS("Get-NetAdapter | % { $w = ($_.PhysicalMediaType -like '*802.11*' -or $_.InterfaceDescription -match 'Wireless|Wi-Fi'); $(if ($w) { 'W' } else { 'E' }) + '|' + $_.Status + '|' + $_.Name }")) : null;
-    Task<string>? usbT = c.Usb.On ? Task.Run(() => PS("Get-PnpDevice -PresentOnly | ? InstanceId -like 'USBSTOR*' | % { $_.InstanceId + '|' + $_.FriendlyName }")) : null;
+    Task<string>? usbT = c.Usb.On ? Task.Run(() => PS("Get-PnpDevice -PresentOnly | ? InstanceId -like 'USBSTOR*' | % { $p = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName 'DEVPKEY_Device_Parent' -ErrorAction SilentlyContinue).Data; $_.InstanceId + '|' + $_.FriendlyName + '|' + $p }")) : null;
     Task<string>? fwT = c.NetApps.On && c.NetAppsWhite ? Task.Run(() => PS("Get-NetFirewallProfile | % { [string]$_.Name + '|' + [string]$_.DefaultOutboundAction }")) : null;
     var netCmds = new List<string>(); var usbCmds = new List<string>(); var fwCmds = new List<string>(); var wlanArgs = new List<string>();
 
@@ -155,7 +171,7 @@ public static class Enforcer {
       var adapterWhite = c.Net.White.Where(w => !w.StartsWith("ssid:")).ToList();
       var nl = Lines(netT!.Result);
       // מתאמי רשת שאינם Wi-Fi (Ethernet וכדומה): נחסמים כולם חוץ מהרשימה הלבנה; מתאם שכבר מושבת לא נוגעים בו שוב
-      foreach (var l in nl) { var q = l.Split('|', 3); if (q.Length < 3 || q[0] != "E" || adapterWhite.Contains(q[2])) continue; if (q[1] != "Disabled") netCmds.Add($"Disable-NetAdapter -Name '{Q(q[2])}' -Confirm:$false"); AddA(c, "net|" + q[2]); }
+      foreach (var l in nl) { var q = l.Split('|', 3); if (q.Length < 3 || q[0] != "E" || adapterWhite.Contains(q[2])) continue; if (q[1] != "Disabled") { netCmds.Add($"Disable-NetAdapter -Name '{Q(q[2])}' -Confirm:$false"); AddA(c, "net|" + q[2]); } else if (prevNet.ContainsKey(q[2])) AddA(c, "net|" + q[2]); }   // מתאם שהיה מושבת לפני כן (לא על ידינו) לא יופעל בביטול
       // Wi-Fi: חסימה לפי שם הרשת (SSID). נשלח ישירות ל-netsh (בלי PowerShell), כדי ששם רשת זדוני לא יוכל להריץ פקודות
       if (nl.Any(l => l.StartsWith("W|"))) {
         wlanArgs.Add("wlan add filter permission=denyall networktype=infrastructure"); AddA(c, "wlanfilter|denyall");
@@ -176,14 +192,20 @@ public static class Enforcer {
       // רשימה לבנה לפי מזהה מופע (כולל מספר סידורי): כונן אחר מאותו דגם לא יאושר. ערכים ישנים (שם ידידותי) עדיין נתמכים
       var allow = new List<string>();
       foreach (var l in Lines(usbT!.Result)) {
-        var q = l.Split('|', 2); if (q.Length < 2) continue;
-        if (c.Usb.White.Contains(q[0]) || c.Usb.White.Contains(q[1])) { allow.Add(q[0]); continue; }
+        var q = l.Split('|', 3); if (q.Length < 2) continue;
+        var parent = q.Length > 2 ? q[2].Trim() : "";
+        if (c.Usb.White.Contains(q[0]) || c.Usb.White.Contains(q[1])) {
+          allow.Add(q[0]);
+          if (parent.Length > 0) { allow.Add(parent); var pw = "usbparent:" + parent; if (!c.Usb.White.Contains(pw)) c.Usb.White.Add(pw); }   // גם התקן ה-USB האב חייב להיות מותר, אחרת הכונן לא יותקן
+          continue;
+        }
         if (!prevUsb.TryRemove(q[0], out _)) usbCmds.Add($"Disable-PnpDevice -InstanceId '{Q(q[0])}' -Confirm:$false"); AddA(c, "usb|" + q[0]);
       }
-      foreach (var w in c.Usb.White) if (w.Contains('\\') && !allow.Contains(w)) allow.Add(w);
-      if (c.Usb.White.Count == 0) { SetReg(c, "HKLM", USBSTOR, "Start", 4); SetReg(c, "HKLM", RSD, "Deny_All", 1); }   // חוסם גם אמצעי אחסון שכבר הותקנו
+      foreach (var w in c.Usb.White.ToList()) { var wv = w.StartsWith("usbparent:") ? w[10..] : w; if (wv.Contains('\\') && !allow.Contains(wv)) allow.Add(wv); }
+      bool hasWhite = c.Usb.White.Any(w => !w.StartsWith("usbparent:"));
+      if (!hasWhite) { SetReg(c, "HKLM", USBSTOR, "Start", 4); SetReg(c, "HKLM", RSD, "Deny_All", 1); }   // חוסם גם אמצעי אחסון שכבר הותקנו
       SetReg(c, "HKLM", DEVREST, "DenyRemovableDevices", 1);   // חסימה ברמת המדיניות: חלה גם על התקנים עתידיים
-      if (c.Usb.White.Count > 0) {
+      if (hasWhite) {
         SetReg(c, "HKLM", DEVREST, "AllowDenyLayered", 1); SetReg(c, "HKLM", DEVREST, "AllowInstanceIDs", 1);
         int ai = 1; foreach (var id in allow) SetReg(c, "HKLM", DEVREST + @"\AllowInstanceIDs", (ai++).ToString(), id, RegistryValueKind.String);
       }
@@ -219,6 +241,11 @@ public static class Enforcer {
         var pp = SAFER + @"\262144\Paths\{" + Guid.NewGuid() + "}";
         SetReg(c, "HKLM", pp, "ItemData", a, RegistryValueKind.String); SetReg(c, "HKLM", pp, "SaferFlags", 0);
       }
+      // תיקיות שמשתמש רגיל יכול לכתוב אליהן בתוך Windows: חוסמים הרצה מהן (כלל מפורש גובר על הכלל הכללי של Windows)
+      foreach (var wd in new[] { @"\Temp", @"\Tasks", @"\tracing", @"\Registration\CRMLog", @"\System32\Tasks", @"\System32\spool\drivers\color", @"\System32\spool\PRINTERS" }) {
+        var dp = SAFER + @"\0\Paths\{" + Guid.NewGuid() + "}";
+        SetReg(c, "HKLM", dp, "ItemData", WinDir + wd, RegistryValueKind.String); SetReg(c, "HKLM", dp, "SaferFlags", 0);
+      }
     }
     // 5) קבצים, תיקיות וסיומות
     foreach (var r in c.Paths.Where(r => r.On)) if (!ProtectedPath(r.Path)) { Block(c, r, r.Path); if (r.Mode == Mode.Code) MakeLnk(c, r); }
@@ -244,11 +271,13 @@ public static class Enforcer {
     if (a.Browsers) {   // מונע עקיפת סינון: DNS מוצפן בדפדפן וגלישה פרטית
       SetReg(c, "HKLM", @"SOFTWARE\Policies\Google\Chrome", "IncognitoModeAvailability", 1); SetReg(c, "HKLM", @"SOFTWARE\Policies\Google\Chrome", "DnsOverHttpsMode", "off", RegistryValueKind.String);
       SetReg(c, "HKLM", @"SOFTWARE\Policies\Microsoft\Edge", "InPrivateModeAvailability", 1); SetReg(c, "HKLM", @"SOFTWARE\Policies\Microsoft\Edge", "DnsOverHttpsMode", "off", RegistryValueKind.String);
+      SetReg(c, "HKLM", @"SOFTWARE\Policies\Google\Chrome", "BrowserGuestModeEnabled", 0); SetReg(c, "HKLM", @"SOFTWARE\Policies\Microsoft\Edge", "BrowserGuestModeEnabled", 0);   // מצב אורח עוקף פרופיל מסונן
       SetReg(c, "HKLM", @"SOFTWARE\Policies\Mozilla\Firefox", "DisablePrivateBrowsing", 1);
       SetReg(c, "HKLM", @"SOFTWARE\Policies\Mozilla\Firefox\DNSOverHTTPS", "Enabled", 0); SetReg(c, "HKLM", @"SOFTWARE\Policies\Mozilla\Firefox\DNSOverHTTPS", "Locked", 1);
     }
     if (a.NoTether) SetReg(c, "HKLM", @"SOFTWARE\Policies\Microsoft\Windows\Network Connections", "NC_ShowSharedAccessUI", 0);
     if (a.NoTcpip) SetReg(c, "HKLM", @"SOFTWARE\Policies\Microsoft\Windows\Network Connections", "NC_AllowAdvancedTCPIPConfig", 0);
+    if (a.NoProxy) SetReg(c, "HKLM", @"SOFTWARE\Policies\Microsoft\Internet Explorer\Control Panel", "Proxy", 1);   // מונע הגדרת Proxy (עקיפת סינון) בהגדרות המערכת, שמשפיעות גם על Chrome ו-Edge
     if (a.LockHosts) {
       try { var fi = new FileInfo(HostsPath); if (fi.Exists) { var sec = fi.GetAccessControl(); sec.AddAccessRule(HostsDeny); fi.SetAccessControl(sec); AddA(c, "hostslock"); } } catch { }
     }
@@ -283,17 +312,17 @@ public static class Enforcer {
   // ---------- IFEO (שער חסימה) ----------
   static void Ifeo(Config c, string exe, Rule r) {
     if (IsCritical(exe)) return;
-    foreach (var v in Views) { using var b = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, v); using var k = b.CreateSubKey(IFEO + exe); k.SetValue("Debugger", $"\"{GateExe}\" --gate {r.Id}"); }
+    foreach (var v in Views) { using var b = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, v); using var k = b.CreateSubKey(IFEO + exe); k.SetValue("Debugger", GateCmd(r.Id)); }
     AddA(c, "ifeo|" + exe + "|" + r.Id);
   }
   // מוחק כל שער של DeviceGuard מהרישום (גם יתומים שאינם רשומים ב-Applied)
   public static void PurgeIfeo() {
-    var mark = "\"" + GateExe + "\" --gate";
+    var mark = "\"" + GateExe + "\" --gate"; var mark2 = "\"" + LightGateExe + "\" --gate";
     foreach (var v in Views) {
       try {
         using var b = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, v); using var ifeo = b.OpenSubKey(IFEO.TrimEnd('\\'), true); if (ifeo == null) continue;
         foreach (var n in ifeo.GetSubKeyNames()) {
-          try { using var k = ifeo.OpenSubKey(n, true); if (k?.GetValue("Debugger") is string d && d.StartsWith(mark, StringComparison.OrdinalIgnoreCase)) k.DeleteValue("Debugger", false); } catch { }
+          try { using var k = ifeo.OpenSubKey(n, true); if (k?.GetValue("Debugger") is string d && (d.StartsWith(mark, StringComparison.OrdinalIgnoreCase) || d.StartsWith(mark2, StringComparison.OrdinalIgnoreCase))) k.DeleteValue("Debugger", false); } catch { }
         }
       } catch { }
     }
@@ -308,7 +337,7 @@ public static class Enforcer {
 
   // ---------- חסימת קבצים ותיקיות (ACL) ----------
   // חיזוק: כלל OWNER RIGHTS (S-1-3-4) מבטל לבעל הקובץ את הזכות המובנית לשנות הרשאות, כך שמשתמש רגיל לא יכול להסיר את החסימה בעצמו.
-  public static bool Harden = true, SkipAppData = true; public static string[] Exclude = Array.Empty<string>();
+  public static bool Harden = true, SkipAppData = true, IncludeRemovable, SkipProgramDirs = true; public static string[] Exclude = Array.Empty<string>();
   static readonly SecurityIdentifier OwnerSid = new("S-1-3-4");
   static FileSystemAccessRule OwnerRule(bool dir) => new(OwnerSid, FileSystemRights.ReadAttributes | FileSystemRights.ReadPermissions | FileSystemRights.Synchronize,
     dir ? InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit : InheritanceFlags.None, PropagationFlags.None, AccessControlType.Allow);
@@ -347,6 +376,32 @@ public static class Enforcer {
   static string WatchLog => System.IO.Path.Combine(Config.Dir, "var", "watched.log");
   // דילוג לפי נתיב מלא (ולא לפי שם תיקייה, שאפשר לעקוף בקלות): Windows (חוץ מ-Temp), Program Files, חלק מ-ProgramData, AppData של משתמשים (אופציונלי) וההחרגות שהוגדרו
   static readonly string[] SkipFull = { PF, PF86, System.IO.Path.Combine(PData, "Microsoft"), System.IO.Path.Combine(PData, "Packages") };
+  // תיקיית תוכנה: תיקייה (או אחת מהתיקיות שמעליה) שיש בה קובצי dll, וכן תיקיות נקודה, node_modules ו-site-packages. חסימת תמונות/סרטים שם שוברת תוכנות
+  static readonly ConcurrentDictionary<string, (bool V, DateTime T)> dllDirs = new(StringComparer.OrdinalIgnoreCase);
+  static bool HasDll(string d) {
+    var now = DateTime.UtcNow;
+    if (dllDirs.TryGetValue(d, out var e) && (now - e.T).TotalMinutes < 10) return e.V;
+    bool v; try { v = Directory.EnumerateFiles(d, "*.dll").Any(); } catch { v = false; }
+    if (dllDirs.Count > 20000) dllDirs.Clear();
+    dllDirs[d] = (v, now); return v;
+  }
+  static bool IsProgramPath(string p) {
+    var root = System.IO.Path.GetPathRoot(p) ?? "";
+    if (p.Length > root.Length) {
+      var parts = p[root.Length..].Split('\\');
+      for (int i = 0; i < parts.Length - 1; i++) { var s = parts[i]; if ((s.Length > 1 && s[0] == '.') || s.Equals("node_modules", StringComparison.OrdinalIgnoreCase) || s.Equals("site-packages", StringComparison.OrdinalIgnoreCase)) return true; }
+    }
+    var d = System.IO.Path.GetDirectoryName(p);
+    for (int depth = 0; d != null && depth < 12; depth++, d = System.IO.Path.GetDirectoryName(d)) if (HasDll(d)) return true;
+    return false;
+  }
+  static readonly ConcurrentDictionary<string, bool> removableRoots = new(StringComparer.OrdinalIgnoreCase);
+  static bool RemovableExcluded(string p) {
+    if (IncludeRemovable) return false;
+    try { var r = System.IO.Path.GetPathRoot(p); if (string.IsNullOrEmpty(r)) return false; return removableRoots.GetOrAdd(r, x => { try { return new DriveInfo(x).DriveType == DriveType.Removable; } catch { return false; } }); } catch { return false; }
+  }
+  public static bool ScanDrive(DriveInfo d) => d.DriveType == DriveType.Fixed || (d.DriveType == DriveType.Removable && IncludeRemovable);
+  static bool DriveUp(string p) { try { var r = System.IO.Path.GetPathRoot(p); return !string.IsNullOrEmpty(r) && Directory.Exists(r); } catch { return false; } }
   public static bool InSkipped(string p) {
     if (Under(p, WinDir) && !Under(p, WinDir + @"\Temp")) return true;
     foreach (var s in SkipFull) if (Under(p, s)) return true;
@@ -354,12 +409,13 @@ public static class Enforcer {
     if (p.Length > root.Length) { var first = p[root.Length..].Split('\\')[0]; if (first.Equals("$Recycle.Bin", StringComparison.OrdinalIgnoreCase) || first.Equals("System Volume Information", StringComparison.OrdinalIgnoreCase)) return true; }
     if (SkipAppData && p.StartsWith(UsersDir + "\\", StringComparison.OrdinalIgnoreCase)) { var parts = p[(UsersDir.Length + 1)..].Split('\\'); if (parts.Length >= 2 && parts[1].Equals("AppData", StringComparison.OrdinalIgnoreCase)) return true; }
     foreach (var e in Exclude) if (!string.IsNullOrWhiteSpace(e) && Under(p, e.TrimEnd('\\'))) return true;
+    if (SkipProgramDirs && IsProgramPath(p)) return true;
     return false;
   }
   // כוננים שאינם NTFS/ReFS (FAT, exFAT) לא תומכים בהרשאות, ולכן אי אפשר לחסום בהם קבצים
   static readonly ConcurrentDictionary<string, bool> aclRoots = new(StringComparer.OrdinalIgnoreCase);
   public static readonly ConcurrentDictionary<string, byte> NoAclDrives = new(StringComparer.OrdinalIgnoreCase);
-  public static void ResetDriveCache() { aclRoots.Clear(); NoAclDrives.Clear(); }
+  public static void ResetDriveCache() { aclRoots.Clear(); NoAclDrives.Clear(); removableRoots.Clear(); }
   static bool AclOk(string p) {
     var root = System.IO.Path.GetPathRoot(p); if (string.IsNullOrEmpty(root)) return true;
     return aclRoots.GetOrAdd(root, r => {
@@ -394,7 +450,7 @@ public static class Enforcer {
   public static bool BlockNewFile(Rule r, string p) {
     try {
       if (known.ContainsKey(p)) return true;
-      if (InSkipped(p) || !AclOk(p)) return true;
+      if (RemovableExcluded(p) || InSkipped(p) || !AclOk(p)) return true;
       var fi = new FileInfo(p); if (!fi.Exists || Protected(p)) return true;
       var s = fi.GetAccessControl();
       if (s.GetAccessRules(true, false, typeof(SecurityIdentifier)).Cast<FileSystemAccessRule>().Any(x => x.AccessControlType == AccessControlType.Deny && x.IdentityReference.Value == "S-1-1-0")) return true;
@@ -414,12 +470,17 @@ public static class Enforcer {
   static int CountUnits(string root) { int n = 1; foreach (var d1 in SubDirs(root)) { n++; n += SubDirs(d1).Count; } return n; }
   public static void ScanNew(Dictionary<string, Rule> map, CancellationToken ct = default, string? only = null) {
     if (map.Count == 0) return;   // אין סיומות חסומות – אין מה לסרוק
-    var roots = (only != null ? new[] { only } : DriveInfo.GetDrives().Where(d => (d.DriveType == DriveType.Fixed || d.DriveType == DriveType.Removable) && d.IsReady).Select(d => d.RootDirectory.FullName).ToArray()).Where(AclOk).ToArray();
+    var roots = (only != null ? new[] { only } : DriveInfo.GetDrives().Where(d => ScanDrive(d) && d.IsReady).Select(d => d.RootDirectory.FullName).ToArray()).Where(AclOk).ToArray();
     bool track = only == null;
     if (track) { ScanFinished = false; ScanDone = 0; ScanTotal = 0; ScanStartTicks = DateTime.UtcNow.Ticks; ScanId++; ScanRunning = true; }
     try {
-      if (track) ScanTotal = Math.Max(1, roots.Sum(CountUnits));
-      Parallel.ForEach(roots, new ParallelOptions { MaxDegreeOfParallelism = ParSvc, CancellationToken = ct }, d => ScanN(d, map, ct, 0));
+      // סריקה מהירה דרך יומן ה-USN (קריאת ה-MFT) כשאפשר; אחרת – מעבר על התיקיות כמו קודם
+      var usn = new List<(string Root, List<string> Files)>(); var crawl = new List<string>();
+      foreach (var r in roots) { if (ct.IsCancellationRequested) break; var l = UsnScan.TryList(r, map.Keys, ct); if (l != null) usn.Add((r, l)); else crawl.Add(r); }
+      if (track) ScanTotal = Math.Max(1, usn.Sum(u => u.Files.Count) + crawl.Sum(CountUnits));
+      var po = new ParallelOptions { MaxDegreeOfParallelism = ParSvc, CancellationToken = ct };
+      foreach (var u in usn) Parallel.ForEach(u.Files, po, f => { if (map.TryGetValue(System.IO.Path.GetExtension(f).TrimStart('.').ToLowerInvariant(), out var rl)) BlockNewFile(rl, f); if (track) Interlocked.Increment(ref ScanDone); });
+      Parallel.ForEach(crawl, po, d => ScanN(d, map, ct, 0));
       if (track && !ct.IsCancellationRequested) { ScanDone = ScanTotal; ScanFinished = true; }
     } finally { if (track) ScanRunning = false; }
   }
@@ -472,9 +533,12 @@ public static class Enforcer {
       var want = Harden ? "1" : "0"; var have = "0";
       try { if (File.Exists(HardFlag)) have = File.ReadAllText(HardFlag).Trim(); } catch { }
       var keep = new List<string>(); var rel = new List<string>();
+      removableRoots.Clear();
       if (File.Exists(WatchLog)) foreach (var l in File.ReadAllLines(WatchLog)) {
         var i = l.LastIndexOf('|'); if (i < 0) continue; var p = l[..i];
-        if (map.ContainsKey(System.IO.Path.GetExtension(p).TrimStart('.').ToLowerInvariant()) && File.Exists(p)) { keep.Add(l); known[p] = 0; } else rel.Add(l);   // קבצים שנמחקו מוסרים מהיומן
+        bool inMap = map.ContainsKey(System.IO.Path.GetExtension(p).TrimStart('.').ToLowerInvariant());
+        if (!File.Exists(p)) { if (!DriveUp(p)) keep.Add(l); else rel.Add(l); continue; }   // כונן שאינו זמין כרגע (נשלף / נעול) – שומרים ביומן כדי שהקובץ ישוחרר בהמשך; קובץ שנמחק מוסר מהיומן
+        if (inMap && !InSkipped(p) && !RemovableExcluded(p)) { keep.Add(l); known[p] = 0; } else rel.Add(l);   // סיומת שכבר לא חסומה, תיקייה שהוחרגה או כונן נשלף – משחררים
       }
       var po = new ParallelOptions { MaxDegreeOfParallelism = ParSvc };
       if (rel.Count > 0) { Parallel.ForEach(rel, po, UnblockLine); File.WriteAllLines(WatchLog, keep); }
@@ -521,7 +585,9 @@ public static class Enforcer {
   }
   static List<string> NetAppsRules(Config c, List<string> names) {
     var res = new List<string>();
-    foreach (var a in c.NetApps.White.Where(w => !string.IsNullOrWhiteSpace(w)).Distinct(StringComparer.OrdinalIgnoreCase)) {
+    var apps = c.NetApps.White.Where(w => !string.IsNullOrWhiteSpace(w)).ToList();
+    if (c.NetAppsWhite && !string.IsNullOrWhiteSpace(c.AlertUrl)) apps.Add(GateExe);   // ברשימה לבנה השירות עצמו חייב להיות מותר, כדי שההתראות (Webhook) יישלחו
+    foreach (var a in apps.Distinct(StringComparer.OrdinalIgnoreCase)) {
       string target, label;
       if (a.StartsWith("pkg:")) { var sid = PkgSid(a[4..]); if (sid == null) continue; target = $"-Package '{sid}'"; label = a[4..]; }
       else if (a.StartsWith("svc:")) { target = $"-Service '{Q(a[4..])}'"; label = a[4..]; }
@@ -585,7 +651,7 @@ public static class Enforcer {
   public static int Heal(List<(string Exe, string Id)> list) {
     int n = 0;
     foreach (var (exe, id) in list) {
-      var want = $"\"{GateExe}\" --gate {id}";
+      var want = GateCmd(id);
       foreach (var v in Views) { try { using var b = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, v); using var k = b.CreateSubKey(IFEO + exe); if (!want.Equals(k.GetValue("Debugger") as string)) { k.SetValue("Debugger", want); n++; } } catch { } }
     }
     return n;
@@ -658,11 +724,36 @@ public static class Enforcer {
       catch (Exception ex) when ((ex is IOException || ex is UnauthorizedAccessException) && i < 20) { Thread.Sleep(500); }
     }
   }
+  // שער קל (NativeAOT): מוטמע בתוך הקובץ הראשי ומופרד לדיסק. מטפל במסלול המהיר של כל הפעלה חסומה ופונה לשער המלא רק כשצריך חלון
+  static void DeployLightGate() {
+    try {
+      using var s = typeof(Enforcer).Assembly.GetManifestResourceStream("DeviceGuardGate.exe");
+      if (s == null) { try { if (File.Exists(LightGateExe)) File.Delete(LightGateExe); } catch { } return; }
+      var tmp = LightGateExe + ".new";
+      using (var o = File.Create(tmp)) s.CopyTo(o);
+      File.Move(tmp, LightGateExe, true);
+    } catch { try { if (File.Exists(LightGateExe)) File.Delete(LightGateExe); } catch { } }   // כישלון בפריסה → חוזרים לשער המלא (GateCmd בודק אם הקובץ קיים)
+  }
+  static DateTime lastStart = DateTime.MinValue;
+  // מנסה להפעיל את השירות אם הוא מותקן אך לא רץ (מוגבל בקצב, כדי שלא יתקע את הממשק)
+  public static bool TryStartService() {
+    if (Config.Up(300)) return true;
+    if ((DateTime.UtcNow - lastStart).TotalSeconds < 20) return false;
+    lastStart = DateTime.UtcNow;
+    try { if (!ServiceExists()) return false; Sc("start DeviceGuard"); return WaitUp(10); } catch { return false; }
+  }
   // התקנה חד-פעמית של שירות מערכת מוגן; אם הוא מגרסה ישנה מעדכנים אותו ב-EnsureService
   static void InstallService() {
     Directory.CreateDirectory(Config.Dir);
-    var wd = GateExe; CopyGate(wd);
-    Sc($"create DeviceGuard binPath= \"\\\"{wd}\\\" --service\" start= auto obj= LocalSystem DisplayName= \"DeviceGuard Protection\"");
+    var wd = GateExe; CopyGate(wd); DeployLightGate();
+    var ex = RunExe2("sc.exe", $"create DeviceGuard binPath= \"\\\"{wd}\\\" --service\" start= auto obj= LocalSystem DisplayName= \"DeviceGuard Protection\"");
+    if (ex.Code != 0 && !ServiceExists()) throw new IOException("יצירת שירות ההגנה נכשלה (קוד " + ex.Code + "). ודא שהתוכנה רצה כמנהל.");
+    // ספריית החילוץ של .NET (קובץ יחיד) מוגדרת לתיקייה קבועה של השירות, כדי שלא יחולצו קבצים מחדש בכל הפעלה
+    try {
+      var xd = System.IO.Path.Combine(Config.Dir, "var", "net"); Directory.CreateDirectory(xd);
+      using var k = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\DeviceGuard", true);
+      k?.SetValue("Environment", new[] { "DOTNET_BUNDLE_EXTRACT_BASE_DIR=" + xd }, RegistryValueKind.MultiString);
+    } catch { }
     Sc("failure DeviceGuard reset= 0 actions= restart/1000/restart/1000/restart/1000"); Sc("failureflag DeviceGuard 1");
     SafeBootSet(true);
     Sc("start DeviceGuard");
@@ -719,7 +810,7 @@ public static class Enforcer {
   // משחרר חסימות שהיו בהחלה הקודמת ולא נדרשו מחדש
   static void FinishRevert(Config c) {
     var ps = new List<string>(); foreach (var id in prevUsb.Keys) ps.Add($"Enable-PnpDevice -InstanceId '{Q(id)}' -Confirm:$false");
-    var accs = prevAcl.Keys.ToList(); var hids = prevHid.Values.ToList(); prevUsb.Clear(); prevAcl.Clear(); prevHid.Clear();
+    var accs = prevAcl.Keys.ToList(); var hids = prevHid.Values.ToList(); prevUsb.Clear(); prevAcl.Clear(); prevHid.Clear(); prevNet.Clear();
     Task? t = ps.Count > 0 ? Task.Run(() => PSAll(ps)) : null;
     try {
       var po = new ParallelOptions { MaxDegreeOfParallelism = Par };
@@ -758,7 +849,7 @@ public static class Enforcer {
               using (var k2 = parent.OpenSubKey(p[1])) { if (k2 != null && k2.ValueCount == 0 && k2.SubKeyCount == 0) { k2.Close(); parent.DeleteSubKey(p[1], false); } }
             }
             break;
-          case "net": if (keepAd != null && !keepAd.Contains(p[1])) break; ps.Add($"Enable-NetAdapter -Name '{Q(p[1])}' -Confirm:$false"); break;
+          case "net": if (keepAd != null && !keepAd.Contains(p[1])) { prevNet[p[1]] = 0; break; } ps.Add($"Enable-NetAdapter -Name '{Q(p[1])}' -Confirm:$false"); break;
           case "usb": ps.Add($"Enable-PnpDevice -InstanceId '{Q(p[1])}' -Confirm:$false"); break;
           case "usbstor": { using var k = Registry.LocalMachine.OpenSubKey(USBSTOR, true); k?.SetValue("Start", 3); break; }   // רשומה ישנה (גרסאות קודמות)
           case "lnk": File.Delete(p[1]); break;

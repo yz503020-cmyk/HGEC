@@ -46,7 +46,8 @@ static class GateMode {
 
   // נקרא על ידי Windows כשמנסים להפעיל תוכנה חסומה: DeviceGuard.exe --gate <id> <הפקודה המקורית>
   public static void RunGate(string[] a) {
-    var id = a[1]; var cl = Environment.CommandLine; var orig = cl[(cl.IndexOf(id, StringComparison.Ordinal) + id.Length)..].Trim();
+    var id = a[1]; var cl = Environment.CommandLine; var marker = "--gate " + id; var mi = cl.IndexOf(marker, StringComparison.Ordinal);
+    var orig = (mi >= 0 ? cl[(mi + marker.Length)..] : "").Trim();
     if (orig.Length == 0) return;
     bool sys = Native.IsSystemContext();
     var info = GetInfo(id);
@@ -108,7 +109,7 @@ static class GateMode {
   static bool FolderOpen(string path) {
     try {
       dynamic sh = Activator.CreateInstance(Type.GetTypeFromProgID("Shell.Application")!)!;
-      foreach (dynamic w in sh.Windows()) { try { string? u = w.LocationURL; if (string.IsNullOrEmpty(u)) continue; if (new Uri(u).LocalPath.TrimEnd('\\').StartsWith(path.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase)) return true; } catch { } }
+      foreach (dynamic w in sh.Windows()) { try { string? u = w.LocationURL; if (string.IsNullOrEmpty(u)) continue; var lp = new Uri(u).LocalPath.TrimEnd('\\'); var pp = path.TrimEnd('\\'); if (lp.Equals(pp, StringComparison.OrdinalIgnoreCase) || lp.StartsWith(pp + "\\", StringComparison.OrdinalIgnoreCase)) return true; } catch { } }
     } catch { }
     return false;
   }

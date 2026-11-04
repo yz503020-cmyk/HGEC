@@ -1,4 +1,4 @@
-using System.Collections.Concurrent; using System.Diagnostics; using System.IO; using System.IO.Pipes; using System.Management; using System.Security.AccessControl; using System.Security.Principal; using System.Text; using System.Text.Json; using System.Threading; using System.Threading.Tasks; using System.Windows;
+using System.Collections.Concurrent; using System.Diagnostics; using System.IO; using System.IO.Pipes; using System.Management; using Microsoft.Win32; using System.Security.AccessControl; using System.Security.Principal; using System.Text; using System.Text.Json; using System.Threading; using System.Threading.Tasks; using System.Windows;
 namespace DG;
 public static class Program {
   public static string? Code;   // קוד הכניסה של התוכנה (בזיכרון בלבד, לאימות מחדש מול השירות)
@@ -15,7 +15,13 @@ public static class Program {
   static volatile Dictionary<string, string> codeKillMap = new(StringComparer.OrdinalIgnoreCase);
   static readonly ConcurrentDictionary<string, DateTime> tokens = new(), lease = new(), ruleAuth = new();
   static readonly ConcurrentDictionary<int, (string Rule, DateTime Start)> authPid = new();   // תהליכים שאושרו בקוד (או בנו של תהליך מאושר)
-  static readonly ConcurrentDictionary<int, string> promptedPid = new();
+  static readonly ConcurrentDictionary<int, (string Rule, DateTime Start)> promptedPid = new();
+  static readonly ConcurrentDictionary<int, int> connCount = new();                           // חיבורים פתוחים לכל לקוח ב-Pipe (הגנה מהצפה)
+  static readonly ConcurrentDictionary<int, byte> renameSeen = new();                         // תהליכים שכבר נבדקו לזיהוי עותק שהשם שלו שונה
+  static readonly ConcurrentDictionary<string, string> origNames = new(StringComparer.OrdinalIgnoreCase);
+  static readonly ConcurrentDictionary<string, (long L, DateTime W, string H)> hashCache = new(StringComparer.OrdinalIgnoreCase);
+  static volatile Dictionary<long, List<(string Hash, string Name)>> sizeMap = new();        // גודל קובץ -> גיבוב של תוכנות חסומות (זיהוי עותקים ששינו להם שם)
+  static volatile bool removing;
   static readonly ConcurrentDictionary<int, int> internalPids = new();                       // תהליכים של DeviceGuard עצמו שמריצים כלי מערכת
   static readonly object lk = new();
   static readonly Dictionary<string, (int N, int Level, DateTime Until)> fails = new();
@@ -26,7 +32,7 @@ public static class Program {
   static readonly Dictionary<string, string[]> alias = new(StringComparer.OrdinalIgnoreCase) { ["calc"] = new[] { "CalculatorApp", "Calculator" }, ["SystemSettings"] = new[] { "SystemSettings" } };
 
   // האם החסימות אמורות להיות פעילות כרגע (מתג ראשי, פתיחה זמנית, תזמון)
-  public static bool Blocking(Config c) => c.Master && c.TempOpenUntil <= DateTime.UtcNow.Ticks && (!c.Sched.On || c.Sched.Active(DateTime.Now));
+  public static bool Blocking(Config c) => c.Master && c.TempOpenUntil <= DateTime.UtcNow.Ticks && (!c.Sched.On || c.Sched.Active(c.Sched.NowPinned()));
   public static void InternalAdd(int pid, int d) {
     internalPids.AddOrUpdate(pid, d > 0 ? 1 : 0, (k, v) => Math.Max(0, v + d));
     if (internalPids.TryGetValue(pid, out var v2) && v2 <= 0) internalPids.TryRemove(pid, out _);
@@ -43,19 +49,30 @@ public static class Program {
   static void Ok(string key) { lock (lk) fails.Remove(key); }
   static bool TokenOk(string t) { if (tokens.TryGetValue(t, out var d) && (DateTime.UtcNow - d).TotalHours < 8) return true; tokens.TryRemove(t, out _); return false; }
   static bool IsAuth(int pid, string rid) => authPid.TryGetValue(pid, out var a) && a.Rule == rid && Native.SameStart(pid, a.Start);
-  static bool FromGate(int pid) { var ip = pid > 0 ? Native.ImagePath(pid) : null; return ip != null && string.Equals(System.IO.Path.GetFullPath(ip), System.IO.Path.GetFullPath(Enforcer.GateExe), StringComparison.OrdinalIgnoreCase); }
+  static bool FromGate(int pid) {
+    var ip = pid > 0 ? Native.ImagePath(pid) : null; if (ip == null) return false;
+    var full = System.IO.Path.GetFullPath(ip);
+    return string.Equals(full, System.IO.Path.GetFullPath(Enforcer.GateExe), StringComparison.OrdinalIgnoreCase) || string.Equals(full, System.IO.Path.GetFullPath(Enforcer.LightGateExe), StringComparison.OrdinalIgnoreCase);
+  }
+  static bool IsAuthAny(int pid) => authPid.TryGetValue(pid, out var a) && Native.SameStart(pid, a.Start);
+  // מסמן תהליך כ"נשאל" פעם אחת (לפי זמן ההתחלה, כך שמספר תהליך שנעשה בו שימוש חוזר לא יידלג)
+  static bool TryPrompt(int pid, string rid) {
+    DateTime st; try { using var pr = Process.GetProcessById(pid); st = pr.StartTime; } catch { return false; }
+    lock (lk) { if (promptedPid.TryGetValue(pid, out var v) && v.Start == st) return false; promptedPid[pid] = (rid, st); return true; }
+  }
   static void RegisterAuth(int pid, string rule) { try { using var pr = Process.GetProcessById(pid); authPid[pid] = (rule, pr.StartTime); ruleAuth[rule] = DateTime.UtcNow; } catch { } }
   static string ExtOf(string p) => System.IO.Path.GetExtension(p).TrimStart('.').ToLowerInvariant();
 
   // ---------- שירות ----------
   class GuardService : System.ServiceProcess.ServiceBase {
-    public GuardService() { ServiceName = "DeviceGuard"; }
+    public GuardService() { ServiceName = "DeviceGuard"; CanShutdown = true; }
     protected override void OnStart(string[] a) { new Thread(Watch) { IsBackground = true }.Start(); }
-    protected override void OnStop() { Alerts.Log("שירות ההגנה נעצר", false); }
+    protected override void OnShutdown() { Alerts.Log("המחשב נכבה – השירות נעצר", false); }   // כיבוי רגיל של המחשב: בלי התראה
+    protected override void OnStop() { if (removing) return; Alerts.Log("שירות ההגנה נעצר", true, true); Alerts.Event("שירות ההגנה נעצר"); }
   }
   static void LockDir() {   // תיקיית ההגדרות: רק SYSTEM כותב; מנהלים וקבצי ההפעלה לקריאה. קובץ ההגדרות עצמו נעול גם בפני משתמשים רגילים
     try {
-      Directory.CreateDirectory(Config.Dir); Directory.CreateDirectory(System.IO.Path.Combine(Config.Dir, "var"));
+      Directory.CreateDirectory(Config.Dir); Directory.CreateDirectory(System.IO.Path.Combine(Config.Dir, "var")); Directory.CreateDirectory(System.IO.Path.Combine(Config.Dir, "var", "net"));   // net = תיקיית חילוץ מוגנת של השירות
       Enforcer.RunExe("icacls", $"\"{Config.Dir}\" /inheritance:r /grant *S-1-5-18:(OI)(CI)F /grant *S-1-5-32-544:(OI)(CI)RX /grant *S-1-5-32-545:(OI)(CI)RX");
       Enforcer.RunExe("icacls", $"\"{System.IO.Path.Combine(Config.Dir, "var")}\" /inheritance:r /grant *S-1-5-18:(OI)(CI)F /grant *S-1-5-32-544:(OI)(CI)F");
       Config.SecureFile(Config.CfgPath); Config.SecureFile(Config.BakPath);
@@ -86,16 +103,57 @@ public static class Program {
   static void StartWmi() {
     try {
       pw = new ManagementEventWatcher(new WqlEventQuery("SELECT * FROM Win32_ProcessStartTrace"));
-      pw.EventArrived += (s, e) => { try { var n = (string)e.NewEvent["ProcessName"]; int pid = Convert.ToInt32(e.NewEvent["ProcessID"]); HandleProc(n.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? n[..^4] : n, pid); } catch { } };
+      pw.EventArrived += (s, e) => { try { var n = (string)e.NewEvent["ProcessName"]; int pid = Convert.ToInt32(e.NewEvent["ProcessID"]); int ppid = 0; try { ppid = Convert.ToInt32(e.NewEvent["ParentProcessID"]); } catch { } HandleProc(n.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? n[..^4] : n, pid, ppid); } catch { } };
+      pw.Stopped += (s, e) => { pw = null; };   // ה-Watch ינסה להפעיל מחדש
       pw.Start();
     } catch { pw = null; }
   }
   static bool OwnerApplies(Config c, int pid) => c.AllUsers || string.IsNullOrEmpty(c.OwnerSid) || string.Equals(Native.ProcSid(pid), c.OwnerSid, StringComparison.OrdinalIgnoreCase);
   static void KillPid(int pid) { try { using var p = Process.GetProcessById(pid); p.Kill(); } catch { } }
-  static void HandleProc(string n, int pid) {
+  static string? OrigNameCached(string path) {
+    if (origNames.TryGetValue(path, out var v)) return v.Length == 0 ? null : v;
+    var o = Native.OriginalName(path); if (origNames.Count > 5000) origNames.Clear(); origNames[path] = o ?? ""; return o;
+  }
+  static string? HashOf(string path) {
+    try {
+      var fi = new FileInfo(path);
+      if (hashCache.TryGetValue(path, out var v) && v.L == fi.Length && v.W == fi.LastWriteTimeUtc) return v.H;
+      using var s = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+      var h = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(s));
+      hashCache[path] = (fi.Length, fi.LastWriteTimeUtc, h); return h;
+    } catch { return null; }
+  }
+  // עותק של תוכנה חסומה ששונה לו השם (copy notepad.exe x.exe): מזהים לפי שם הקובץ המקורי שבמשאב הגרסה, ואם אין – לפי גיבוב התוכן (רק כשהגודל זהה)
+  static string? RenamedIdentity(int pid) {
+    try {
+      if (!renameSeen.TryAdd(pid, 0)) return null;   // כל תהליך נבדק פעם אחת
+      var path = Native.ImagePath(pid); if (path == null) return null;
+      var on = OrigNameCached(path);
+      if (on != null && (killSet.Contains(on) || codeKillMap.ContainsKey(on))) return on;
+      var sm = sizeMap; if (sm.Count == 0) return null;
+      long len; try { len = new FileInfo(path).Length; } catch { return null; }
+      if (!sm.TryGetValue(len, out var cands)) return null;
+      var h = HashOf(path); if (h == null) return null;
+      foreach (var cd in cands) if (cd.Hash == h) return cd.Name;
+    } catch { }
+    return null;
+  }
+  static void HandleProc(string n, int pid, int ppid = 0) {
     var c = cur; if (!Blocking(c)) return;
-    if (killSet.Contains(n)) { if (OwnerApplies(c, pid)) { KillPid(pid); Alerts.Log("נסגרה תוכנה חסומה: " + n, false); } return; }
-    if (codeKillMap.TryGetValue(n, out var rid) && !IsAuth(pid, rid) && promptedPid.TryAdd(pid, rid)) {
+    if (killSet.Count == 0 && codeKillMap.Count == 0) return;
+    if (!killSet.Contains(n) && !codeKillMap.ContainsKey(n)) { var real = RenamedIdentity(pid); if (real == null) return; n = real; }
+    if (ppid <= 0) ppid = Native.ParentOf(pid);
+    if (ppid > 0 && internalPids.ContainsKey(ppid)) return;   // כלי מערכת שהאפליקציה עצמה הפעילה (PowerShell, netsh, sc ...)
+    if (killSet.Contains(n)) {
+      if (!OwnerApplies(c, pid) || IsAuthAny(pid)) return;
+      var name = n;
+      if (ppid > 0 && FromGate(ppid)) {   // הופעל על ידי השער: ממתינים לרגע שהאישור יירשם (קריאה פנימית מאושרת), ואם אין אישור – סוגרים
+        Task.Run(async () => { for (int i = 0; i < 15; i++) { await Task.Delay(100); if (IsAuthAny(pid) || !Native.Alive(pid)) return; } KillPid(pid); Alerts.Log("נסגרה תוכנה חסומה: " + name, false); });
+        return;
+      }
+      KillPid(pid); Alerts.Log("נסגרה תוכנה חסומה: " + n, false); return;
+    }
+    if (codeKillMap.TryGetValue(n, out var rid) && !IsAuth(pid, rid) && TryPrompt(pid, rid)) {
       int sess = 0; try { using var p = Process.GetProcessById(pid); sess = p.SessionId; } catch { return; }
       // ממתינים רגע: אם התוכנה הופעלה דרך השער, הקוד כבר הוקש והאישור מגיע בעוד מילישניות
       Task.Run(async () => {
@@ -107,8 +165,10 @@ public static class Program {
   static void Reload(Config c) {
     var blocking = Blocking(c);
     var ks = new HashSet<string>(StringComparer.OrdinalIgnoreCase); var ck = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    var progs = new List<(string Name, string Path)>();
     void Names(Rule r, bool full) {
       var n = System.IO.Path.GetFileNameWithoutExtension(r.Path); if (n.Length == 0 || Enforcer.IsCritical(n)) return;
+      progs.Add((n, r.Path));
       var all = new List<string> { n }; if (alias.TryGetValue(n, out var al)) all.AddRange(al);
       foreach (var x in all) { if (full) ks.Add(x); else ck[x] = r.Id; }
     }
@@ -117,6 +177,12 @@ public static class Program {
       if (c.Settings.On && c.Settings.Mode == Mode.Code) ck["SystemSettings"] = c.Settings.Id;   // רשת ביטחון: אפליקציית ההגדרות של Windows לא תמיד נתפסת ב-IFEO
     }
     killSet = ks; codeKillMap = ck;
+    if (progs.Count == 0) sizeMap = new();
+    else Task.Run(() => {   // גיבוב התוכנות החסומות ברקע (לזיהוי עותקים ששינו להם שם)
+      var d = new Dictionary<long, List<(string Hash, string Name)>>();
+      foreach (var (nm, pth) in progs) { try { if (!File.Exists(pth)) continue; var h = HashOf(pth); if (h == null) continue; var len = new FileInfo(pth).Length; if (!d.TryGetValue(len, out var l)) d[len] = l = new(); l.Add((h, nm)); } catch { } }
+      sizeMap = d;
+    });
     curMap = blocking ? Enforcer.ExtMap(c) : new Dictionary<string, Rule>();
     Enforcer.SetSkip(c); Alerts.SetUrl(c.AlertUrl);
   }
@@ -140,30 +206,37 @@ public static class Program {
     }
     return "BAD";
   }
-  static string Handle(string line, int clientPid) {
+  // admin = הלקוח הוא מנהל מורם (נבדק דרך הזדהות ה-Pipe). פקודות ניהול נענות רק למנהל, כך שמשתמש רגיל לא יכול לנעול את המנהל מחוץ לשירות
+  static string Handle(string line, int clientPid, bool admin, string sid) {
     try {
       var p = line.Split('|', 4);
       switch (p[0]) {
         case "HELLO": return "OK";
         case "VER": return Ver;
-        case "AUTH": return Auth(string.Join("|", p.Skip(1)));
-        case "SAVE": {
-            if (p.Length < 3 || !TokenOk(p[1])) return "DENY";
+        case "AUTH": if (!admin) return "DENY"; return Auth(string.Join("|", p.Skip(1)));
+        case "SAVE":
+        case "SAVERT": {   // SAVE: הגדרות בלבד (מצב ההחלה נשמר מהקובץ הקיים). SAVERT: כולל מצב החלה
+            if (!admin || p.Length < 3 || !TokenOk(p[1])) return "DENY";
             var json = Encoding.UTF8.GetString(Convert.FromBase64String(p[2]));
-            if (json.Length > 8_000_000 || JsonSerializer.Deserialize<Config>(json, Config.O) == null) return "ERR";
+            if (json.Length > 8_000_000) return "ERR";
+            var inc = JsonSerializer.Deserialize<Config>(json, Config.O); if (inc == null) return "ERR";
+            if (p[0] == "SAVE") {
+              var latest = Config.TryLoad();
+              if (latest != null) { inc.Applied = latest.Applied; inc.State = latest.State; inc.TempOpenUntil = latest.TempOpenUntil; json = JsonSerializer.Serialize(inc, Config.O); }
+            }
             Config.WriteSecure(json); return "OK";
           }
-        case "RULE": return RuleInfo(p[1], p.Length > 2 ? string.Join("|", p.Skip(2)) : "");
+        case "RULE": return RuleInfo(p[1], p.Length > 2 && p[2].Length > 0 ? string.Join("|", p.Skip(2)) : sid);   // בלי SID – משתמשים בזהות של הלקוח
         case "VERIFY": {
             var c = cur; var r = c.Find(p[1]); if (r == null) return "ERR";
-            var k = "r|" + p[1]; if (Locked(k)) return "LOCK";
+            var k = "r|" + p[1] + "|" + sid; if (Locked(k)) return "LOCK";   // הנעילה לפי משתמש: משתמש רגיל לא יכול לנעול את המנהל
             if (c.CodeOk(r, string.Join("|", p.Skip(2)))) { Ok(k); return "OK"; }
             Fail(k, r.Name); return "BAD";
           }
         case "OPEN": {
             var c = cur; var r = c.Find(p[1]);
             if (r == null || !r.On || !Blocking(c) || r.Mode != Mode.Code || !(c.Paths.Contains(r) || Enforcer.IsExt(c, r))) return "ERR";
-            var k = "r|" + p[1]; if (Locked(k)) return "LOCK";
+            var k = "r|" + p[1] + "|" + sid; if (Locked(k)) return "LOCK";
             if (!c.CodeOk(r, string.Join("|", p.Skip(2)))) { Fail(k, r.Name); return "BAD"; }
             Ok(k); Enforcer.Unlock(r, c); lease[p[1]] = DateTime.UtcNow; Alerts.Log("נפתח בקוד: " + r.Name, false); return "OK";
           }
@@ -174,13 +247,13 @@ public static class Program {
             return "NO";
           }
         case "INTERNAL": {
-            if (p.Length < 4 || !TokenOk(p[1]) || !int.TryParse(p[2], out var ip)) return "DENY";
+            if (!admin || p.Length < 4 || !TokenOk(p[1]) || !int.TryParse(p[2], out var ip)) return "DENY";
             InternalAdd(ip, p[3] == "1" ? 1 : -1); return "OK";
           }
         case "AUTHPID": { if (!FromGate(clientPid) || p.Length < 3 || !int.TryParse(p[1], out var ap)) return "DENY"; RegisterAuth(ap, p[2]); return "OK"; }
         case "KILL": {
             if (!FromGate(clientPid) || p.Length < 3 || !int.TryParse(p[1], out var kp)) return "DENY";
-            if (promptedPid.TryGetValue(kp, out var rr) && rr == p[2] && !IsAuth(kp, rr)) { KillPid(kp); Alerts.Log("תוכנה חסומה נסגרה (לא הוקש קוד)", false); }
+            if (promptedPid.TryGetValue(kp, out var rr) && rr.Rule == p[2] && Native.SameStart(kp, rr.Start) && !IsAuth(kp, rr.Rule)) { KillPid(kp); Alerts.Log("תוכנה חסומה נסגרה (לא הוקש קוד)", false); }
             return "OK";
           }
         case "PING": lease[p[1]] = DateTime.UtcNow; return "OK";
@@ -191,15 +264,31 @@ public static class Program {
         case "SCAN": return $"{Enforcer.ScanId}|{Enforcer.ScanStartTicks}|{Enforcer.ScanDone}|{Enforcer.ScanTotal}|{(Enforcer.ScanRunning ? 1 : 0)}|{(Enforcer.ScanFinished ? 1 : 0)}|{string.Join(",", Enforcer.NoAclDrives.Keys)}";
         case "UNREG":   // הסרת השירות לצורך עדכון (נקרא מהחלון בעדכון גרסה)
         case "UNINSTALL": {
-            if (p.Length < 2 || !TokenOk(p[1])) return "DENY";
-            bool full = p[0] == "UNINSTALL"; Alerts.Log(full ? "התוכנה הוסרה" : "השירות מתעדכן");
-            var cmd = $"sc sdset DeviceGuard \"D:(A;;GA;;;SY)(A;;GA;;;BA)\" & ping -n 3 127.0.0.1 >nul & sc stop DeviceGuard & sc delete DeviceGuard & icacls \"{Config.Dir}\" /grant *S-1-5-32-544:(OI)(CI)F";
-            if (full) cmd += " & reg delete \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\SafeBoot\\Minimal\\DeviceGuard\" /f & reg delete \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\SafeBoot\\Network\\DeviceGuard\" /f & ping -n 3 127.0.0.1 >nul & del /f /q \"" + Enforcer.GateExe + "\"";
-            Process.Start(new ProcessStartInfo("cmd.exe", "/c " + cmd) { CreateNoWindow = true, UseShellExecute = false }); return "OK";
+            if (!admin || p.Length < 2 || !TokenOk(p[1])) return "DENY";
+            bool full = p[0] == "UNINSTALL"; removing = true;
+            Task.Run(() => SelfRemove(full)); return "OK";
           }
       }
     } catch { }
     return "ERR";
+  }
+  // הסרה עצמית של השירות (עדכון או הסרה מלאה). הכול נעשה מתוך השירות עצמו; cmd משמש רק למחיקת קובץ ההפעלה אחרי העצירה, והוא מסומן כפנימי כדי שהשער לא יחסום אותו
+  static void SelfRemove(bool full) {
+    Alerts.Log(full ? "התוכנה הוסרה" : "השירות מתעדכן");
+    try {
+      Enforcer.RunExe("sc.exe", "sdset DeviceGuard D:(A;;GA;;;SY)(A;;GA;;;BA)");
+      Enforcer.RunExe("icacls", $"\"{Config.Dir}\" /grant *S-1-5-32-544:(OI)(CI)F");
+      if (full) foreach (var m in new[] { "Minimal", "Network" }) { try { Registry.LocalMachine.DeleteSubKeyTree($@"SYSTEM\CurrentControlSet\Control\SafeBoot\{m}\DeviceGuard", false); } catch { } }
+      Enforcer.RunExe("sc.exe", "delete DeviceGuard");   // מסומן למחיקה; יימחק סופית כשהשירות ייעצר
+    } catch { }
+    Thread.Sleep(1000);
+    if (full) {
+      try {
+        InternalAdd(Environment.ProcessId, 1);
+        Process.Start(new ProcessStartInfo("cmd.exe", $"/c ping -n 4 127.0.0.1 >nul & del /f /q \"{Enforcer.GateExe}\" \"{Enforcer.LightGateExe}\"") { CreateNoWindow = true, UseShellExecute = false });
+      } catch { }
+    }
+    try { using var sc = new System.ServiceProcess.ServiceController("DeviceGuard"); sc.Stop(); } catch { Environment.Exit(0); }
   }
   static void PipeServer() {
     var ps = new PipeSecurity();
@@ -209,26 +298,52 @@ public static class Program {
     while (true) {
       NamedPipeServerStream? st = null;
       try {
-        st = NamedPipeServerStreamAcl.Create("DeviceGuard.Unlock", PipeDirection.InOut, 64, PipeTransmissionMode.Byte, PipeOptions.Asynchronous, 0, 0, ps);
+        st = NamedPipeServerStreamAcl.Create("DeviceGuard.Unlock", PipeDirection.InOut, 254, PipeTransmissionMode.Byte, PipeOptions.Asynchronous, 0, 0, ps);
         st.WaitForConnection(); var s2 = st; st = null; _ = Task.Run(() => Serve(s2));
       } catch { try { st?.Dispose(); } catch { } Thread.Sleep(500); }
     }
   }
-  // כל חיבור מוגבל ל-5 שניות קריאה: אי אפשר לתפוס את השרת בחיבור שלא שולח כלום
+  // קריאת שורה אחת עם הגבלת גודל: 64KB לפקודות רגילות, 12MB ל-SAVE. מונע מלקוח לנפח את זיכרון השירות
+  static async Task<string?> ReadLimited(Stream s, CancellationToken ct) {
+    var buf = new byte[8192]; using var ms = new MemoryStream(); int limit = 65536; bool decided = false;
+    while (true) {
+      int n = await s.ReadAsync(buf.AsMemory(0, buf.Length), ct); if (n <= 0) break;
+      int nl = Array.IndexOf(buf, (byte)'\n', 0, n);
+      ms.Write(buf, 0, nl >= 0 ? nl : n);
+      if (!decided && ms.Length >= 4) { decided = true; var b = ms.GetBuffer(); if (b[0] == 'S' && b[1] == 'A' && b[2] == 'V' && b[3] == 'E') limit = 12_000_000; }
+      if (ms.Length > limit) return null;
+      if (nl >= 0) break;
+    }
+    if (ms.Length == 0) return null;
+    return Encoding.UTF8.GetString(ms.GetBuffer(), 0, (int)ms.Length).TrimEnd('\r');
+  }
+  // כל חיבור מוגבל ל-5 שניות קריאה: אי אפשר לתפוס את השרת בחיבור שלא שולח כלום. ולכל לקוח עד 16 חיבורים במקביל
   static async Task Serve(NamedPipeServerStream st) {
+    int cpid = 0;
     try {
       using (st) {
+        try { if (Native.GetNamedPipeClientProcessId(st.SafePipeHandle.DangerousGetHandle(), out var u)) cpid = (int)u; } catch { }
+        if (cpid != 0 && connCount.AddOrUpdate(cpid, 1, (k, v) => v + 1) > 16) return;
         string? l;
-        try { using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5)); var rd = new StreamReader(st, new UTF8Encoding(false), false, 4096, true); l = await rd.ReadLineAsync(cts.Token); } catch { return; }
+        try { using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5)); l = await ReadLimited(st, cts.Token); } catch { return; }
         if (l == null) return;
-        int cpid = 0; try { if (Native.GetNamedPipeClientProcessId(st.SafePipeHandle.DangerousGetHandle(), out var u)) cpid = (int)u; } catch { }
-        var resp = await Task.Run(() => Handle(l, cpid));
+        bool admin = false; string sid = "";
+        try { st.RunAsClient(() => { using var id = WindowsIdentity.GetCurrent(); sid = id.User?.Value ?? ""; admin = new WindowsPrincipal(id).IsInRole(WindowsBuiltInRole.Administrator); }); } catch { }
+        var resp = await Task.Run(() => Handle(l, cpid, admin, sid));
         var wr = new StreamWriter(st, new UTF8Encoding(false)) { AutoFlush = true }; await wr.WriteLineAsync(resp);
       }
     } catch { }
+    finally { if (cpid != 0 && connCount.AddOrUpdate(cpid, 0, (k, v) => v - 1) <= 0) connCount.TryRemove(cpid, out _); }
   }
 
   // ---------- הלולאה הראשית של השירות ----------
+  // חתימה של כל מה שמשפיע על חסימת קבצים לפי סיומת. כשהיא לא משתנה אין צורך בסריקה מחדש של הדיסקים
+  static string MapSig(Config c) {
+    var sb = new StringBuilder();
+    foreach (var kv in curMap.OrderBy(k => k.Key, StringComparer.Ordinal)) sb.Append(kv.Key).Append('=').Append(kv.Value.Id).Append(kv.Value.Hidden && kv.Value.Mode == Mode.Full ? 'h' : '-').Append(';');
+    sb.Append('|').Append(string.Join(",", c.Exclude)).Append('|').Append(c.SkipAppData).Append(c.Harden).Append(c.IncludeRemovable).Append(c.SkipProgramDirs);
+    return sb.ToString();
+  }
   public static void Watch() {
     Config.InService = true; Enforcer.InService = true;
     LockDir(); new Thread(PipeServer) { IsBackground = true }.Start();
@@ -245,13 +360,13 @@ public static class Program {
         w.EnableRaisingEvents = true; fsw.Add(w);
       } catch { }
     }
-    IEnumerable<string> Drives() => DriveInfo.GetDrives().Where(x => (x.DriveType == DriveType.Fixed || x.DriveType == DriveType.Removable) && x.IsReady).Select(x => x.RootDirectory.FullName);
+    IEnumerable<string> Drives() => DriveInfo.GetDrives().Where(x => Enforcer.ScanDrive(x) && x.IsReady).Select(x => x.RootDirectory.FullName);
     foreach (var d in Drives()) Watch1(d);
 
     var stamp = DateTime.MinValue; var c = new Config();
     var ifeo = new List<(string Exe, string Id)>(); var regs = new List<RegWant>();
     var lastScan = DateTime.MinValue; var lastIfeo = DateTime.UtcNow; var lastReg = DateTime.UtcNow; var lastFw = DateTime.UtcNow; var lastAd = DateTime.UtcNow;
-    var lastPoll = DateTime.MinValue; var lastRec = DateTime.UtcNow; var lastSweep = DateTime.UtcNow; var lastOverflow = DateTime.MinValue;
+    var lastPoll = DateTime.MinValue; var lastRec = DateTime.UtcNow; var lastSweep = DateTime.UtcNow; var lastOverflow = DateTime.MinValue; var lastDrv = DateTime.MinValue; var lastWmi = DateTime.UtcNow; string? lastSig = null;
     bool pendingDone = false; Task scanTask = Task.CompletedTask; CancellationTokenSource? scanCts = null;
     void StartScan(Dictionary<string, Rule> map, bool release, string? root = null) {
       if (release) scanCts?.Cancel();
@@ -261,7 +376,11 @@ public static class Program {
     }
     while (true) {
       try {
-        try { foreach (var d in Drives()) { if (watched.Contains(d)) continue; Enforcer.ResetDriveCache(); Watch1(d); if (curMap.Count > 0) StartScan(curMap, false, d); } } catch { }
+        if ((DateTime.UtcNow - lastDrv).TotalSeconds >= 5) {   // בדיקת כוננים חדשים כל כמה שניות (ולא כל שנייה)
+          lastDrv = DateTime.UtcNow;
+          try { foreach (var d in Drives()) { if (watched.Contains(d)) continue; Enforcer.ResetDriveCache(); Watch1(d); if (curMap.Count > 0) StartScan(curMap, false, d); } } catch { }
+        }
+        if (pw == null && (DateTime.UtcNow - lastWmi).TotalSeconds >= 30) { lastWmi = DateTime.UtcNow; StartWmi(); }   // ניטור WMI שנפל – מפעילים מחדש
         var ts = File.GetLastWriteTimeUtc(Config.CfgPath);
         if (ts != stamp) {
           var nc = Config.TryLoad();   // null = קריאה נכשלה: נשארים עם ההגדרות הקודמות ומנסים שוב (לא מתאפסים להגדרות ריקות)
@@ -269,7 +388,8 @@ public static class Program {
             stamp = ts; c = nc; cur = nc; Reload(nc); var bl = Blocking(nc);
             ifeo = bl ? Enforcer.IfeoList(nc) : new(); regs = bl ? Enforcer.RegWants(nc) : new();
             if (!pendingDone) { pendingDone = true; Enforcer.RelockPending(nc); }
-            StartScan(curMap, true); lastScan = DateTime.UtcNow;
+            var sig = MapSig(nc);   // סורקים מחדש רק אם משהו שמשפיע על חסימת הקבצים השתנה (ולא בכל שמירה של הגדרה כלשהי)
+            if (sig != lastSig) { lastSig = sig; StartScan(curMap, true); lastScan = DateTime.UtcNow; }
           }
         }
         var blocking = Blocking(c); var now = DateTime.UtcNow;
@@ -297,7 +417,8 @@ public static class Program {
         if ((now - lastSweep).TotalSeconds >= 30) {
           lastSweep = now;
           foreach (var k in authPid.Keys.ToArray()) if (!Native.Alive(k)) authPid.TryRemove(k, out _);
-          foreach (var k in promptedPid.Keys.ToArray()) if (!Native.Alive(k)) promptedPid.TryRemove(k, out _);
+          foreach (var kv in promptedPid.ToArray()) if (!Native.SameStart(kv.Key, kv.Value.Start)) promptedPid.TryRemove(kv.Key, out _);
+          foreach (var k in renameSeen.Keys.ToArray()) if (!Native.Alive(k)) renameSeen.TryRemove(k, out _);
           foreach (var k in internalPids.Keys.ToArray()) if (!Native.Alive(k)) internalPids.TryRemove(k, out _);
           foreach (var kv in tokens.ToArray()) if ((now - kv.Value).TotalHours >= 8) tokens.TryRemove(kv.Key, out _);
           foreach (var kv in ruleAuth.ToArray()) if ((now - kv.Value).TotalHours >= 1) ruleAuth.TryRemove(kv.Key, out _);
@@ -312,7 +433,7 @@ public static class Program {
   [STAThread]
   public static void Main(string[] args) {
     if (args.Contains("--service")) { Config.InService = true; System.ServiceProcess.ServiceBase.Run(new GuardService()); return; }
-    if (args.Contains("--watch")) { Watch(); return; }
+    if (args.Contains("--watch")) { using var wid = WindowsIdentity.GetCurrent(); if (wid.IsSystem) Watch(); return; }   // מצב ישן: רק כ-SYSTEM
     if (args.Length >= 2 && args[0] == "--gate") { GateMode.RunGate(args); return; }
     if (args.Length >= 3 && args[0] == "--promptkill") { GateMode.PromptKill(args); return; }
     if (args.Length >= 2 && args[0] == "--open") { GateMode.OpenFlow(args[1]); return; }
@@ -325,6 +446,8 @@ public static class Program {
   }
   static void RunUi() {
     try {
+      using var single = new Mutex(true, "Global\\DeviceGuard.UI", out var created);   // מופע אחד בלבד של החלון (שני חלונות היו דורסים זה את ההגדרות של זה)
+      if (!created) { MessageBox.Show("DeviceGuard כבר פתוח."); return; }
       var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown }; Theme.Apply(app);
       app.DispatcherUnhandledException += (s, e) => { MessageBox.Show(e.Exception.Message, "DeviceGuard"); e.Handled = true; };
       var c = Config.Load();
@@ -340,6 +463,7 @@ public static class Program {
           MessageBox.Show("קוד שגוי");
         }
       }
+      Enforcer.TryStartService();   // אם השירות מותקן אך כבוי – מפעילים אותו, אחרת אי אפשר לשמור הגדרות
       if (Code != null && Config.Up() && !Config.Auth(Code)) MessageBox.Show("האימות מול שירות ההגנה נכשל (ייתכן שיש נעילה זמנית אחרי ניסיונות שגויים)");
       if (string.IsNullOrEmpty(c.OwnerSid)) { c.OwnerSid = Native.InteractiveUserSid(); c.OwnerUser = Native.AccountName(c.OwnerSid) ?? Environment.UserName; dirty = true; }
       if (!string.Equals(c.UiExe, Environment.ProcessPath, StringComparison.OrdinalIgnoreCase)) { c.UiExe = Environment.ProcessPath; dirty = true; }

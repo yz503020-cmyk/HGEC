@@ -23,7 +23,7 @@ public class MainWin : Window {
     un.Click += async (s, e) => {
       var k = Ask("קוד ברירת מחדל"); if (k == null) return; if (!Config.Check(k, C.DefaultCode)) { MessageBox.Show(C.DefaultCode == null ? "לא הוגדר קוד ברירת מחדל (חלון 1)" : "קוד שגוי"); return; }
       IsEnabled = false; busy = true;
-      try { await Task.Run(() => { Enforcer.Revert(C); C.TempOpenUntil = DateTime.UtcNow.AddMinutes(30).Ticks; C.Save(); }); status.Text = "החסימות פתוחות זמנית (30 דקות)"; }   // השירות מחזיר את החסימות לבד כשהזמן נגמר, גם אם התוכנה נסגרה
+      try { await Task.Run(() => { Enforcer.Revert(C); C.TempOpenUntil = DateTime.UtcNow.AddMinutes(30).Ticks; C.Save(true); }); status.Text = "החסימות פתוחות זמנית (30 דקות)"; }   // השירות מחזיר את החסימות לבד כשהזמן נגמר, גם אם התוכנה נסגרה
       catch (Exception x) { MessageBox.Show("שגיאה: " + x.Message); }
       busy = false; IsEnabled = true;
     };
@@ -62,8 +62,8 @@ public class MainWin : Window {
   async Task Do() {
     if (C.Master && C.DefaultCode == null && C.All().Any(r => r.On && r.Mode == Mode.Code && r.OwnCode == null)) { MessageBox.Show("יש חסימות בקוד שאין להן קוד. הגדר קוד ברירת מחדל (חלון 1) או קוד נפרד לכל חסימה."); return; }
     C.TempOpenUntil = 0;
-    if (C.Master && C.Sched.On && !C.Sched.Active(DateTime.Now)) {   // מחוץ לחלון הזמנים: שומרים, והשירות יפעיל לבד בתחילת החלון
-      try { C.Save(); } catch (Exception x) { MessageBox.Show(x.Message); }
+    if (C.Master && C.Sched.On && !C.Sched.Active(C.Sched.NowPinned())) {   // מחוץ לחלון הזמנים: שומרים, והשירות יפעיל לבד בתחילת החלון
+      try { C.Save(true); } catch (Exception x) { MessageBox.Show(x.Message); }
       status.Text = "מחוץ לחלון הזמנים – החסימות יופעלו אוטומטית בתחילת החלון"; return;
     }
     if (C.PreviewApply && MessageBox.Show(Enforcer.Describe(C) + "\n\nלהחיל?", "סיכום החלה", MessageBoxButton.YesNo) != MessageBoxResult.Yes) return;
@@ -209,7 +209,13 @@ public class MainWin : Window {
     glyph ??= t.Contains("הוסף") ? "\uE710" : t.Contains("ייצוא") ? "\uE898" : t.Contains("ייבוא") ? "\uE896" : t.Contains("קוד") ? "\uE72E" : null;
     var b = new Button { Content = glyph == null ? t : Theme.IconText(glyph, t), Margin = new Thickness(0, 4, 8, 4) }; b.Click += (s, e) => a(); return b;
   }
-  static ImageSource? Icon(string exe) { try { using var i = System.Drawing.Icon.ExtractAssociatedIcon(exe); return i == null ? null : Imaging.CreateBitmapSourceFromHIcon(i.Handle, Int32Rect.Empty, BitmapSizeOptions.FromEmptyOptions()); } catch { return null; } }
+  static readonly Dictionary<string, ImageSource?> iconCache = new(StringComparer.OrdinalIgnoreCase);
+  static ImageSource? Icon(string exe) {
+    if (iconCache.TryGetValue(exe, out var c)) return c;
+    ImageSource? r = null;
+    try { using var i = System.Drawing.Icon.ExtractAssociatedIcon(exe); if (i != null) { var b = Imaging.CreateBitmapSourceFromHIcon(i.Handle, Int32Rect.Empty, BitmapSizeOptions.FromEmptyOptions()); b.Freeze(); r = b; } } catch { }
+    iconCache[exe] = r; return r;
+  }
 
   UIElement ProgRow(string n, string e) {
     var rule = C.Programs.FirstOrDefault(x => x.Path.Equals(e, StringComparison.OrdinalIgnoreCase)) ?? new Rule { Name = n, Path = e };   // נוסף לרשימה ונשמר רק אחרי שינוי (לא כל תוכנה מותקנת)
@@ -272,7 +278,7 @@ public class MainWin : Window {
     Theme.Tipped(exp, "שומר את ההגדרות לקובץ, לגיבוי או להעברה למחשב אחר.");
     Theme.Tipped(imp, "טוען הגדרות מקובץ שיוצא קודם. אחרי הטעינה לוחצים 'החל שינויים'.");
     Theme.Tipped(un2, "מכבה את כל החסימות ומסיר את שירות ההגנה מהמחשב, אחרי הקשת קוד הכניסה.");
-    return Page("הגדרות כלליות", "\uE713", code, all, hard, SkipAppCheck(), PreviewCheck(), Row(C.Settings, () => SettingsPages, false, null, "\uE713"), Row(C.Install, null, false, null, "\uE896"), Row(C.Usb, usb, false, null, "\uE88E"), SchedulePanel(), new StackPanel { Orientation = Orientation.Horizontal, Children = { exp, imp, un2 } }, note);
+    return Page("הגדרות כלליות", "\uE713", code, all, hard, SkipAppCheck(), ScanOpts(), PreviewCheck(), Row(C.Settings, () => SettingsPages, false, null, "\uE713"), Row(C.Install, null, false, null, "\uE896"), Row(C.Usb, usb, false, null, "\uE88E"), SchedulePanel(), new StackPanel { Orientation = Orientation.Horizontal, Children = { exp, imp, un2 } }, note);
   }
   Dictionary<string, object> Sections() => new() { ["1"] = new { C.AllUsers, C.Settings, C.Install, C.Usb }, ["2"] = C.Programs, ["3"] = C.Portable, ["4"] = new { C.Movies, C.Songs, C.Images, C.Exts }, ["5"] = C.Paths, ["6"] = new { C.Net, C.NetApps, C.NetAppsWhite }, ["7"] = new { C.Adv, C.AdvOpts, C.Sched } };
   void Export() {
@@ -479,6 +485,14 @@ public class MainWin : Window {
     var cb = new CheckBox { Content = "אל תחסום קבצים בתיקיית AppData של המשתמשים (מומלץ: מונע שבירת תוכנות)", IsChecked = C.SkipAppData, Margin = new Thickness(0, 0, 0, 8) };
     cb.Click += (s, e) => { C.SkipAppData = cb.IsChecked == true; C.Save(); }; return cb;
   }
+  UIElement ScanOpts() {
+    var sp = new StackPanel();
+    var rem = new CheckBox { Content = "חסום מדיה גם בכוני USB / כוננים נשלפים (ברירת מחדל: לא – כדי לא לפגוע בציוד של אחרים)", IsChecked = C.IncludeRemovable, Margin = new Thickness(0, 0, 0, 8) };
+    rem.Click += (s, e) => { C.IncludeRemovable = rem.IsChecked == true; C.Save(); };
+    var prog = new CheckBox { Content = "אל תחסום מדיה בתיקיות תוכנות (תיקיות עם קובצי dll, node_modules וכד') – מומלץ, מונע שבירת תוכנות", IsChecked = C.SkipProgramDirs, Margin = new Thickness(0, 0, 0, 8) };
+    prog.Click += (s, e) => { C.SkipProgramDirs = prog.IsChecked == true; C.Save(); };
+    sp.Children.Add(rem); sp.Children.Add(prog); return sp;
+  }
   CheckBox PreviewCheck() {
     var cb = new CheckBox { Content = "הצג סיכום ובקש אישור לפני החלת שינויים", IsChecked = C.PreviewApply, Margin = new Thickness(0, 0, 0, 8) };
     cb.Click += (s, e) => { C.PreviewApply = cb.IsChecked == true; C.Save(); }; return cb;
@@ -487,12 +501,12 @@ public class MainWin : Window {
   UIElement SchedulePanel() {
     var sp = new StackPanel();
     var on = new CheckBox { Content = "תזמון: החסימות פעילות רק בחלון זמן (מחוץ לחלון הכול נפתח אוטומטית, ובתחילתו נסגר שוב)", IsChecked = C.Sched.On, FontWeight = FontWeights.SemiBold };
-    on.Click += (s, e) => { C.Sched.On = on.IsChecked == true; C.Save(); };
+    on.Click += (s, e) => { C.Sched.On = on.IsChecked == true; if (C.Sched.On && string.IsNullOrEmpty(C.Sched.TzId)) C.Sched.TzId = Schedule.Local(); C.Save(); };
     sp.Children.Add(on);
     var row = new WrapPanel { Margin = new Thickness(0, 10, 0, 0) };
     TextBox Tb(Func<string> get, Action<string> set) {
       var t = new TextBox { Text = get(), Width = 64, Margin = new Thickness(0, 0, 8, 0), TextAlignment = TextAlignment.Center, FlowDirection = FlowDirection.LeftToRight };
-      t.LostFocus += (s, e) => { if (TimeSpan.TryParse(t.Text.Trim(), out var ts) && ts >= TimeSpan.Zero && ts < TimeSpan.FromDays(1)) { var v = ts.ToString(@"hh\:mm"); t.Text = v; set(v); C.Save(); } else t.Text = get(); };
+      t.LostFocus += (s, e) => { if (TimeSpan.TryParse(t.Text.Trim(), out var ts) && ts >= TimeSpan.Zero && ts < TimeSpan.FromDays(1)) { var v = ts.ToString(@"hh\:mm"); t.Text = v; set(v); if (string.IsNullOrEmpty(C.Sched.TzId)) C.Sched.TzId = Schedule.Local(); C.Save(); } else t.Text = get(); };
       return t;
     }
     row.Children.Add(new TextBlock { Text = "פעיל מהשעה", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 8, 0) });
@@ -506,6 +520,7 @@ public class MainWin : Window {
       row.Children.Add(cb);
     }
     sp.Children.Add(row);
+    sp.Children.Add(new TextBlock { Text = "אזור הזמן של התזמון: " + (string.IsNullOrEmpty(C.Sched.TzId) ? "של המחשב" : C.Sched.TzId) + " (שינוי שעון במחשב לא יזיז את החלון).", Foreground = Brushes.Gray, Margin = new Thickness(0, 6, 0, 0), TextWrapping = TextWrapping.Wrap });
     sp.Children.Add(new TextBlock { Text = "אם שעת הסיום מוקדמת משעת ההתחלה, החלון עובר את חצות (למשל 20:00–07:00).", Foreground = Brushes.Gray, Margin = new Thickness(0, 6, 0, 0), TextWrapping = TextWrapping.Wrap });
     return Card(sp);
   }
@@ -546,6 +561,7 @@ public class MainWin : Window {
     Opt("חסימת Microsoft Store", "מונע התקנת אפליקציות מהחנות. פועל ב-Pro/Enterprise/Education.", () => C.AdvOpts.NoStore, v => C.AdvOpts.NoStore = v);
     Opt("חסימת winget (App Installer)", "מונע התקנת תוכנות דרך winget.", () => C.AdvOpts.NoWinget, v => C.AdvOpts.NoWinget = v);
     Opt("דפדפנים: כיבוי DNS מוצפן וגלישה פרטית", "Chrome / Edge / Firefox: מבטל DoH וגלישה בסתר, שעוקפים סינון רשת.", () => C.AdvOpts.Browsers, v => C.AdvOpts.Browsers = v);
+    Opt("חסימת הגדרת Proxy / VPN בדפדפנים ובמערכת", "מונע עקיפת סינון דרך שרת Proxy. עלול להפריע אם המחשב משתמש ב-Proxy ארגוני.", () => C.AdvOpts.NoProxy, v => C.AdvOpts.NoProxy = v);
     Opt("חסימת שיתוף אינטרנט (נקודה חמה)", "מסתיר את ממשק השיתוף של חיבור האינטרנט.", () => C.AdvOpts.NoTether, v => C.AdvOpts.NoTether = v);
     Opt("חסימת שינוי הגדרות TCP/IP מתקדמות (DNS)", "מונע שינוי DNS והגדרות רשת מתקדמות בממשק.", () => C.AdvOpts.NoTcpip, v => C.AdvOpts.NoTcpip = v);
     Opt("נעילת קובץ hosts", "מונע עריכת קובץ hosts (עקיפת סינון בדרך זו).", () => C.AdvOpts.LockHosts, v => C.AdvOpts.LockHosts = v);

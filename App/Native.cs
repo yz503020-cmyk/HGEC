@@ -26,6 +26,16 @@ static class Native {
   public static int ParentPid() {
     try { var pbi = new PBI(); using var p = Process.GetCurrentProcess(); return NtQueryInformationProcess(p.Handle, 0, ref pbi, Marshal.SizeOf<PBI>(), out _) == 0 ? (int)pbi.Parent : 0; } catch { return 0; }
   }
+  // תהליך האב של תהליך כלשהו (0 = לא ידוע)
+  public static int ParentOf(int pid) {
+    var h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid); if (h == 0) return 0;
+    try { var pbi = new PBI(); return NtQueryInformationProcess(h, 0, ref pbi, Marshal.SizeOf<PBI>(), out _) == 0 ? (int)pbi.Parent : 0; }
+    catch { return 0; } finally { CloseHandle(h); }
+  }
+  // שם הקובץ המקורי מתוך משאב הגרסה של קובץ ההפעלה (בלי סיומת). משמש לזיהוי עותקים ששינו להם שם
+  public static string? OriginalName(string path) {
+    try { var o = FileVersionInfo.GetVersionInfo(path).OriginalFilename; return string.IsNullOrWhiteSpace(o) ? null : System.IO.Path.GetFileNameWithoutExtension(o.Trim()); } catch { return null; }
+  }
   public static bool Alive(int pid) { try { using var p = Process.GetProcessById(pid); return !p.HasExited; } catch { return false; } }
   public static bool SameStart(int pid, DateTime start) { try { using var p = Process.GetProcessById(pid); return p.StartTime == start; } catch { return false; } }
   // המשתמש שיושב מול המחשב (בעל explorer.exe בסשן הנוכחי) – גם כשהתוכנה הורצה כמנהל של חשבון אחר

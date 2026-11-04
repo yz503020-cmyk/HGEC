@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net8.0-windows</TargetFramework>
+    <TargetFramework>net10.0-windows</TargetFramework>
     <UseWPF>true</UseWPF>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
@@ -9,11 +9,11 @@
     <RootNamespace>DG</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>icon.ico</ApplicationIcon>
-    <Version>2.0.0</Version>
+    <Version>2.1.0</Version>
     <Product>DeviceGuard</Product>
     <Company>DeviceGuard</Company>
     <Description>DeviceGuard device restrictions manager</Description>
-    <!-- אריזה לקובץ יחיד: האפליקציה והשער הם אותו קובץ (השירות מעתיק אותו ל-DeviceGuardWatch.exe) -->
+    <!-- אריזה לקובץ יחיד: האפליקציה והשער המלא הם אותו קובץ (השירות מעתיק אותו ל-DeviceGuardWatch.exe) -->
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <DebugType>none</DebugType>
@@ -23,8 +23,13 @@
     <NoWarn>$(NoWarn);CS8618;CS8600;CS8602;CS8604;CS8625;CS0649;CS0169</NoWarn>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="System.Management" Version="8.0.0" />
-    <PackageReference Include="System.Drawing.Common" Version="8.0.0" />
-    <PackageReference Include="System.ServiceProcess.ServiceController" Version="8.0.0" />
+    <PackageReference Include="System.Management" Version="10.0.0" />
+    <PackageReference Include="System.Drawing.Common" Version="10.0.0" />
+    <PackageReference Include="System.ServiceProcess.ServiceController" Version="10.0.0" />
+    <PackageReference Include="System.Diagnostics.EventLog" Version="10.0.0" />
+  </ItemGroup>
+  <!-- השער הקל (NativeAOT) מוטמע בקובץ הראשי אם נבנה מראש (ראו build.cmd / CI). אם אינו קיים – הכל עובד עם השער המלא -->
+  <ItemGroup Condition="Exists('..\Gate\out\DeviceGuardGate.exe')">
+    <EmbeddedResource Include="..\Gate\out\DeviceGuardGate.exe" LogicalName="DeviceGuardGate.exe" />
   </ItemGroup>
 </Project>

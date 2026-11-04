@@ -9,13 +9,18 @@ public class Rule {
 }
 // אפשרויות "הגנה מתקדמת" (חלון 7)
 public class AdvOpts {
-  public bool BlockBoot = true, NoVirt, NoTaskMgr, NoRegedit, NoStore, NoWinget, NoTether, NoTcpip, LockHosts;
+  public bool BlockBoot = true, NoVirt, NoTaskMgr, NoRegedit, NoStore, NoWinget, NoTether, NoTcpip, LockHosts, NoProxy;
   public bool Browsers = true;   // כיבוי DoH וגלישה פרטית בדפדפנים
   public bool SafeBoot = true;   // השירות רץ גם ב-Safe Mode
 }
 // תזמון: החסימות פעילות רק בתוך החלון (מחוץ לו הכול נפתח אוטומטית)
 public class Schedule {
   public bool On; public string From = "20:00", To = "07:00"; public int Days = 127;   // ביט 0 = יום ראשון
+  public string? TzId;   // אזור הזמן שבו מוגדר התזמון. נקבע בהגדרה, כדי ששינוי אזור הזמן במחשב (מותר למשתמש רגיל) לא יזיז את החלון
+  public static string? Local() { try { return TimeZoneInfo.Local.Id; } catch { return null; } }
+  public DateTime NowPinned() {
+    try { var tz = string.IsNullOrEmpty(TzId) ? TimeZoneInfo.Local : TimeZoneInfo.FindSystemTimeZoneById(TzId); return TimeZoneInfo.ConvertTime(DateTime.UtcNow, tz); } catch { return DateTime.Now; }
+  }
   static TimeSpan P(string s) => TimeSpan.TryParse(s, out var t) ? t : TimeSpan.Zero;
   bool DayOn(DayOfWeek d) => (Days & (1 << (int)d)) != 0;
   public bool Active(DateTime now) {
@@ -29,6 +34,8 @@ public class Schedule {
 }
 public class Config {
   public string? AppCode, DefaultCode, OwnerUser, OwnerSid, UiExe, AlertUrl;
+  public bool IncludeRemovable;   // false (ברירת מחדל): לא חוסמים קבצים בכוננים נשלפים, כדי שלא יישארו נעולים גם במחשבים אחרים
+  public bool SkipProgramDirs = true;   // לא חוסמים קבצי מדיה בתיקיות תוכנה (תיקייה שיש בה קובצי dll), תיקיות נקודה ו-node_modules – מונע שבירת תוכנות
   public bool Master = true, AllUsers = true, Terms, Harden = true, SkipAppData = true, PreviewApply;   // Harden: חיזוק חסימת קבצים – מונע מבעל הקובץ לשנות את ההרשאות
   public long TempOpenUntil;   // פתיחה זמנית: זמן סיום (UTC ticks). השירות מחזיר את החסימות לבד כשהזמן עובר
   public int State;            // 1 = החסימות הוחלו כרגע (בשימוש התזמון והפתיחה הזמנית)
@@ -47,7 +54,7 @@ public class Config {
   public bool AnyOn() => All().Any(r => r.On) || NetApps.On;
 
   // רשימות סיומות ברירת מחדל. הוסרו סיומות שנשברות בקלות (ts = TypeScript, mod, ps, ico, svg ...) – אפשר להוסיף ידנית בחלון 4
-  public static readonly string[] Vid = "3g2 3gp amv asf avi avs cpk divx dv dvr-ms f4v fli flv gxv h264 m1v m2p m2t m2ts m2v m4v mkv mov mp2 mp4 mpe mpeg mpeg1 mpeg2 mpeg4 mpg mts mxf nvavi ogg ogm qt rmvb trp vfw vob wmv yuv".Split(' ');
+  public static readonly string[] Vid = "3g2 3gp amv asf avi avs cpk divx dv dvr-ms f4v fli flv gxv h264 m1v m2p m2t m2ts m2v m4v mkv mov mp4 mpe mpeg mpeg1 mpeg2 mpeg4 mpg mts mxf nvavi ogm qt rmvb trp vfw vob wmv yuv".Split(' ');
   public static readonly string[] Aud = "aac ac3 amr ape flac m4r mmf mp2 mp3 ogg wav wma wv m4a".Split(' ');
   public static readonly string[] Img = "bmp gif jpg jpeg jpe jfif png tga tif tiff webp wmf heic heif avif".Split(' ');
   // סיומות שאסור לחסום (חוסמות את המחשב עצמו)
@@ -85,28 +92,40 @@ public class Config {
   public static bool Up(int ms = 1500) => Pipe("HELLO", ms) == "OK";
   public static bool Auth(string code) { var t = Pipe("AUTH|" + code); if (t != null && t.StartsWith("TOKEN|")) { Token = t[6..]; return true; } return false; }
 
-  public void Save() {
+  // runtime = true: השמירה כוללת גם את מצב ההחלה (Applied / State / TempOpenUntil). שמירה רגילה לא דורסת אותו, כדי שה-UI לא ידרוס מצב שהשירות עדכן בינתיים
+  public void Save(bool runtime = false) {
     Programs.RemoveAll(r => !r.On && r.OwnCode == null && !r.Hidden && r.Mode == Mode.Full && r.White.Count == 0);   // לא שומרים תוכנות כבויות (מקטין את הקובץ)
     var json = JsonSerializer.Serialize(this, O);
-    if (InService) { WriteSecure(json); return; }
-    if (Token != null || Pipe("HELLO", 300) == "OK") {   // כשהשירות המוגן פעיל – השמירה עוברת דרכו בלבד
+    if (InService) { if (runtime) SaveRuntimeMerged(json); else WriteSecure(json); return; }
+    if (Token != null || Pipe("HELLO", 300) == "OK" || Enforcer.TryStartService()) {   // כשהשירות המוגן פעיל – השמירה עוברת דרכו בלבד
       var b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(json));
+      var cmd = runtime ? "SAVERT|" : "SAVE|";
       for (int i = 0; i < 2; i++) {
         if (Token == null && !(Program.Code != null && Auth(Program.Code))) break;
-        var r = Pipe("SAVE|" + Token + "|" + b64, 10000);
+        var r = Pipe(cmd + Token + "|" + b64, 10000);
         if (r == "OK") return;
         if (r == "DENY") { Token = null; continue; }   // הטוקן פג (השירות הופעל מחדש): מאמתים שוב ומנסים שוב
         break;
       }
       throw new IOException("שמירת ההגדרות דרך שירות ההגנה נכשלה");
     }
-    if (!Directory.Exists(Dir)) {
-      Directory.CreateDirectory(Dir);
-      Enforcer.RunExe("icacls", $"\"{Dir}\" /inheritance:r /grant *S-1-5-32-544:(OI)(CI)F /grant *S-1-5-18:(OI)(CI)F /grant *S-1-5-32-545:(OI)(CI)RX");
-    }
-    var tmp = CfgPath + ".tmp"; File.WriteAllText(tmp, json);
-    if (File.Exists(CfgPath)) File.Copy(CfgPath, BakPath, true);
-    File.Move(tmp, CfgPath, true);
+    try {
+      if (!Directory.Exists(Dir)) {
+        Directory.CreateDirectory(Dir);
+        Enforcer.RunExe("icacls", $"\"{Dir}\" /inheritance:r /grant *S-1-5-32-544:(OI)(CI)F /grant *S-1-5-18:(OI)(CI)F /grant *S-1-5-32-545:(OI)(CI)RX");
+      }
+      var tmp = CfgPath + ".tmp"; File.WriteAllText(tmp, json);
+      if (File.Exists(CfgPath)) File.Copy(CfgPath, BakPath, true);
+      File.Move(tmp, CfgPath, true);
+    } catch (UnauthorizedAccessException) { throw new IOException("שירות ההגנה אינו פעיל, ולכן לא ניתן לשמור. המתן רגע ונסה שוב, או הפעל מחדש את המחשב"); }
+  }
+  // שמירה מתוך השירות: משנה רק את מצב ההחלה בקובץ העדכני, ולא דורסת הגדרות שהמשתמש שמר בינתיים
+  void SaveRuntimeMerged(string fallbackJson) {
+    var latest = TryLoad();
+    if (latest == null || ReferenceEquals(latest, this)) { WriteSecure(fallbackJson); return; }
+    List<string> ap; lock (Applied) ap = Applied.ToList();
+    latest.Applied = ap; latest.State = State; latest.TempOpenUntil = TempOpenUntil;
+    WriteSecure(JsonSerializer.Serialize(latest, O));
   }
   // כתיבה אטומית + הרשאות מוגבלות (SYSTEM ומנהלים בלבד). משמש את השירות
   public static void WriteSecure(string json) {

@@ -38,7 +38,7 @@ jobs:
           $st = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName | Select-Object -Last 1
           & $st.FullName sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f "$env:RUNNER_TEMP\sign.pfx" /p $env:SIGN_PFX_PASSWORD out\DeviceGuard.exe
           Remove-Item "$env:RUNNER_TEMP\sign.pfx"
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         with:
           name: DeviceGuard
           path: out/DeviceGuard.exe

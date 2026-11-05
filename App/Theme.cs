@@ -44,8 +44,10 @@ public class StaTaskScheduler : TaskScheduler, IDisposable
 
 public static class Theme
 {
-  public static readonly Brush Accent = new SolidColorBrush(Color.FromRgb(88, 128, 196));
-  public static readonly Brush SideAccent = new SolidColorBrush(Color.FromRgb(88, 128, 196));
+  // הכחול של התוכנה (כפתורים, מתגים, תפריט צד, סמלים). כחול עדין; הטקסט הלבן על הכפתורים נשאר קריא
+  public static readonly Color AccentColor = Color.FromRgb(116, 150, 206);   // #7496CE (קודם: #5880C4)
+  public static readonly Brush Accent = new SolidColorBrush(AccentColor);
+  public static readonly Brush SideAccent = new SolidColorBrush(AccentColor);
 
   static Style Make(Type t, Color bg, Color? offBg = null)
   {
@@ -258,14 +260,14 @@ public static class Theme
   }
 
   // סגנון הכפתור הראשי (כחול) – גם לחלונות שנפתחים לפני שהסגנונות הכלליים הוחלו
-  public static Style AccentButton() => Make(typeof(Button), Color.FromRgb(88, 128, 196));
+  public static Style AccentButton() => Make(typeof(Button), AccentColor);
 
   public static void Apply(Application app)
   {
     app.Resources[typeof(CheckBox)] = Switch();
     app.Resources[typeof(TextBox)] = Input(typeof(TextBox));
     app.Resources[typeof(PasswordBox)] = Input(typeof(PasswordBox));
-    app.Resources[typeof(Button)] = Make(typeof(Button), Color.FromRgb(88, 128, 196));
+    app.Resources[typeof(Button)] = Make(typeof(Button), AccentColor);
     app.Resources[typeof(ToggleButton)] = Make(typeof(ToggleButton), Color.FromRgb(22, 163, 74), Color.FromRgb(220, 38, 38));
   }
 }

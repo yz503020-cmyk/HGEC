@@ -20,7 +20,8 @@
     <!-- הפעלה מהירה יותר (חשוב לשער, שרץ בכל הפעלת תוכנה חסומה) -->
     <TieredPGO>false</TieredPGO>
     <PublishReadyToRun Condition="'$(RuntimeIdentifier)' != ''">true</PublishReadyToRun>
-    <NoWarn>$(NoWarn);CS8618;CS8600;CS8602;CS8604;CS8625;CS0649;CS0169</NoWarn>
+    <NoWarn>$(NoWarn);CS0649;CS0169</NoWarn>
+    <!-- אזהרות null פעילות (הוסרו CS8618/8600/8602/8604/8625) -->
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="System.Management" Version="10.0.0" />

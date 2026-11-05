@@ -153,6 +153,27 @@ public class DangerousPathTests
   public void UserProfileRootIsDangerous() => Assert.True(Enforcer.IsDangerous(F(Environment.SpecialFolder.UserProfile)));
 
   [Fact]
+  public void SharedSystemFoldersAreDangerous()
+  {
+    Assert.True(Enforcer.IsDangerous(Path.Combine(F(Environment.SpecialFolder.UserProfile), "AppData")));
+    Assert.True(Enforcer.IsDangerous(Path.Combine(F(Environment.SpecialFolder.UserProfile), "AppData", "Local")));
+    Assert.True(Enforcer.IsDangerous(Path.Combine(F(Environment.SpecialFolder.CommonApplicationData), "Microsoft", "Windows Defender")));
+    Assert.True(Enforcer.IsDangerous(Path.Combine(F(Environment.SpecialFolder.ProgramFiles), "Common Files")));
+    Assert.True(Enforcer.IsDangerous(Path.Combine(F(Environment.SpecialFolder.ProgramFiles), "WindowsApps")));
+    Assert.True(Enforcer.IsDangerous(Path.Combine(Sys + "\\", "Recovery")));
+  }
+
+  [Fact]
+  public void SystemProcessesAreCritical()
+  {
+    Assert.True(Enforcer.IsCritical("consent.exe"));
+    Assert.True(Enforcer.IsCritical(@"C:\ProgramData\DeviceGuard\DeviceGuardGate.exe"));
+    Assert.False(Enforcer.IsCritical("notepad.exe"));
+    Assert.True(Enforcer.IsGenericName(@"C:\x\Update.exe"));
+    Assert.False(Enforcer.IsGenericName(@"C:\x\Discord.exe"));
+  }
+
+  [Fact]
   public void OrdinaryFoldersAreNotDangerous()
   {
     Assert.False(Enforcer.IsDangerous(Path.Combine(F(Environment.SpecialFolder.UserProfile), "Pictures")));
@@ -231,12 +252,23 @@ public class SkippedPathTests : IDisposable
   }
 
   [Fact]
-  public void ProgramLikeFoldersAreSkippedWhenEnabled()
+  public void ProgramLikeFolderNamesAloneDoNotSkip()
   {
+    // תיקייה שהמשתמש יצר ונתן לה שם כזה (כאן: לא קיימת, ולכן לא בבעלות מערכת) אינה עוקפת את החסימה
     Enforcer.SkipProgramDirs = true;
-    Assert.True(Enforcer.InSkipped(Path.Combine(Sys, "Proj", "node_modules", "pkg", "a.png")));
-    Assert.True(Enforcer.InSkipped(Path.Combine(Sys, "Proj", ".git", "a.png")));
-    Assert.True(Enforcer.InSkipped(Path.Combine(Sys, "Py", "Lib", "site-packages", "a.png")));
+    Assert.False(Enforcer.InSkipped(Path.Combine(Sys, "Proj_" + Guid.NewGuid().ToString("N"), "node_modules", "pkg", "a.png")));
+    Assert.False(Enforcer.InSkipped(Path.Combine(Sys, "Proj_" + Guid.NewGuid().ToString("N"), ".git", "a.png")));
+  }
+
+  [Fact]
+  public void ArchiveTempFoldersAreNotSkipped()
+  {
+    var baseP = Path.Combine(Sys, "Users", "someone", "AppData", "Local", "Temp");
+    Assert.False(Enforcer.InSkipped(Path.Combine(baseP, "Temp1_photos.zip", "a.jpg")));
+    Assert.False(Enforcer.InSkipped(Path.Combine(baseP, "7zO1234", "a.jpg")));
+    Assert.False(Enforcer.InSkipped(Path.Combine(baseP, "Rar$EXa1.234", "a.jpg")));
+    Assert.True(Enforcer.InSkipped(Path.Combine(baseP, "SomeApp", "a.jpg")));
+    Assert.True(Enforcer.InSkipped(Path.Combine(baseP, "TempState", "a.jpg")));
   }
 
   [Fact]
@@ -250,6 +282,7 @@ public class SkippedPathTests : IDisposable
     Enforcer.SkipProgramDirs = false;
     Assert.False(Enforcer.InSkipped(Path.Combine(d, "a.jpg")));
     Enforcer.SkipProgramDirs = true;
-    Assert.True(Enforcer.InSkipped(Path.Combine(d, "a.jpg")));
+    // מדלגים רק כשה-dll הותקן על ידי המערכת/מנהל, ולא כשמשתמש רגיל שם אותו בעצמו
+    Assert.Equal(Enforcer.PrivOwned(Path.Combine(d, "x.dll")), Enforcer.InSkipped(Path.Combine(d, "a.jpg")));
   }
 }

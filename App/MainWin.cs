@@ -312,6 +312,8 @@ public partial class MainWin : Window
             ? $" (נחסמו {Enforcer.Blocked} קבצים" + (Enforcer.Failed > 0 ? $", נכשלו {Enforcer.Failed}: {Enforcer.LastErr}" : "") + ")"
             : ""
         );
+      if (Enforcer.NeedReboot)
+        Say("תוקנה הגדרה של Windows 11 שמנעה את חסימת התוכנות הניידות / ההתקנות. החסימה הזו תפעל רק אחרי הפעלה מחדש של המחשב.");
       StartScanWatch();
     }
     catch (Exception x)

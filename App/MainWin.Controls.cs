@@ -283,6 +283,27 @@ public partial class MainWin
         on.IsChecked = false;
         return;
       }
+      // תוכנות: החסימה עובדת לפי שם הקובץ בכל המחשב. שם כללי (Update.exe, setup.exe...) יחסום גם תוכנות אחרות באותו שם
+      if (
+        on.IsChecked == true
+        && (touch != null || C.Programs.Contains(r))
+        && Enforcer.IsGenericName(r.Path)
+        && !Say(
+          $"שם הקובץ של התוכנה הזו הוא \"{System.IO.Path.GetFileName(r.Path)}\" – שם כללי.\nהחסימה פועלת לפי שם הקובץ, ולכן תחסום גם כל תוכנה אחרת במחשב עם קובץ באותו שם.\n\nלחסום בכל זאת?",
+          "שים לב",
+          yesNo: true
+        )
+      )
+      {
+        on.IsChecked = false;
+        return;
+      }
+      if (on.IsChecked == true && (touch != null || C.Programs.Contains(r)) && Enforcer.IsCritical(r.Path))
+      {
+        Say("זהו רכיב מערכת של Windows, וחסימתו עלולה לפגוע בפעולת המחשב. לא ניתן לחסום אותו.");
+        on.IsChecked = false;
+        return;
+      }
       r.On = on.IsChecked == true;
       Sv();
     };
@@ -670,6 +691,18 @@ public partial class MainWin
     };
     DockPanel.SetDock(img, Dock.Left);
     d.Children.Add(img);
+    // שם הקובץ שייחסם (החסימה עובדת לפי שם הקובץ), והנתיב המלא בריחוף
+    var fn = new TextBlock
+    {
+      Text = System.IO.Path.GetFileName(e),
+      FontSize = 11,
+      Foreground = Brushes.Gray,
+      Margin = new Thickness(0, 0, 0, 2),
+      ToolTip = e,
+    };
+    DockPanel.SetDock(fn, Dock.Bottom);
+    d.Children.Add(fn);
+    d.ToolTip = e;
     d.Children.Add(
       Row(
         rule,

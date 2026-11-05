@@ -1073,15 +1073,18 @@ public static class Program
     var lastOverflow = DateTime.MinValue;
     var lastDrv = DateTime.MinValue;
     var lastWmi = DateTime.UtcNow;
+    var lastPend = DateTime.UtcNow;
     string? lastSig = null;
     bool pendingDone = false;
     Task scanTask = Task.CompletedTask;
     CancellationTokenSource? scanCts = null;
-    void StartScan(Dictionary<string, Rule> map, bool release, string? root = null)
+    // cancel = לעצור סריקה מלאה שרצה (בשינוי הגדרות). בחיבור כונן משחררים קבצים בלי לעצור את הסריקה
+    void StartScan(Dictionary<string, Rule> map, bool release, string? root = null, bool? cancel = null)
     {
-      if (release)
+      bool cn = cancel ?? release;
+      if (cn)
         scanCts?.Cancel();
-      var cts = release || scanCts == null ? (scanCts = new CancellationTokenSource()) : scanCts;
+      var cts = cn || scanCts == null ? (scanCts = new CancellationTokenSource()) : scanCts;
       var prev = scanTask;
       scanTask = Task.Run(() =>
       {
@@ -1114,14 +1117,32 @@ public static class Program
           lastDrv = DateTime.UtcNow;
           try
           {
-            foreach (var d in Drives())
+            var present = Drives().ToHashSet(StringComparer.OrdinalIgnoreCase);
+            foreach (var gone in watched.Where(w => !present.Contains(w)).ToList())
+            { // כונן שנותק: מפסיקים לעקוב, כדי שחיבור מחדש שלו יזוהה כחיבור חדש
+              watched.Remove(gone);
+              foreach (var w in fsw.Where(x => string.Equals(x.Path, gone, StringComparison.OrdinalIgnoreCase)).ToList())
+              {
+                try
+                {
+                  w.EnableRaisingEvents = false;
+                  w.Dispose();
+                }
+                catch (Exception __e)
+                {
+                  Diag.Log(__e);
+                }
+                fsw.Remove(w);
+              }
+            }
+            foreach (var d in present)
             {
               if (watched.Contains(d))
                 continue;
               Enforcer.ResetDriveCache();
               Watch1(d);
-              if (curMap.Count > 0)
-                StartScan(curMap, false, d);
+              // כונן שחובר מחדש: קודם משחררים בו קבצים שהיו צריכים להשתחרר כשהיה מנותק, ואז (אם יש חסימה) סורקים אותו
+              StartScan(curMap, true, d, false);
             }
           }
           catch (Exception __e)
@@ -1251,6 +1272,32 @@ public static class Program
         }
         else
           while (q.TryDequeue(out _)) { }
+        // פעולות שהמתינו: ביטול/החלה של הגבלות למשתמש שלא היה מחובר, והחזרה לפעולה של מתאמי רשת והתקנים שלא חזרו בביטול
+        if (
+          (now - lastPend).TotalSeconds >= 15
+          && !Enforcer.Applying()
+          && Interlocked.CompareExchange(ref applyBusy, 0, 0) == 0
+          && (now - stamp).TotalSeconds > 5
+        )
+        {
+          lastPend = now;
+          try
+          {
+            var nr = Enforcer.ProcessRegPending();
+            if (nr > 0)
+              Alerts.Log($"בוטלו {nr} הגבלות שהמתינו למשתמש שלא היה מחובר", false);
+            if (blocking && Enforcer.ApplyRegPending(c))
+            {
+              c.Save(true);
+              regs = Enforcer.RegWants(c);
+            }
+            Enforcer.ProcessDevPending(c, blocking);
+          }
+          catch (Exception __e)
+          {
+            Diag.Log(__e);
+          }
+        }
         if ((now - lastSweep).TotalSeconds >= 30)
         {
           lastSweep = now;

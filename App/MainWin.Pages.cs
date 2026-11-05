@@ -363,6 +363,12 @@ public partial class MainWin
         Diag.Log(__e);
       }
     }
+    // רשומת התקנה או קיצור שמצביעים על קובץ של Windows (msiexec, rundll32, explorer...) אינם התוכנה עצמה: חסימה שלהם הייתה חוסמת רכיב מערכת.
+    // קובצי Windows מוצגים רק מהרשימה המפורשת שלמטה
+    var win = Environment.GetFolderPath(Environment.SpecialFolder.Windows).TrimEnd('\\') + "\\";
+    foreach (var k in res.Keys.Where(x => x.StartsWith(win, StringComparison.OrdinalIgnoreCase)).ToList())
+      res.Remove(k);
+    var known = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     var sys = Environment.SystemDirectory;
     foreach (
       var (n, f) in new[]
@@ -381,7 +387,10 @@ public partial class MainWin
     {
       var p = System.IO.Path.GetFullPath(System.IO.Path.Combine(sys, f));
       if (File.Exists(p))
+      {
         res.TryAdd(p, n);
+        known.Add(p);
+      }
     }
     var pf = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
     foreach (
@@ -437,6 +446,8 @@ public partial class MainWin
     return res.Where(x =>
         !x.Key.EndsWith("DeviceGuard.exe", StringComparison.OrdinalIgnoreCase)
         && !x.Key.EndsWith("DeviceGuardWatch.exe", StringComparison.OrdinalIgnoreCase)
+        && !Enforcer.IsCritical(x.Key)
+        && (known.Contains(x.Key) || !x.Key.StartsWith(win, StringComparison.OrdinalIgnoreCase))
       )
       .Select(x => (x.Value, x.Key))
       .OrderBy(x => x.Value)

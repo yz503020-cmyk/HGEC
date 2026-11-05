@@ -70,11 +70,11 @@ public class Schedule
     try
     {
       var tz = string.IsNullOrEmpty(TzId) ? TimeZoneInfo.Local : TimeZoneInfo.FindSystemTimeZoneById(TzId);
-      return TimeZoneInfo.ConvertTime(DateTime.UtcNow, tz);
+      return TimeZoneInfo.ConvertTime(Clock.UtcNow(), tz); // בשירות: שעה אמינה (שינוי שעון המחשב לא מזיז את החלון)
     }
     catch
     {
-      return DateTime.Now;
+      return Clock.UtcNow().ToLocalTime();
     }
   }
 
@@ -328,6 +328,9 @@ public class Config
     }
     catch (UnauthorizedAccessException)
     {
+      // התיקייה נעולה (רק השירות כותב אליה) והשירות לא עונה: כתיבה בעזרת הרשאת השחזור של מנהל מורם
+      if (File.Exists(CfgPath) && Enforcer.WriteFileBackup(CfgPath, json))
+        return;
       throw new IOException("שירות ההגנה אינו פעיל, ולכן לא ניתן לשמור. המתן רגע ונסה שוב, או הפעל מחדש את המחשב");
     }
   }
@@ -351,8 +354,20 @@ public class Config
   }
 
   // כתיבה אטומית + הרשאות מוגבלות (SYSTEM ומנהלים בלבד). משמש את השירות
+  // התוכן האחרון שהשירות כתב (או טען בהפעלה). שינוי של הקובץ שלא דרך השירות (מנהל שלקח בעלות על הקובץ) מזוהה ומשוחזר
+  public static volatile string? LastWritten;
+
+  static readonly object WriteLock = new();
+
   public static void WriteSecure(string json)
   {
+    lock (WriteLock) // הכתיבה ו-LastWritten יחד: שתי כתיבות במקביל לא ייראו כ"שינוי מבחוץ"
+      WriteSecureCore(json);
+  }
+
+  static void WriteSecureCore(string json)
+  {
+    LastWritten = json;
     Directory.CreateDirectory(Dir);
     var tmp = CfgPath + ".tmp";
     File.WriteAllText(tmp, json);

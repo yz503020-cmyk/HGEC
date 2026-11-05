@@ -282,6 +282,47 @@ static class Native
     }
   }
 
+  [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+  static extern int CM_Locate_DevNodeW(out uint dev, string id, int flags);
+
+  [DllImport("cfgmgr32.dll")]
+  static extern int CM_Get_DevNode_Status(out uint status, out uint problem, uint dev, int flags);
+
+  // מצב התקן לפי מזהה המופע: -1 = לא מחובר כרגע, 1 = מושבת (CM_PROB_DISABLED), 0 = מחובר ולא מושבת. בדיקה זולה (בלי PowerShell)
+  public static int DevState(string id)
+  {
+    try
+    {
+      if (CM_Locate_DevNodeW(out var d, id, 0) != 0) // CM_LOCATE_DEVNODE_NORMAL: רק התקנים מחוברים
+        return -1;
+      if (CM_Get_DevNode_Status(out _, out var pr, d, 0) != 0)
+        return 0;
+      return pr == 22 ? 1 : 0;
+    }
+    catch
+    {
+      return 0;
+    }
+  }
+
+  // מנקה את סימון "מושבת" של התקן שאינו מחובר (CONFIGFLAG_DISABLED ברישום). כשיחובר שוב – יעבוד כרגיל. רק בשירות (SYSTEM)
+  public static bool ClearDisabledFlag(string id)
+  {
+    try
+    {
+      using var k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Enum\" + id, true);
+      if (k == null)
+        return false;
+      if (k.GetValue("ConfigFlags") is int f && (f & 1) != 0)
+        k.SetValue("ConfigFlags", f & ~1, Microsoft.Win32.RegistryValueKind.DWord);
+      return true;
+    }
+    catch
+    {
+      return false;
+    }
+  }
+
   public static bool IsSystemContext()
   {
     try

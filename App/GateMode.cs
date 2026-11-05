@@ -171,6 +171,13 @@ static class GateMode
     var orig = (mi >= 0 ? cl[(mi + marker.Length)..] : "").Trim();
     if (orig.Length == 0)
       return;
+    // Windows עצמו (SYSTEM / שירותים) – למשל שירות Windows Installer (msiexec /V) או עדכון שמריץ reagentc: עובר תמיד.
+    // משתמש רגיל לא יכול להריץ דבר בחשבונות האלה, ולכן זה לא פותח עקיפה; בלי זה עדכוני Windows נכשלו בשקט בזמן החסימה
+    if (Native.IsServiceAccount())
+    {
+      Launch(orig, null);
+      return;
+    }
     bool sys = Native.IsSystemContext();
     var info = GetInfo(id);
     if (info == null)

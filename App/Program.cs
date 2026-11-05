@@ -450,6 +450,8 @@ public static class Program
       ppid = Native.ParentOf(pid);
     if (ppid > 0 && internalPids.ContainsKey(ppid))
       return; // כלי מערכת שהאפליקציה עצמה הפעילה (PowerShell, netsh, sc ...)
+    if (Native.IsServiceSid(Native.ProcSid(pid)))
+      return; // תהליך של Windows עצמו (SYSTEM / שירות), למשל משימה מתוזמנת של המערכת שמריצה PowerShell – כמו בשער
     if (killSet.Contains(n))
     {
       if (!OwnerApplies(c, pid) || IsAuthAny(pid))
@@ -1062,6 +1064,12 @@ public static class Program
       DriveInfo.GetDrives().Where(x => Enforcer.ScanDrive(x) && x.IsReady).Select(x => x.RootDirectory.FullName);
     foreach (var d in Drives())
       Watch1(d);
+    // כוננים שכבר מחוברים בהפעלת השירות: השחרור שלהם נעשה בטעינת ההגדרות הראשונה (ReleaseStale), ולא כאן – לפני הטעינה המפה ריקה, ושחרור איתה היה פותח הכול
+    var otherSeen = DriveInfo
+      .GetDrives()
+      .Where(x => (x.DriveType == DriveType.Fixed || x.DriveType == DriveType.Removable) && x.IsReady)
+      .Select(x => x.RootDirectory.FullName)
+      .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
     var stamp = DateTime.MinValue;
     var c = new Config();
@@ -1079,12 +1087,14 @@ public static class Program
     var lastDrv = DateTime.MinValue;
     var lastWmi = DateTime.UtcNow;
     var lastPend = DateTime.UtcNow;
+    var lastLost = DateTime.UtcNow;
     string? lastSig = null;
     bool pendingDone = false;
     Task scanTask = Task.CompletedTask;
     CancellationTokenSource? scanCts = null;
     // cancel = לעצור סריקה מלאה שרצה (בשינוי הגדרות). בחיבור כונן משחררים קבצים בלי לעצור את הסריקה
-    void StartScan(Dictionary<string, Rule> map, bool release, string? root = null, bool? cancel = null)
+    // scan = false: רק שחרור (כונן שלא סורקים בו, למשל דיסק USB חיצוני שחובר מחדש וקבצים בו ננעלו בגרסה קודמת)
+    void StartScan(Dictionary<string, Rule> map, bool release, string? root = null, bool? cancel = null, bool scan = true)
     {
       bool cn = cancel ?? release;
       if (cn)
@@ -1105,7 +1115,8 @@ public static class Program
         {
           if (release)
             Enforcer.ReleaseStale(map);
-          Enforcer.ScanNew(map, cts.Token, root);
+          if (scan)
+            Enforcer.ScanNew(map, cts.Token, root);
         }
         catch (Exception __e)
         {
@@ -1117,12 +1128,31 @@ public static class Program
     {
       try
       {
-        if ((DateTime.UtcNow - lastDrv).TotalSeconds >= 5)
-        { // בדיקת כוננים חדשים כל כמה שניות (ולא כל שנייה)
+        if ((DateTime.UtcNow - lastDrv).TotalSeconds >= 5 && stamp != DateTime.MinValue)
+        { // בדיקת כוננים חדשים כל כמה שניות (ולא כל שנייה). רק אחרי שההגדרות נטענו, כדי לא לשחרר עם מפה ריקה
           lastDrv = DateTime.UtcNow;
+          var blockingNow = Blocking(c);
           try
           {
+            // כוננים שלא סורקים בהם (דיסק USB חיצוני): כשהם מתחברים משחררים בהם קבצים שננעלו בעבר, בלי לנעול חדשים
+            var ready = DriveInfo
+              .GetDrives()
+              .Where(dv => (dv.DriveType == DriveType.Fixed || dv.DriveType == DriveType.Removable) && dv.IsReady)
+              .Select(dv => dv.RootDirectory.FullName)
+              .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            otherSeen.RemoveWhere(x => !ready.Contains(x));
+            var newOther = ready.Where(r => !otherSeen.Contains(r)).ToList();
+            foreach (var r in newOther)
+              otherSeen.Add(r);
+            if (newOther.Count > 0)
+            {
+              Enforcer.ResetDriveCache();
+              if (blockingNow && c.Usb.On)
+                _ = Task.Run(() => Enforcer.UsbDiskHeal(c));
+            }
             var present = Drives().ToHashSet(StringComparer.OrdinalIgnoreCase);
+            foreach (var r in newOther.Where(nr => !present.Contains(nr)))
+              StartScan(curMap, true, r, false, false);
             foreach (var gone in watched.Where(w => !present.Contains(w)).ToList())
             { // כונן שנותק: מפסיקים לעקוב, כדי שחיבור מחדש שלו יזוהה כחיבור חדש
               watched.Remove(gone);
@@ -1302,6 +1332,29 @@ public static class Program
           {
             Diag.Log(__e);
           }
+        }
+        // קבצים שהועברו ממקומם בזמן החסימה ולא שוחררו (Enforcer.ProcessLost). רץ בתור של הסריקות, כדי לא לרוץ במקביל לסריקה מלאה
+        if ((now - lastLost).TotalSeconds >= 60 && stamp != DateTime.MinValue && scanTask.IsCompleted && !Enforcer.Applying() && Enforcer.HasLost())
+        {
+          lastLost = now;
+          var mp = curMap;
+          HashSet<string> keepAcl;
+          lock (c.Applied)
+            keepAcl = c
+              .Applied.Where(x => x.StartsWith("acl|"))
+              .Select(x => x.Split('|')[1])
+              .ToHashSet(StringComparer.OrdinalIgnoreCase);
+          scanTask = Task.Run(() =>
+          {
+            try
+            {
+              Enforcer.ProcessLost(mp, keepAcl);
+            }
+            catch (Exception __e)
+            {
+              Diag.Log(__e);
+            }
+          });
         }
         if ((now - lastSweep).TotalSeconds >= 30)
         {

@@ -142,8 +142,21 @@ public partial class MainWin
         {
           C.Master = false;
           C.TempOpenUntil = 0;
-          Enforcer.Apply(C);
+          // גם אם השמירה נכשלת (למשל השירות לא עובד), הביטול עצמו כבר בוצע – ממשיכים לנקות, ורק אחר כך מדווחים על השגיאה
+          Exception? err = null;
+          try
+          {
+            Enforcer.Apply(C);
+          }
+          catch (Exception x)
+          {
+            err = x;
+          }
           Enforcer.PurgeAll();
+          // אחרי ההסרה אין שירות שיחפש קבצים שהועברו ממקומם בזמן החסימה – משחררים אותם עכשיו
+          Enforcer.ProcessLost(new(), new(StringComparer.OrdinalIgnoreCase));
+          if (err != null)
+            throw new IOException("החסימות בוטלו, אך " + err.Message, err);
         },
         CancellationToken.None,
         TaskCreationOptions.None,

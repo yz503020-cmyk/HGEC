@@ -190,6 +190,12 @@ static unsafe class Program
       sidStr = WindowsIdentity.GetCurrent().User?.Value ?? "";
     }
     catch { }
+    // Windows עצמו (SYSTEM / LocalService / NetworkService) עובר תמיד – משתמש רגיל לא יכול להריץ תוכנה בחשבונות האלה (ראו GateMode.RunGate)
+    if (sidStr == "S-1-5-18" || sidStr == "S-1-5-19" || sidStr == "S-1-5-20")
+    {
+      Run(orig, null, true);
+      return 0;
+    }
     // נתיב השער המלא: אותה תיקייה
     var full = Path.Combine(AppContext.BaseDirectory, "DeviceGuardWatch.exe");
     int Delegate() => File.Exists(full) && Run("\"" + full + "\" --gate " + id + " " + orig, null, false) ? 0 : 1;

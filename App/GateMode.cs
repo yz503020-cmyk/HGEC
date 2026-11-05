@@ -318,27 +318,7 @@ static class GateMode
 
   static void Msg(string t)
   { // הודעה שתמיד מופיעה מעל שאר החלונות
-    var o = new Window
-    {
-      Topmost = true,
-      ShowInTaskbar = false,
-      WindowStyle = WindowStyle.None,
-      Width = 0,
-      Height = 0,
-      Opacity = 0,
-      WindowStartupLocation = WindowStartupLocation.CenterScreen,
-    };
-    o.Show();
-    MessageBox.Show(
-      o,
-      t,
-      "DeviceGuard",
-      MessageBoxButton.OK,
-      MessageBoxImage.Warning,
-      MessageBoxResult.OK,
-      MessageBoxOptions.RtlReading | MessageBoxOptions.RightAlign
-    );
-    o.Close();
+    MainWin.Say(t, "DeviceGuard", warn: true);
   }
 
   // תיקייה נפתחת ישירות ב-Explorer (כדי שלא יתפוס במקומה את הקיצור שנוצר לצידה); קובץ נפתח כרגיל

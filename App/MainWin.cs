@@ -95,7 +95,7 @@ public partial class MainWin : Window
         return;
       if (!Config.Check(k, C.DefaultCode))
       {
-        MessageBox.Show(C.DefaultCode == null ? "לא הוגדר קוד ברירת מחדל (חלון 1)" : "קוד שגוי");
+        Say(C.DefaultCode == null ? "לא הוגדר קוד ברירת מחדל (חלון 1)" : "קוד שגוי");
         return;
       }
       IsEnabled = false;
@@ -107,7 +107,7 @@ public partial class MainWin : Window
       } // השירות מחזיר את החסימות לבד כשהזמן נגמר, גם אם התוכנה נסגרה
       catch (Exception x)
       {
-        MessageBox.Show("שגיאה: " + x.Message);
+        Say("שגיאה: " + x.Message);
       }
       busy = false;
       IsEnabled = true;
@@ -277,7 +277,7 @@ public partial class MainWin : Window
   {
     if (C.Master && C.DefaultCode == null && C.All().Any(r => r.On && r.Mode == Mode.Code && r.OwnCode == null))
     {
-      MessageBox.Show("יש חסימות בקוד שאין להן קוד. הגדר קוד ברירת מחדל (חלון 1) או קוד נפרד לכל חסימה.");
+      Say("יש חסימות בקוד שאין להן קוד. הגדר קוד ברירת מחדל (חלון 1) או קוד נפרד לכל חסימה.");
       return;
     }
     C.TempOpenUntil = 0;
@@ -289,14 +289,14 @@ public partial class MainWin : Window
       }
       catch (Exception x)
       {
-        MessageBox.Show(x.Message);
+        Say(x.Message);
       }
       status.Text = "מחוץ לחלון הזמנים – החסימות יופעלו אוטומטית בתחילת החלון";
       return;
     }
     if (
       C.PreviewApply
-      && MessageBox.Show(Enforcer.Describe(C) + "\n\nלהחיל?", "סיכום החלה", MessageBoxButton.YesNo) != MessageBoxResult.Yes
+      && !Say(Enforcer.Describe(C) + "\n\nלהחיל?", "סיכום החלה", yesNo: true)
     )
       return;
     status.Text = "מחיל...";
@@ -317,7 +317,7 @@ public partial class MainWin : Window
     catch (Exception x)
     {
       status.Text = "שגיאה: " + x.Message;
-      MessageBox.Show("שגיאה בהחלת החסימות: " + x.Message);
+      Say("שגיאה בהחלת החסימות: " + x.Message);
     }
     busy = false;
     IsEnabled = true;

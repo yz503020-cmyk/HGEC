@@ -1350,14 +1350,14 @@ public static class Program
       using var single = new Mutex(true, "Global\\DeviceGuard.UI", out var created); // מופע אחד בלבד של החלון (שני חלונות היו דורסים זה את ההגדרות של זה)
       if (!created)
       {
-        MessageBox.Show("DeviceGuard כבר פתוח.");
+        MainWin.Say("DeviceGuard כבר פתוח.");
         return;
       }
       var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
       Theme.Apply(app);
       app.DispatcherUnhandledException += (s, e) =>
       {
-        MessageBox.Show(e.Exception.Message, "DeviceGuard");
+        MainWin.Say(e.Exception.Message, "DeviceGuard");
         e.Handled = true;
       };
       var c = Config.Load();
@@ -1385,12 +1385,12 @@ public static class Program
             Code = k;
             break;
           }
-          MessageBox.Show("קוד שגוי");
+          MainWin.Say("קוד שגוי");
         }
       }
       Enforcer.TryStartService(); // אם השירות מותקן אך כבוי – מפעילים אותו, אחרת אי אפשר לשמור הגדרות
       if (Code != null && Config.Up() && !Config.Auth(Code))
-        MessageBox.Show("האימות מול שירות ההגנה נכשל (ייתכן שיש נעילה זמנית אחרי ניסיונות שגויים)");
+        MainWin.Say("האימות מול שירות ההגנה נכשל (ייתכן שיש נעילה זמנית אחרי ניסיונות שגויים)");
       if (string.IsNullOrEmpty(c.OwnerSid))
       {
         c.OwnerSid = Native.InteractiveUserSid();
@@ -1427,7 +1427,7 @@ public static class Program
     }
     catch (Exception x)
     {
-      MessageBox.Show(x.ToString(), "DeviceGuard – שגיאה");
+      MainWin.Say(x.ToString(), "DeviceGuard – שגיאה");
     }
   }
 }

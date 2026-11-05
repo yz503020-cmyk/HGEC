@@ -74,7 +74,7 @@ public partial class MainWin
         {
           C.DefaultCode = Config.Hash(k);
           C.Save();
-          MessageBox.Show("הקוד נשמר");
+          Say("הקוד נשמר");
         }
       }
     );
@@ -86,14 +86,13 @@ public partial class MainWin
       () =>
       {
         if (
-          MessageBox.Show("הפעולה תשבית את כל החסימות ותסיר את שירות ההגנה. להמשיך?", "אישור", MessageBoxButton.YesNo)
-          != MessageBoxResult.Yes
+          !Say("הפעולה תשבית את כל החסימות ותסיר את שירות ההגנה. להמשיך?", "אישור", yesNo: true)
         )
           return;
         var k = Ask("קוד כניסה לתוכנה");
         if (k == null || !Config.Check(k, C.AppCode))
         {
-          MessageBox.Show("קוד שגוי");
+          Say("קוד שגוי");
           return;
         }
         _ = Uninstall();
@@ -161,18 +160,18 @@ public partial class MainWin
       {
         Config.Token = null;
         status.Text = "";
-        MessageBox.Show("השירות יוסר בעוד מספר שניות");
+        Say("השירות יוסר בעוד מספר שניות");
       }
       else
       {
         status.Text = "הסרת השירות נכשלה";
-        MessageBox.Show("החסימות בוטלו, אך הסרת שירות ההגנה נכשלה. נסה שוב, או הפעל מחדש את המחשב ונסה שוב.");
+        Say("החסימות בוטלו, אך הסרת שירות ההגנה נכשלה. נסה שוב, או הפעל מחדש את המחשב ונסה שוב.");
       }
     }
     catch (Exception x)
     {
       status.Text = "שגיאה: " + x.Message;
-      MessageBox.Show("שגיאה בהסרה: " + x.Message);
+      Say("שגיאה בהסרה: " + x.Message);
     }
     busy = false;
     IsEnabled = true;
@@ -281,7 +280,7 @@ public partial class MainWin
     }
     catch (Exception x)
     {
-      MessageBox.Show("קובץ לא תקין: " + x.Message);
+      Say("קובץ לא תקין: " + x.Message);
     }
   }
 
@@ -536,7 +535,7 @@ public partial class MainWin
           if (!C.Portable.White.Contains(f))
             C.Portable.White.Add(f);
         C.Save();
-        MessageBox.Show($"נוספו {fs.Length} פריטים");
+        Say($"נוספו {fs.Length} פריטים");
       }
     };
     var warn = new TextBlock
@@ -586,7 +585,7 @@ public partial class MainWin
           return;
         if (Config.Danger.Contains(x))
         {
-          MessageBox.Show("סיומת זו חיונית לפעולת המחשב ולא ניתן לחסום אותה");
+          Say("סיומת זו חיונית לפעולת המחשב ולא ניתן לחסום אותה");
           return;
         }
         C.Exts.Add(new Rule { Name = "חסימת ." + x, Path = x });
@@ -654,7 +653,7 @@ public partial class MainWin
     {
       if (Enforcer.IsDangerous(p))
       {
-        MessageBox.Show("זהו נתיב מערכת (או כונן / תיקיית משתמשים), וחסימתו עלולה להקריס את המחשב. בחר תיקייה או קובץ ספציפיים.");
+        Say("זהו נתיב מערכת (או כונן / תיקיית משתמשים), וחסימתו עלולה להקריס את המחשב. בחר תיקייה או קובץ ספציפיים.");
         return;
       }
       if (C.Paths.Any(x => x.Path.Equals(p, StringComparison.OrdinalIgnoreCase)))

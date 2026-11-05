@@ -21,6 +21,88 @@ public partial class MainWin
   // ---------- דיאלוגים ----------
   const int MinCode = 6; // אורך מינימלי לקוד חדש (confirm = הגדרת קוד). קודים קיימים ממשיכים לעבוד
 
+  // הודעה בעיצוב של שאר החלונות (במקום MessageBox הרגיל של Windows). yesNo: מחזיר true רק אם נלחץ "כן"
+  public static bool Say(string text, string? title = null, bool yesNo = false, bool warn = false)
+  {
+    var w = new Window
+    {
+      Title = title ?? "DeviceGuard",
+      SizeToContent = SizeToContent.WidthAndHeight,
+      WindowStartupLocation = WindowStartupLocation.CenterScreen,
+      FlowDirection = FlowDirection.RightToLeft,
+      ResizeMode = ResizeMode.NoResize,
+      Topmost = true,
+      Background = new SolidColorBrush(Color.FromRgb(248, 250, 252)),
+      FontFamily = new FontFamily("Segoe UI"),
+      FontSize = 14,
+    };
+    var owner = Application.Current?.Windows.OfType<Window>().FirstOrDefault(x => x.IsActive && x.IsVisible);
+    if (owner != null)
+      w.Owner = owner;
+    var sp = new StackPanel { Margin = new Thickness(16), MinWidth = 240, MaxWidth = 460 };
+    var msg = new TextBlock { Text = text, TextWrapping = TextWrapping.Wrap };
+    UIElement body = new ScrollViewer
+    {
+      Content = msg,
+      MaxHeight = 420,
+      VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+      HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+    };
+    if (warn)
+    {
+      var row = new DockPanel();
+      var g = Theme.Glyph("\uE7BA", 22, new SolidColorBrush(Color.FromRgb(217, 119, 6)));
+      g.Margin = new Thickness(0, 0, 10, 0);
+      g.VerticalAlignment = VerticalAlignment.Top;
+      DockPanel.SetDock(g, Dock.Left);
+      row.Children.Add(g);
+      row.Children.Add(body);
+      body = row;
+    }
+    sp.Children.Add(body);
+    bool res = false;
+    var ok = new Button
+    {
+      Content = yesNo ? "כן" : "אישור",
+      IsDefault = true,
+      Padding = new Thickness(10, 4, 10, 4),
+      Style = Theme.AccentButton(),
+    };
+    ok.Click += (s, e) =>
+    {
+      res = true;
+      w.Close();
+    };
+    if (yesNo)
+    {
+      var no = new Button
+      {
+        Content = "לא",
+        IsCancel = true,
+        Padding = new Thickness(10, 4, 10, 4),
+        Style = Theme.Soft(typeof(Button)),
+      };
+      no.Click += (s, e) => w.Close();
+      var g2 = new Grid { Margin = new Thickness(0, 12, 0, 0) };
+      g2.ColumnDefinitions.Add(new ColumnDefinition());
+      g2.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(8) });
+      g2.ColumnDefinitions.Add(new ColumnDefinition());
+      Grid.SetColumn(no, 2);
+      g2.Children.Add(ok);
+      g2.Children.Add(no);
+      sp.Children.Add(g2);
+    }
+    else
+    {
+      ok.IsCancel = true;
+      ok.Margin = new Thickness(0, 12, 0, 0);
+      sp.Children.Add(ok);
+    }
+    w.Content = sp;
+    w.ShowDialog();
+    return res;
+  }
+
   public static string? Ask(string title, bool confirm = false)
   {
     var w = new Window
@@ -58,12 +140,12 @@ public partial class MainWin
         return;
       if (confirm && a.Password.Length < MinCode)
       {
-        MessageBox.Show($"הקוד חייב להכיל לפחות {MinCode} תווים");
+        Say($"הקוד חייב להכיל לפחות {MinCode} תווים");
         return;
       }
       if (confirm && a.Password != b.Password)
       {
-        MessageBox.Show("הקודים אינם זהים");
+        Say("הקודים אינם זהים");
         return;
       }
       res = a.Password;
@@ -611,7 +693,7 @@ public partial class MainWin
     var g = System.IO.Path.Combine(Config.Dir, "DeviceGuardWatch.exe");
     if (!File.Exists(g))
     {
-      MessageBox.Show("יש ללחוץ 'החל שינויים' קודם");
+      Say("יש ללחוץ 'החל שינויים' קודם");
       return;
     }
     Process.Start(new ProcessStartInfo(g, "--open " + r.Id) { UseShellExecute = false });

@@ -257,6 +257,9 @@ public static class Theme
     return s;
   }
 
+  // סגנון הכפתור הראשי (כחול) – גם לחלונות שנפתחים לפני שהסגנונות הכלליים הוחלו
+  public static Style AccentButton() => Make(typeof(Button), Color.FromRgb(88, 128, 196));
+
   public static void Apply(Application app)
   {
     app.Resources[typeof(CheckBox)] = Switch();

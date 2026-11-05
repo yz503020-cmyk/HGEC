@@ -541,8 +541,80 @@ public static class Enforcer
     }
   }
 
+  // ---- נעילה בין החלון לשירות: רק החלה/ביטול אחד בכל רגע ----
+  // בלי זה, לחיצה על "החל" בדיוק כשחלון הזמנים מתחיל הייתה מריצה שתי החלות במקביל, וכל אחת שומרת רשימת "מה הוחל" אחרת – ודברים נשארים חסומים בלי רישום.
+  // קובץ פתוח בבלעדיות (משתחרר אוטומטית גם אם התהליך קורס). בתוך אותו תהליכון אפשר להיכנס שוב
+  static string ApplyLockFile => System.IO.Path.Combine(Config.Dir, "var", "apply.lock");
+
+  [ThreadStatic]
+  static int applyLockDepth;
+
+  sealed class ApplyLockRel : IDisposable
+  {
+    FileStream? fs;
+    bool done;
+
+    public ApplyLockRel(FileStream? fs) => this.fs = fs;
+
+    public void Dispose()
+    {
+      if (done)
+        return;
+      done = true;
+      applyLockDepth--;
+      fs?.Dispose();
+    }
+  }
+
+  public static IDisposable ApplyLock()
+  {
+    if (applyLockDepth++ > 0)
+      return new ApplyLockRel(null);
+    var until = DateTime.UtcNow.AddMinutes(10);
+    while (true)
+    {
+      try
+      {
+        Directory.CreateDirectory(System.IO.Path.GetDirectoryName(ApplyLockFile)!);
+        return new ApplyLockRel(new FileStream(ApplyLockFile, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None));
+      }
+      catch (IOException) when (DateTime.UtcNow < until)
+      {
+        Thread.Sleep(250); // החלה אחרת רצה כרגע: מחכים שתסתיים
+      }
+      catch (Exception __e)
+      {
+        Diag.Log(__e); // לא ניתן לנעול (או המתנה ארוכה מדי): ממשיכים בלי נעילה, כמו קודם
+        return new ApplyLockRel(null);
+      }
+    }
+  }
+
+  // אחרי ההמתנה לנעילה: רשימת "מה הוחל" נלקחת מהקובץ, כי ייתכן שהצד השני שינה אותה בזמן שחיכינו
+  static void RefreshRuntime(Config c)
+  {
+    try
+    {
+      var cur = Config.TryLoad();
+      if (cur == null || ReferenceEquals(cur, c) || ReferenceEquals(cur.Applied, c.Applied))
+        return;
+      lock (c.Applied)
+      {
+        c.Applied.Clear();
+        c.Applied.AddRange(cur.Applied);
+      }
+      c.State = cur.State;
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
+    }
+  }
+
   public static void Apply(Config c)
   {
+    using var lk = ApplyLock();
+    RefreshRuntime(c);
     try
     {
       Directory.CreateDirectory(System.IO.Path.GetDirectoryName(ApplyFlag)!);
@@ -571,6 +643,8 @@ public static class Enforcer
 
   public static void Release(Config c)
   {
+    using var lk = ApplyLock();
+    RefreshRuntime(c);
     Revert(c);
     c.State = 0;
     c.Save(true);
@@ -579,6 +653,8 @@ public static class Enforcer
   // פתיחה זמנית מהחלון: הדגל מסמן לשירות לא "לשחזר" חסימות בזמן הביטול. הדגל נשאר עוד רגע אחרי השמירה, כדי שהשירות יטען את ההגדרות החדשות לפני שהוא בודק שוב
   public static void TempOpen(Config c, long until)
   {
+    using var lk = ApplyLock();
+    RefreshRuntime(c);
     try
     {
       Directory.CreateDirectory(System.IO.Path.GetDirectoryName(ApplyFlag)!);
@@ -1363,6 +1439,59 @@ public static class Enforcer
   [DllImport("kernel32.dll")]
   static extern IntPtr LocalFree(IntPtr h);
 
+  [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+  static extern uint GetNamedSecurityInfoW(
+    string name,
+    int type,
+    uint info,
+    IntPtr owner,
+    IntPtr group,
+    IntPtr dacl,
+    IntPtr sacl,
+    out IntPtr sd
+  );
+
+  [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  static extern bool ConvertSecurityDescriptorToStringSecurityDescriptorW(IntPtr sd, uint rev, uint info, out IntPtr str, IntPtr len);
+
+  // תווית השלמות הנוכחית כטקסט SDDL ("" = אין תווית). null = לא ניתן לקרוא
+  static string? LabelSddl(string p)
+  {
+    const uint LABEL = 0x10;
+    try
+    {
+      if (GetNamedSecurityInfoW(p, 1, LABEL, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, out var sd) != 0)
+        return null;
+      try
+      {
+        if (!ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, 1, LABEL, out var str, IntPtr.Zero))
+          return null;
+        try
+        {
+          return Marshal.PtrToStringUni(str) ?? "";
+        }
+        finally
+        {
+          LocalFree(str);
+        }
+      }
+      finally
+      {
+        LocalFree(sd);
+      }
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
+      return null;
+    }
+  }
+
+  // התווית שלנו: No-Write-Up ברמה High (ישירה או בירושה מתיקייה חסומה). כל תווית אחרת שייכת למישהו אחר ולא נוגעים בה
+  static bool HasLabel(string sddl) => sddl.Contains("(ML;", StringComparison.OrdinalIgnoreCase);
+
+  static bool IsOurLabel(string sddl) => sddl.Contains(";NW;;;HI)", StringComparison.OrdinalIgnoreCase);
+
   static readonly byte[] EmptyAcl = MakeEmptyAcl();
 
   static byte[] MakeEmptyAcl()
@@ -1379,8 +1508,12 @@ public static class Enforcer
     const uint LABEL_SECURITY_INFORMATION = 0x10;
     try
     {
+      var cur = LabelSddl(p);
       if (on)
       {
+        // לקובץ כבר יש תווית אחרת (למשל Low של תוכנה מסוימת): לא דורסים אותה – אחרת בשחרור אי אפשר היה להחזיר אותה
+        if (cur != null && HasLabel(cur) && !IsOurLabel(cur))
+          return;
         if (
           !ConvertStringSecurityDescriptorToSecurityDescriptorW(dir ? "S:(ML;OICI;NW;;;HI)" : "S:(ML;;NW;;;HI)", 1, out var sd, IntPtr.Zero)
         )
@@ -1397,6 +1530,9 @@ public static class Enforcer
       }
       else
       {
+        // מסירים רק את התווית שלנו. (אם אי אפשר לקרוא – מסירים כמו קודם, כדי שתווית שלנו לא תשאיר את הקובץ נעול לשינויים)
+        if (cur != null && !IsOurLabel(cur))
+          return;
         var h = GCHandle.Alloc(EmptyAcl, GCHandleType.Pinned);
         try
         {

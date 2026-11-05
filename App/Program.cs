@@ -242,7 +242,8 @@ public static class Program
   // ---------- הפעלה / סגירה אוטומטית (תזמון ופתיחה זמנית) ----------
   static void Reconcile(Config c)
   {
-    if (Interlocked.CompareExchange(ref applyBusy, 0, 0) != 0 || DateTime.UtcNow < reconBackoff)
+    // החלון באמצע החלה/ביטול: לא מתחילים במקביל (ננסה שוב בסבב הבא, אחרי שההגדרות החדשות נשמרו)
+    if (Interlocked.CompareExchange(ref applyBusy, 0, 0) != 0 || DateTime.UtcNow < reconBackoff || Enforcer.Applying())
       return;
     bool need = Blocking(c),
       applied = c.State == 1 || c.Applied.Count > 0;
@@ -261,9 +262,13 @@ public static class Program
       {
         try
         {
+          // נעילה לפני טעינת ההגדרות: אם החלון באמצע החלה, מחכים לו ואז טוענים את ההגדרות שהוא שמר (ולא גרסה ישנה)
+          using var lk = Enforcer.ApplyLock();
           var cfg = Config.TryLoad();
           if (cfg == null)
             return;
+          if (apply != Blocking(cfg))
+            return; // בזמן ההמתנה המצב השתנה (למשל החלון כיבה את החסימות): אין מה לעשות
           Enforcer.SetSkip(cfg);
           if (apply)
           {

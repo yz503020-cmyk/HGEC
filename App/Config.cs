@@ -85,6 +85,7 @@ public class Config {
   public static string? Pipe(string msg, int ms = 3000) {
     try {
       using var p = new NamedPipeClientStream(".", "DeviceGuard.Unlock", PipeDirection.InOut); p.Connect(ms);
+      if (!Native.TrustedPipeServer(p.SafePipeHandle.DangerousGetHandle())) return null;   // לא שולחים קודים לשרת שאינו שירות ההגנה
       var w = new StreamWriter(p) { AutoFlush = true }; var r = new StreamReader(p); w.WriteLine(msg);
       var t = r.ReadLineAsync(); return t.Wait(Math.Max(ms, 15000)) ? t.Result : null;
     } catch { return null; }

@@ -41,11 +41,19 @@ public static class Enforcer {
       } catch { }
     }
   }
+  // זמן קצוב: כלי שנתקע (למשל PowerShell ב-Get-PnpDevice) נסגר, כדי שההחלה והתזמון האוטומטי לא ייתקעו לתמיד
+  const int ExeTimeoutMs = 180_000;
   public static (int Code, string Out) RunExe2(string exe, string args) {
     using var _ = new InternalScope();
     try {
       using var p = Process.Start(new ProcessStartInfo(exe, args) { CreateNoWindow = true, UseShellExecute = false, RedirectStandardOutput = true })!;
-      var o = p.StandardOutput.ReadToEnd(); p.WaitForExit(); return (p.ExitCode, o);
+      var ot = p.StandardOutput.ReadToEndAsync();
+      if (!p.WaitForExit(ExeTimeoutMs)) {
+        try { p.Kill(true); } catch { }
+        Alerts.Log($"פעולת מערכת נתקעה ונעצרה אחרי {ExeTimeoutMs / 1000} שניות: {System.IO.Path.GetFileName(exe)}", false);
+        return (-1, ot.Wait(2000) ? ot.Result : "");
+      }
+      p.WaitForExit(); return (p.ExitCode, ot.Wait(5000) ? ot.Result : "");
     } catch { return (-1, ""); }
   }
   public static string RunExe(string exe, string args) => RunExe2(exe, args).Out;
@@ -89,6 +97,11 @@ public static class Enforcer {
     k.SetValue(name, value, kind);
     AddA(c, $"reg|{hive}|{path}|{name}|{pk}|{pv}|{kind}|{Enc(value, kind)}");
   }
+  static bool HasValues(RegistryKey k, int depth = 0) {
+    if (k.ValueCount > 0 || depth > 16) return true;
+    foreach (var n in k.GetSubKeyNames()) { using var sk = k.OpenSubKey(n); if (sk != null && HasValues(sk, depth + 1)) return true; }
+    return false;
+  }
   static void RevertReg(string e) {
     var p = e.Split('|');
     if (p.Length < 4) return;
@@ -125,6 +138,12 @@ public static class Enforcer {
     try { ApplyInner(c); } finally { try { File.Delete(ApplyFlag); } catch { } }
   }
   public static void Release(Config c) { Revert(c); c.State = 0; c.Save(true); }
+  // פתיחה זמנית מהחלון: הדגל מסמן לשירות לא "לשחזר" חסימות בזמן הביטול. הדגל נשאר עוד רגע אחרי השמירה, כדי שהשירות יטען את ההגדרות החדשות לפני שהוא בודק שוב
+  public static void TempOpen(Config c, long until) {
+    try { Directory.CreateDirectory(System.IO.Path.GetDirectoryName(ApplyFlag)!); File.WriteAllText(ApplyFlag, "1"); } catch { }
+    try { Revert(c); c.TempOpenUntil = until; c.Save(true); Thread.Sleep(3000); }
+    finally { try { File.Delete(ApplyFlag); } catch { } }
+  }
   static void ApplyInner(Config c) {
     SetSkip(c); Revert(c, true); Blocked = 0; Failed = 0; LastErr = null;
     try {
@@ -341,6 +360,40 @@ public static class Enforcer {
   static readonly SecurityIdentifier OwnerSid = new("S-1-3-4");
   static FileSystemAccessRule OwnerRule(bool dir) => new(OwnerSid, FileSystemRights.ReadAttributes | FileSystemRights.ReadPermissions | FileSystemRights.Synchronize,
     dir ? InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit : InheritanceFlags.None, PropagationFlags.None, AccessControlType.Allow);
+  // תווית שלמות High עם No-Write-Up: תהליך לא מורם (משתמש רגיל, או מנהל בלי אישור UAC) לא יכול לשנות הרשאות/בעלות של הקובץ,
+  // גם כשיש לו "שליטה מלאה" מפורשת (כמו בכל קובץ בתיקיות המשתמש). השירות (SYSTEM) והחלון המורם (High) לא מושפעים
+  [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(string sddl, uint rev, out IntPtr sd, IntPtr size);
+  [DllImport("advapi32.dll", SetLastError = true)] static extern bool GetSecurityDescriptorSacl(IntPtr sd, out bool present, out IntPtr sacl, out bool defaulted);
+  [DllImport("advapi32.dll", CharSet = CharSet.Unicode)] static extern uint SetNamedSecurityInfoW(string name, int type, uint info, IntPtr owner, IntPtr group, IntPtr dacl, IntPtr sacl);
+  [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr h);
+  static readonly byte[] EmptyAcl = MakeEmptyAcl();
+  static byte[] MakeEmptyAcl() { var a = new RawAcl(GenericAcl.AclRevision, 0); var b = new byte[a.BinaryLength]; a.GetBinaryForm(b, 0); return b; }
+  static void Label(string p, bool dir, bool on) {
+    const int SE_FILE_OBJECT = 1; const uint LABEL_SECURITY_INFORMATION = 0x10;
+    try {
+      if (on) {
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(dir ? "S:(ML;OICI;NW;;;HI)" : "S:(ML;;NW;;;HI)", 1, out var sd, IntPtr.Zero)) return;
+        try { if (GetSecurityDescriptorSacl(sd, out var present, out var sacl, out _) && present) SetNamedSecurityInfoW(p, SE_FILE_OBJECT, LABEL_SECURITY_INFORMATION, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, sacl); }
+        finally { LocalFree(sd); }
+      } else {
+        var h = GCHandle.Alloc(EmptyAcl, GCHandleType.Pinned);
+        try { SetNamedSecurityInfoW(p, SE_FILE_OBJECT, LABEL_SECURITY_INFORMATION, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, h.AddrOfPinnedObject()); } finally { h.Free(); }
+      }
+    } catch { }
+  }
+  // נעילה/שחרור של קובץ או תיקייה: כלל הדחייה + (בחיזוק) כלל OWNER RIGHTS ותווית השלמות
+  static void AclOn(FileSystemInfo i, bool dir) {
+    var s = i is DirectoryInfo d ? (FileSystemSecurity)d.GetAccessControl() : ((FileInfo)i).GetAccessControl();
+    s.AddAccessRule(Deny(dir)); Own(s, dir);
+    if (i is DirectoryInfo d2) d2.SetAccessControl((DirectorySecurity)s); else ((FileInfo)i).SetAccessControl((FileSecurity)s);
+    if (Harden) Label(i.FullName, dir, true);
+  }
+  static void AclOff(FileSystemInfo i, bool dir) {
+    Label(i.FullName, dir, false);
+    var s = i is DirectoryInfo d ? (FileSystemSecurity)d.GetAccessControl() : ((FileInfo)i).GetAccessControl();
+    s.RemoveAccessRule(Deny(dir)); Unown(s, dir);
+    if (i is DirectoryInfo d2) d2.SetAccessControl((DirectorySecurity)s); else ((FileInfo)i).SetAccessControl((FileSecurity)s);
+  }
   static void Own(FileSystemSecurity s, bool dir) { if (Harden) s.AddAccessRule(OwnerRule(dir)); }
   static void Unown(FileSystemSecurity s, bool dir) { s.RemoveAccessRule(OwnerRule(dir)); }
   static FileSystemAccessRule Deny(bool dir) => new(new SecurityIdentifier(WellKnownSidType.WorldSid, null),
@@ -355,10 +408,10 @@ public static class Enforcer {
     try { return new DirectoryInfo(d).GetAccessControl().GetAccessRules(true, inherited, typeof(SecurityIdentifier)).Cast<FileSystemAccessRule>().Any(x => x.AccessControlType == AccessControlType.Deny && x.IdentityReference.Value == "S-1-1-0" && (x.FileSystemRights & FileSystemRights.ListDirectory) != 0); } catch { return false; }
   }
   static void DenySubs(List<string> subs) {
-    Parallel.ForEach(subs, new ParallelOptions { MaxDegreeOfParallelism = Par }, d => { try { if (HasDeny(d, true)) return; var i = new DirectoryInfo(d); var s = i.GetAccessControl(); s.AddAccessRule(Deny(true)); Own(s, true); i.SetAccessControl(s); } catch { } });
+    Parallel.ForEach(subs, new ParallelOptions { MaxDegreeOfParallelism = Par }, d => { try { if (HasDeny(d, true)) return; AclOn(new DirectoryInfo(d), true); } catch { } });
   }
   static void UnwalkDir(string d, bool root = true) {   // משחרר מלמעלה למטה: קודם התיקייה עצמה, ואז אפשר לרשום את מה שבתוכה
-    try { if (root || HasDeny(d, false)) { var i = new DirectoryInfo(d); var s = i.GetAccessControl(); s.RemoveAccessRule(Deny(true)); Unown(s, true); i.SetAccessControl(s); } } catch { }
+    try { if (root || HasDeny(d, false)) { AclOff(new DirectoryInfo(d), true); } } catch { }
     string[] subs; try { subs = Directory.GetDirectories(d); } catch { return; }
     foreach (var x in subs) { try { if ((File.GetAttributes(x) & FileAttributes.ReparsePoint) == 0) UnwalkDir(x, false); } catch { } }
   }
@@ -366,9 +419,9 @@ public static class Enforcer {
     try {
       bool dir = Directory.Exists(p); if (!dir && !File.Exists(p)) return;
       if ((r.Hidden && r.Mode == Mode.Full) || (r.Mode == Mode.Code && c.Paths.Contains(r))) Hide(c, p);
-      if (dir) { var subs = ListDirs(p); var i = new DirectoryInfo(p); var s = i.GetAccessControl(); s.AddAccessRule(Deny(true)); Own(s, true); i.SetAccessControl(s); DenySubs(subs); }
-      else if (!prevAcl.TryRemove(p, out _)) { var i = new FileInfo(p); var s = i.GetAccessControl(); s.AddAccessRule(Deny(false)); Own(s, false); i.SetAccessControl(s); }
-      AddA(c, "acl|" + p + (Harden ? "|h" : "")); Interlocked.Increment(ref Blocked);
+      if (dir) { var subs = ListDirs(p); AclOn(new DirectoryInfo(p), true); DenySubs(subs); }
+      else if (!prevAcl.TryRemove(p, out _)) AclOn(new FileInfo(p), false);
+      AddA(c, "acl|" + p + (Harden ? "|h2" : "")); Interlocked.Increment(ref Blocked);
     } catch (Exception x) { Interlocked.Increment(ref Failed); LastErr = x.Message; }
   }
 
@@ -447,6 +500,8 @@ public static class Enforcer {
     Directory.CreateDirectory(System.IO.Path.GetDirectoryName(WatchLog)!); File.AppendAllLines(WatchLog, lines);
   }
   // חוסם קובץ (נקרא משירות הרקע: קבצים חדשים וגם קבצים קיימים). מחזיר false אם צריך לנסות שוב
+  // הסריקה התקופתית בודקת מחדש כל קובץ (ולא סומכת על המטמון), כדי שחסימה שהוסרה תחזור
+  public static void ForgetKnown() { lock (LogLock) known.Clear(); }
   public static bool BlockNewFile(Rule r, string p) {
     try {
       if (known.ContainsKey(p)) return true;
@@ -456,7 +511,7 @@ public static class Enforcer {
       if (s.GetAccessRules(true, false, typeof(SecurityIdentifier)).Cast<FileSystemAccessRule>().Any(x => x.AccessControlType == AccessControlType.Deny && x.IdentityReference.Value == "S-1-1-0")) return true;
       var a = File.GetAttributes(p);
       if (r.Hidden && r.Mode == Mode.Full) File.SetAttributes(p, a | FileAttributes.Hidden | FileAttributes.System);
-      s.AddAccessRule(Deny(false)); Own(s, false); fi.SetAccessControl(s);
+      s.AddAccessRule(Deny(false)); Own(s, false); fi.SetAccessControl(s); if (Harden) Label(p, false, true);
       EnqueueLog($"{p}|{(int)a}"); known[p] = 0; return true;
     } catch { return false; }
   }
@@ -496,12 +551,12 @@ public static class Enforcer {
   }
   static void UnblockLine(string l) {
     var i = l.LastIndexOf('|'); if (i < 0) return; var p = l[..i];
-    try { var fi = new FileInfo(p); if (!fi.Exists) return; var s = fi.GetAccessControl(); s.RemoveAccessRule(Deny(false)); Unown(s, false); fi.SetAccessControl(s); File.SetAttributes(p, (FileAttributes)int.Parse(l[(i + 1)..])); } catch { }
+    try { var fi = new FileInfo(p); if (!fi.Exists) return; AclOff(fi, false); File.SetAttributes(p, (FileAttributes)int.Parse(l[(i + 1)..])); } catch { }
   }
   static string HardFlag => System.IO.Path.Combine(Config.Dir, "var", "harden.flag");
   static void SetOwner(string l, bool on) {
     var i = l.LastIndexOf('|'); if (i < 0) return; var p = l[..i];
-    try { var fi = new FileInfo(p); if (!fi.Exists) return; var s = fi.GetAccessControl(); if (on) s.AddAccessRule(OwnerRule(false)); else s.RemoveAccessRule(OwnerRule(false)); fi.SetAccessControl(s); } catch { }
+    try { var fi = new FileInfo(p); if (!fi.Exists) return; var s = fi.GetAccessControl(); if (on) s.AddAccessRule(OwnerRule(false)); else s.RemoveAccessRule(OwnerRule(false)); fi.SetAccessControl(s); Label(p, false, on); } catch { }
   }
   static string HidState => System.IO.Path.Combine(Config.Dir, "var", "hidstate.txt");
   // מסתיר או מחזיר לתצוגה קבצים שכבר חסומים, כשמתג "נסתר" של החוק שלהם השתנה
@@ -530,7 +585,7 @@ public static class Enforcer {
   public static void ReleaseStale(Dictionary<string, Rule> map) {
     lock (LogLock) {
       DrainLog(); known.Clear();
-      var want = Harden ? "1" : "0"; var have = "0";
+      var want = Harden ? "2" : "0"; var have = "0";   // "2" = חיזוק כולל תווית שלמות (קבצים שנחסמו בגרסה קודמת מקבלים אותה פעם אחת)
       try { if (File.Exists(HardFlag)) have = File.ReadAllText(HardFlag).Trim(); } catch { }
       var keep = new List<string>(); var rel = new List<string>();
       removableRoots.Clear();
@@ -631,16 +686,24 @@ public static class Enforcer {
   }
   // מתאמי רשת חדשים (מתאם USB, שיתוף אינטרנט מהטלפון) שחוברו אחרי ההחלה: נחסמים אוטומטית. הבדיקה זולה (ללא PowerShell כשאין חדש)
   static string NetHealFile => System.IO.Path.Combine(Config.Dir, "var", "netheal.txt");
+  static readonly ConcurrentDictionary<string, DateTime> adBackoff = new(StringComparer.OrdinalIgnoreCase);
   public static void NetAdapterHeal(Config c) {
     if (!c.Master || !c.Net.On || Applying()) return;
     try {
       var wl = c.Net.White.Where(w => !w.StartsWith("ssid:")).ToHashSet(StringComparer.OrdinalIgnoreCase);
+      var now = DateTime.UtcNow;
       var bad = NetworkInterface.GetAllNetworkInterfaces().Where(n => n.OperationalStatus == OperationalStatus.Up && n.NetworkInterfaceType != NetworkInterfaceType.Loopback
-        && n.NetworkInterfaceType != NetworkInterfaceType.Wireless80211 && n.NetworkInterfaceType != NetworkInterfaceType.Tunnel && !wl.Contains(n.Name)).Select(n => n.Name).ToList();
+        && n.NetworkInterfaceType != NetworkInterfaceType.Wireless80211 && n.NetworkInterfaceType != NetworkInterfaceType.Tunnel && !wl.Contains(n.Name)
+        && !(adBackoff.TryGetValue(n.Name, out var until) && now < until)).Select(n => n.Name).ToList();
       if (bad.Count == 0) return;
       PSAll(bad.Select(n => $"Disable-NetAdapter -Name '{Q(n)}' -Confirm:$false").ToList());
       Directory.CreateDirectory(System.IO.Path.GetDirectoryName(NetHealFile)!); File.AppendAllLines(NetHealFile, bad);
-      Alerts.Log("מתאם רשת חדש נחסם: " + string.Join(", ", bad));
+      // מתאם שלא הצליח להיחסם: לא מנסים (ולא מתריעים) שוב כל 15 שניות, אלא רק בעוד 10 דקות
+      var still = NetworkInterface.GetAllNetworkInterfaces().Where(n => n.OperationalStatus == OperationalStatus.Up && bad.Contains(n.Name)).Select(n => n.Name).ToList();
+      foreach (var n in still) adBackoff[n] = now.AddMinutes(10);
+      var done = bad.Except(still).ToList();
+      if (done.Count > 0) Alerts.Log("מתאם רשת חדש נחסם: " + string.Join(", ", done));
+      if (still.Count > 0) Alerts.Log("לא ניתן היה לחסום מתאם רשת (ניסיון נוסף בעוד 10 דקות): " + string.Join(", ", still));
     } catch { }
   }
   // שחזור חסימות שנמחקו מהרישום
@@ -682,9 +745,8 @@ public static class Enforcer {
   static void SetLock(string l, bool on) {
     var i = l.LastIndexOf('|'); if (i < 0) return;
     try {
-      var fi = new FileInfo(l[..i]); if (!fi.Exists) return; var s = fi.GetAccessControl();
-      if (on) { s.AddAccessRule(Deny(false)); Own(s, false); } else { s.RemoveAccessRule(Deny(false)); Unown(s, false); }
-      fi.SetAccessControl(s);
+      var fi = new FileInfo(l[..i]); if (!fi.Exists) return;
+      if (on) AclOn(fi, false); else AclOff(fi, false);
     } catch { }
   }
   static void UnlockExt(Config c, Rule r) { lock (ExtLock) { Mark(r.Id, true); Parallel.ForEach(ExtFiles(c, r), new ParallelOptions { MaxDegreeOfParallelism = Par }, l => SetLock(l, false)); } }
@@ -711,8 +773,8 @@ public static class Enforcer {
       l.Save(); AddA(c, "lnk|" + lnk);
     } catch { }
   }
-  public static void Unlock(Rule r, Config? c = null) { if (c != null && IsExt(c, r)) { UnlockExt(c, r); return; } try { if (Directory.Exists(r.Path)) UnwalkDir(r.Path); else { var i = new FileInfo(r.Path); var s = i.GetAccessControl(); s.RemoveAccessRule(Deny(false)); Unown(s, false); i.SetAccessControl(s); } } catch { } }
-  public static void Relock(Rule r, Config? c = null) { if (c != null && IsExt(c, r)) { Task.Run(() => RelockExt(c, r)); return; } try { if (Directory.Exists(r.Path)) { var subs = ListDirs(r.Path); var i = new DirectoryInfo(r.Path); var s = i.GetAccessControl(); s.AddAccessRule(Deny(true)); Own(s, true); i.SetAccessControl(s); DenySubs(subs); } else if (File.Exists(r.Path)) { var i = new FileInfo(r.Path); var s = i.GetAccessControl(); s.AddAccessRule(Deny(false)); Own(s, false); i.SetAccessControl(s); } } catch { } }
+  public static void Unlock(Rule r, Config? c = null) { if (c != null && IsExt(c, r)) { UnlockExt(c, r); return; } try { if (Directory.Exists(r.Path)) UnwalkDir(r.Path); else AclOff(new FileInfo(r.Path), false); } catch { } }
+  public static void Relock(Rule r, Config? c = null) { if (c != null && IsExt(c, r)) { Task.Run(() => RelockExt(c, r)); return; } try { if (Directory.Exists(r.Path)) { var subs = ListDirs(r.Path); AclOn(new DirectoryInfo(r.Path), true); DenySubs(subs); } else if (File.Exists(r.Path)) AclOn(new FileInfo(r.Path), false); } catch { } }
 
   // ---------- שירות ההגנה: התקנה ועדכון ----------
   static void Sc(string a) => RunExe("sc.exe", a);
@@ -804,7 +866,7 @@ public static class Enforcer {
     if (p[0] == "acl") {
       bool dir = Directory.Exists(p[1]);
       if (dir) UnwalkDir(p[1]);
-      else { var i = new FileInfo(p[1]); var s = i.GetAccessControl(); s.RemoveAccessRule(Deny(false)); Unown(s, false); i.SetAccessControl(s); }
+      else AclOff(new FileInfo(p[1]), false);
     } else File.SetAttributes(p[1], (FileAttributes)int.Parse(p[2]));
   }
   // משחרר חסימות שהיו בהחלה הקודמת ולא נדרשו מחדש
@@ -830,7 +892,7 @@ public static class Enforcer {
       foreach (var e in all) {
         var q = e.Split('|');
         if (q[0] == "usb" && q.Length > 1) prevUsb[q[1]] = 0;
-        else if (q[0] == "acl" && q.Length > 1 && ((q.Length > 2 && q[2] == "h") == Harden) && !Directory.Exists(q[1])) prevAcl[q[1]] = 0;
+        else if (q[0] == "acl" && q.Length > 1 && ((q.Length > 2 && q[2] == "h2") == Harden) && !Directory.Exists(q[1])) prevAcl[q[1]] = 0;
         else if (q[0] == "hid" && q.Length > 2 && !Directory.Exists(q[1])) prevHid[q[1]] = e;
         else rest.Add(e);
       }
@@ -873,7 +935,14 @@ public static class Enforcer {
       } catch { }
     }
     foreach (var e in Enumerable.Reverse(regs)) { try { RevertReg(e); } catch { } }   // בסדר הפוך: הערך המקורי ביותר משוחזר אחרון
-    foreach (var e in rkeys.OrderByDescending(x => x.Length)) { try { var p = e.Split('|'); Root(p[1])?.DeleteSubKeyTree(p[2], false); } catch { } }
+    // מפתח שנוצר על ידינו נמחק רק אם לא נשארו בו (או מתחתיו) ערכים – כדי לא למחוק ערכים שתוכנה/מדיניות אחרת הוסיפה בינתיים
+    foreach (var e in rkeys.OrderByDescending(x => x.Length)) {
+      try {
+        var p = e.Split('|'); var root = Root(p[1]); if (root == null) continue;
+        bool empty; using (var k = root.OpenSubKey(p[2])) { if (k == null) continue; empty = !HasValues(k); }
+        if (empty) root.DeleteSubKeyTree(p[2], false);
+      } catch { }
+    }
     if (!keepNet) { try { if (File.Exists(NetHealFile)) { foreach (var n in File.ReadAllLines(NetHealFile).Distinct()) ps.Add($"Enable-NetAdapter -Name '{Q(n)}' -Confirm:$false"); File.Delete(NetHealFile); } } catch { } }
     try { PSAll(ps); } catch { }
     try {   // שחרור קבצים ותיקיות במקביל (כל נתיב בנפרד, לפי הסדר שבו נחסם)

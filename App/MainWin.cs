@@ -23,7 +23,7 @@ public class MainWin : Window {
     un.Click += async (s, e) => {
       var k = Ask("קוד ברירת מחדל"); if (k == null) return; if (!Config.Check(k, C.DefaultCode)) { MessageBox.Show(C.DefaultCode == null ? "לא הוגדר קוד ברירת מחדל (חלון 1)" : "קוד שגוי"); return; }
       IsEnabled = false; busy = true;
-      try { await Task.Run(() => { Enforcer.Revert(C); C.TempOpenUntil = DateTime.UtcNow.AddMinutes(30).Ticks; C.Save(true); }); status.Text = "החסימות פתוחות זמנית (30 דקות)"; }   // השירות מחזיר את החסימות לבד כשהזמן נגמר, גם אם התוכנה נסגרה
+      try { await Task.Run(() => Enforcer.TempOpen(C, DateTime.UtcNow.AddMinutes(30).Ticks)); status.Text = "החסימות פתוחות זמנית (30 דקות)"; }   // השירות מחזיר את החסימות לבד כשהזמן נגמר, גם אם התוכנה נסגרה
       catch (Exception x) { MessageBox.Show("שגיאה: " + x.Message); }
       busy = false; IsEnabled = true;
     };
@@ -107,13 +107,14 @@ public class MainWin : Window {
   }
 
   // ---------- דיאלוגים ----------
+  const int MinCode = 6;   // אורך מינימלי לקוד חדש (confirm = הגדרת קוד). קודים קיימים ממשיכים לעבוד
   public static string? Ask(string title, bool confirm = false) {
     var w = new Window { Title = title, SizeToContent = SizeToContent.WidthAndHeight, WindowStartupLocation = WindowStartupLocation.CenterScreen, FlowDirection = FlowDirection.RightToLeft, ResizeMode = ResizeMode.NoResize, Topmost = true, Background = new SolidColorBrush(Color.FromRgb(248, 250, 252)), FontFamily = new FontFamily("Segoe UI"), FontSize = 14 };
     var sp = new StackPanel { Margin = new Thickness(16) }; var a = new PasswordBox { Width = 240, Margin = new Thickness(0, 4, 0, 8) }; var b = new PasswordBox { Width = 240, Margin = new Thickness(0, 4, 0, 8) };
     sp.Children.Add(new TextBlock { Text = title }); sp.Children.Add(a);
     if (confirm) { sp.Children.Add(new TextBlock { Text = "אימות הקוד" }); sp.Children.Add(b); }
     string? res = null; var ok = new Button { Content = "אישור", IsDefault = true, Padding = new Thickness(10, 4, 10, 4) };
-    ok.Click += (s, e) => { if (a.Password.Length == 0) return; if (confirm && a.Password != b.Password) { MessageBox.Show("הקודים אינם זהים"); return; } res = a.Password; w.Close(); };
+    ok.Click += (s, e) => { if (a.Password.Length == 0) return; if (confirm && a.Password.Length < MinCode) { MessageBox.Show($"הקוד חייב להכיל לפחות {MinCode} תווים"); return; } if (confirm && a.Password != b.Password) { MessageBox.Show("הקודים אינם זהים"); return; } res = a.Password; w.Close(); };
     sp.Children.Add(ok); w.Content = sp; w.ShowDialog(); return res;
   }
   public static List<string>? Pick(string title, IEnumerable<(string L, string V)> opts, IEnumerable<string> sel) {
@@ -270,7 +271,7 @@ public class MainWin : Window {
     var un2 = Btn("הסרת שירות ההגנה (בקוד כניסה)", () => {
       if (MessageBox.Show("הפעולה תשבית את כל החסימות ותסיר את שירות ההגנה. להמשיך?", "אישור", MessageBoxButton.YesNo) != MessageBoxResult.Yes) return;
       var k = Ask("קוד כניסה לתוכנה"); if (k == null || !Config.Check(k, C.AppCode)) { MessageBox.Show("קוד שגוי"); return; }
-      C.Master = false; C.TempOpenUntil = 0; Enforcer.Apply(C); Enforcer.PurgeAll(); Config.Pipe("UNINSTALL|" + Config.Token); Config.Token = null; MessageBox.Show("השירות יוסר בעוד מספר שניות");
+      _ = Uninstall();
     }, "\uE74D");
     var note = new TextBlock { Text = "הערה: רשימה לבנה של הגדרות/רשת/התקנים פועלת בחסימה גמורה.", Foreground = Brushes.Gray, Margin = new Thickness(0, 8, 0, 0), TextWrapping = TextWrapping.Wrap };
     Theme.Tipped(all, "מסומן: החסימות פועלות בכל חשבונות המשתמשים במחשב. לא מסומן: רק בחשבון המשתמש הנוכחי.");
@@ -279,6 +280,21 @@ public class MainWin : Window {
     Theme.Tipped(imp, "טוען הגדרות מקובץ שיוצא קודם. אחרי הטעינה לוחצים 'החל שינויים'.");
     Theme.Tipped(un2, "מכבה את כל החסימות ומסיר את שירות ההגנה מהמחשב, אחרי הקשת קוד הכניסה.");
     return Page("הגדרות כלליות", "\uE713", code, all, hard, SkipAppCheck(), ScanOpts(), PreviewCheck(), Row(C.Settings, () => SettingsPages, false, null, "\uE713"), Row(C.Install, null, false, null, "\uE896"), Row(C.Usb, usb, false, null, "\uE88E"), SchedulePanel(), new StackPanel { Orientation = Orientation.Horizontal, Children = { exp, imp, un2 } }, note);
+  }
+  // הסרה: ביטול החסימות רץ ברקע (החלון לא נתקע), ותוצאת ההסרה נבדקת לפני שמודיעים שהשירות יוסר
+  async Task Uninstall() {
+    IsEnabled = false; busy = true; status.Text = "מסיר...";
+    try {
+      await Task.Factory.StartNew(() => { C.Master = false; C.TempOpenUntil = 0; Enforcer.Apply(C); Enforcer.PurgeAll(); }, CancellationToken.None, TaskCreationOptions.None, Enforcer.Sta);
+      var r = await Task.Run(() => {
+        var x = Config.Token != null ? Config.Pipe("UNINSTALL|" + Config.Token, 5000) : null;
+        if (x != "OK" && Program.Code != null && Config.Auth(Program.Code)) x = Config.Pipe("UNINSTALL|" + Config.Token, 5000);   // הטוקן פג: אימות מחדש וניסיון נוסף
+        return x;
+      });
+      if (r == "OK") { Config.Token = null; status.Text = ""; MessageBox.Show("השירות יוסר בעוד מספר שניות"); }
+      else { status.Text = "הסרת השירות נכשלה"; MessageBox.Show("החסימות בוטלו, אך הסרת שירות ההגנה נכשלה. נסה שוב, או הפעל מחדש את המחשב ונסה שוב."); }
+    } catch (Exception x) { status.Text = "שגיאה: " + x.Message; MessageBox.Show("שגיאה בהסרה: " + x.Message); }
+    busy = false; IsEnabled = true;
   }
   Dictionary<string, object> Sections() => new() { ["1"] = new { C.AllUsers, C.Settings, C.Install, C.Usb }, ["2"] = C.Programs, ["3"] = C.Portable, ["4"] = new { C.Movies, C.Songs, C.Images, C.Exts }, ["5"] = C.Paths, ["6"] = new { C.Net, C.NetApps, C.NetAppsWhite }, ["7"] = new { C.Adv, C.AdvOpts, C.Sched } };
   void Export() {

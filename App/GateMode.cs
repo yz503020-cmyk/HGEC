@@ -134,13 +134,14 @@ static class GateMode {
     using var mx = new Mutex(false, "Local\\DG.OpenExt." + id); bool got = false;
     try { got = mx.WaitOne(0); if (!got) return; OpenExtCore(id); } finally { if (got) mx.ReleaseMutex(); }
   }
-  static bool AskOpen(string id, string need) {
+  // מחזיר את אסימון ה-PING של הפתיחה (null = לא נפתח)
+  static string? AskOpen(string id, string need) {
     while (true) {
-      var code = MainWin.Ask("נדרש " + need); if (code == null) return false;
+      var code = MainWin.Ask("נדרש " + need); if (code == null) return null;
       var resp = Config.Pipe("OPEN|" + id + "|" + code, 15000);
-      if (resp == "OK") return true;
+      if (resp != null && resp.StartsWith("OK|")) return resp[3..];
       Msg(Err(resp, need));
-      if (resp == null || resp == "LOCK" || resp == "ERR") return false;
+      if (resp == null || resp == "LOCK" || resp == "ERR") return null;
     }
   }
   static void OpenExtCore(string id) {
@@ -148,11 +149,11 @@ static class GateMode {
     if (info == null) { Msg(Err(null, "")); return; }
     if (!info.Exists) return;
     if (!info.Applies || info.Mode != (int)Mode.Code) { Msg("החסימה הזו אינה פעילה בקוד."); return; }
-    if (!AskOpen(id, info.HasOwn ? "הקוד הנפרד של הפריט הזה" : "קוד ברירת המחדל (שהוגדר בחלון 1)")) return;
+    var tok = AskOpen(id, info.HasOwn ? "הקוד הנפרד של הפריט הזה" : "קוד ברירת המחדל (שהוגדר בחלון 1)"); if (tok == null) return;
     var w = new Window { Title = "DeviceGuard", ResizeMode = ResizeMode.CanMinimize, SizeToContent = SizeToContent.WidthAndHeight, WindowStartupLocation = WindowStartupLocation.CenterScreen, FlowDirection = FlowDirection.RightToLeft, FontFamily = new FontFamily("Segoe UI"), Background = new SolidColorBrush(Color.FromRgb(248, 250, 252)) };
     w.Content = new TextBlock { Text = info.Name + " פתוחה כל זמן שהחלון הזה פתוח. סגור את החלון כדי לנעול שוב.", TextWrapping = TextWrapping.Wrap, Width = 300, Margin = new Thickness(20) };
     var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
-    timer.Tick += (s, e) => Config.Pipe("PING|" + id);
+    timer.Tick += (s, e) => Config.Pipe("PING|" + id + "|" + tok);
     timer.Start(); w.ShowDialog(); timer.Stop();
     Config.Pipe("RELOCK|" + id);
   }
@@ -162,11 +163,11 @@ static class GateMode {
     if (!info.Exists) return;
     if (!info.Applies) { Shell(info.Path); return; }
     Init();
-    if (!AskOpen(id, info.HasOwn ? "הקוד הנפרד של הפריט הזה" : "קוד ברירת המחדל (שהוגדר בחלון 1)")) return;
+    var tok = AskOpen(id, info.HasOwn ? "הקוד הנפרד של הפריט הזה" : "קוד ברירת המחדל (שהוגדר בחלון 1)"); if (tok == null) return;
     Shell(info.Path);
     bool dir = Directory.Exists(info.Path); var title = System.IO.Path.GetFileNameWithoutExtension(info.Path); var t0 = DateTime.UtcNow; bool seen = false; int miss = 0;
     while (true) {
-      Thread.Sleep(2000); Config.Pipe("PING|" + id);
+      Thread.Sleep(2000); Config.Pipe("PING|" + id + "|" + tok);
       bool open = dir ? FolderOpen(info.Path) : TitleOpen(title);
       if (open) { seen = true; miss = 0; } else if (seen || (DateTime.UtcNow - t0).TotalSeconds > 15) { if (++miss >= 2) break; }
     }

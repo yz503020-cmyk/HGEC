@@ -7,6 +7,17 @@ static class Native {
   [DllImport("advapi32.dll", SetLastError = true)] static extern bool OpenProcessToken(nint h, uint access, out nint tok);
   [DllImport("kernel32.dll")] static extern bool CloseHandle(nint h);
   [DllImport("kernel32.dll", SetLastError = true)] public static extern bool GetNamedPipeClientProcessId(nint pipe, out uint pid);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetNamedPipeServerSessionId(nint pipe, out uint session);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetNamedPipeServerProcessId(nint pipe, out uint pid);
+  // האם מי שעונה ב-Pipe הוא שירות ההגנה האמיתי: שירותים רצים בסשן 0 (משתמש רגיל לא יכול להריץ שם תהליך), ואם אפשר לבדוק – כ-SYSTEM.
+  // מונע ממשתמש לפתוח Pipe באותו שם כשהשירות למטה ולקבל את הקודים שמוקשים אליו
+  public static bool TrustedPipeServer(nint pipe) {
+    try {
+      if (!GetNamedPipeServerSessionId(pipe, out var ses) || ses != 0) return false;
+      if (GetNamedPipeServerProcessId(pipe, out var pid)) { var sid = ProcSid((int)pid); if (sid != null && sid != "S-1-5-18") return false; }
+      return true;
+    } catch { return false; }
+  }
   [DllImport("ntdll.dll")] static extern int NtQueryInformationProcess(nint h, int cls, ref PBI pbi, int len, out int ret);
   [StructLayout(LayoutKind.Sequential)] struct PBI { public nint Exit, Peb, Aff, Prio, Pid, Parent; }
   const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000, TOKEN_QUERY = 0x8;

@@ -17,9 +17,13 @@ static unsafe class Program {
   [DllImport("kernel32")] static extern uint GetCurrentProcessId();
   [DllImport("ntdll")] static extern int NtQueryInformationProcess(nint h, int cls, ref PBI pbi, int len, out int ret);
 
+  [DllImport("kernel32", SetLastError = true)] static extern bool GetNamedPipeServerSessionId(nint pipe, out uint session);
+  // שירות ההגנה רץ בסשן 0; Pipe בשם הזה שנפתח בסשן של משתמש אינו השירות
+  static bool Trusted(NamedPipeClientStream p) { try { return GetNamedPipeServerSessionId(p.SafePipeHandle.DangerousGetHandle(), out var s) && s == 0; } catch { return false; } }
   static string? Pipe(string msg, int ms) {
     try {
       using var p = new NamedPipeClientStream(".", "DeviceGuard.Unlock", PipeDirection.InOut); p.Connect(ms);
+      if (!Trusted(p)) return null;
       var w = new StreamWriter(p) { AutoFlush = true }; var r = new StreamReader(p); w.WriteLine(msg);
       var t = r.ReadLineAsync(); return t.Wait(Math.Max(ms, 15000)) ? t.Result : null;
     } catch { return null; }

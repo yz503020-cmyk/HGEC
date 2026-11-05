@@ -16,6 +16,8 @@ public static class Program {
   static readonly ConcurrentDictionary<string, DateTime> tokens = new(), lease = new(), ruleAuth = new();
   static readonly ConcurrentDictionary<int, (string Rule, DateTime Start)> authPid = new();   // תהליכים שאושרו בקוד (או בנו של תהליך מאושר)
   static readonly ConcurrentDictionary<int, (string Rule, DateTime Start)> promptedPid = new();
+  static readonly ConcurrentDictionary<(int Gate, string Rule), DateTime> grants = new();       // אישורים חד-פעמיים ל-AUTHPID: ניתנים רק אחרי VERIFY מוצלח או ISAUTH חיובי מאותו תהליך שער
+  static readonly ConcurrentDictionary<string, string> leaseTok = new();                       // אסימון PING -> מזהה החוק שנפתח בקוד (רק מי שפתח בקוד יכול להאריך את הפתיחה)
   static readonly ConcurrentDictionary<int, int> connCount = new();                           // חיבורים פתוחים לכל לקוח ב-Pipe (הגנה מהצפה)
   static readonly ConcurrentDictionary<int, byte> renameSeen = new();                         // תהליכים שכבר נבדקו לזיהוי עותק שהשם שלו שונה
   static readonly ConcurrentDictionary<string, string> origNames = new(StringComparer.OrdinalIgnoreCase);
@@ -47,6 +49,9 @@ public static class Program {
     }
   }
   static void Ok(string key) { lock (lk) fails.Remove(key); }
+  static void DropTokens(string rid) { foreach (var kv in leaseTok.ToArray()) if (kv.Value == rid) leaseTok.TryRemove(kv.Key, out _); }
+  // מונה ניסיונות לפי הקוד שנבדק: כל החסימות שמשתמשות בקוד ברירת המחדל חולקות מונה אחד (אחרת כל חסימה נוספת מכפילה את מספר הניחושים)
+  static string LockKey(Rule r, string sid) => r.OwnCode != null ? "r|" + r.Id + "|" + sid : "d|" + sid;
   static bool TokenOk(string t) { if (tokens.TryGetValue(t, out var d) && (DateTime.UtcNow - d).TotalHours < 8) return true; tokens.TryRemove(t, out _); return false; }
   static bool IsAuth(int pid, string rid) => authPid.TryGetValue(pid, out var a) && a.Rule == rid && Native.SameStart(pid, a.Start);
   static bool FromGate(int pid) {
@@ -125,15 +130,17 @@ public static class Program {
   }
   // עותק של תוכנה חסומה ששונה לו השם (copy notepad.exe x.exe): מזהים לפי שם הקובץ המקורי שבמשאב הגרסה, ואם אין – לפי גיבוב התוכן (רק כשהגודל זהה)
   static string? RenamedIdentity(int pid) {
+    // כל תהליך נבדק פעם אחת – אבל מסומן כ"נבדק" רק כשהבדיקה הושלמה. אם היא נכשלה (למשל התהליך רק עלה והנתיב עוד לא זמין) – ננסה שוב בסבב הבא
     try {
-      if (!renameSeen.TryAdd(pid, 0)) return null;   // כל תהליך נבדק פעם אחת
+      if (renameSeen.ContainsKey(pid)) return null;
       var path = Native.ImagePath(pid); if (path == null) return null;
       var on = OrigNameCached(path);
-      if (on != null && (killSet.Contains(on) || codeKillMap.ContainsKey(on))) return on;
-      var sm = sizeMap; if (sm.Count == 0) return null;
+      if (on != null && (killSet.Contains(on) || codeKillMap.ContainsKey(on))) { renameSeen.TryAdd(pid, 0); return on; }
+      var sm = sizeMap; if (sm.Count == 0) return null;   // הגיבובים עוד לא חושבו (או שאין) – בדיקה זולה, אפשר לחזור עליה
       long len; try { len = new FileInfo(path).Length; } catch { return null; }
-      if (!sm.TryGetValue(len, out var cands)) return null;
+      if (!sm.TryGetValue(len, out var cands)) { renameSeen.TryAdd(pid, 0); return null; }
       var h = HashOf(path); if (h == null) return null;
+      renameSeen.TryAdd(pid, 0);
       foreach (var cd in cands) if (cd.Hash == h) return cd.Name;
     } catch { }
     return null;
@@ -229,36 +236,51 @@ public static class Program {
         case "RULE": return RuleInfo(p[1], p.Length > 2 && p[2].Length > 0 ? string.Join("|", p.Skip(2)) : sid);   // בלי SID – משתמשים בזהות של הלקוח
         case "VERIFY": {
             var c = cur; var r = c.Find(p[1]); if (r == null) return "ERR";
-            var k = "r|" + p[1] + "|" + sid; if (Locked(k)) return "LOCK";   // הנעילה לפי משתמש: משתמש רגיל לא יכול לנעול את המנהל
-            if (c.CodeOk(r, string.Join("|", p.Skip(2)))) { Ok(k); return "OK"; }
+            var k = LockKey(r, sid); if (Locked(k)) return "LOCK";   // הנעילה לפי משתמש: משתמש רגיל לא יכול לנעול את המנהל
+            if (c.CodeOk(r, string.Join("|", p.Skip(2)))) { Ok(k); if (clientPid > 0) grants[(clientPid, p[1])] = DateTime.UtcNow; return "OK"; }
             Fail(k, r.Name); return "BAD";
           }
         case "OPEN": {
             var c = cur; var r = c.Find(p[1]);
             if (r == null || !r.On || !Blocking(c) || r.Mode != Mode.Code || !(c.Paths.Contains(r) || Enforcer.IsExt(c, r))) return "ERR";
-            var k = "r|" + p[1] + "|" + sid; if (Locked(k)) return "LOCK";
+            var k = LockKey(r, sid); if (Locked(k)) return "LOCK";
             if (!c.CodeOk(r, string.Join("|", p.Skip(2)))) { Fail(k, r.Name); return "BAD"; }
-            Ok(k); Enforcer.Unlock(r, c); lease[p[1]] = DateTime.UtcNow; Alerts.Log("נפתח בקוד: " + r.Name, false); return "OK";
+            Ok(k); Enforcer.Unlock(r, c); lease[p[1]] = DateTime.UtcNow; Alerts.Log("נפתח בקוד: " + r.Name, false);
+            var lt = Guid.NewGuid().ToString("N"); leaseTok[lt] = p[1]; return "OK|" + lt;
           }
         case "ISAUTH": {   // ISAUTH|ruleId|parentPid[|SYS]: האם ההפעלה הזו מאושרת בלי קוד (הורה מאושר / הפעלה פנימית של DeviceGuard / שירות מערכת אחרי אישור)
             if (p.Length < 3 || !int.TryParse(p[2], out var pp)) return "NO";
-            if (internalPids.ContainsKey(pp) || IsAuth(pp, p[1])) return "OK";
-            if (p.Length > 3 && p[3] == "SYS") { var r = cur.Find(p[1]); if (r != null && r.Mode == Mode.Code && ruleAuth.TryGetValue(p[1], out var t) && (DateTime.UtcNow - t).TotalMinutes < 15) return "OK"; }
-            return "NO";
+            if (clientPid > 0 && Native.ParentOf(clientPid) != pp) return "NO";   // ההורה שהלקוח מצהיר עליו חייב להיות ההורה האמיתי שלו
+            bool yes = internalPids.ContainsKey(pp) || IsAuth(pp, p[1]);
+            if (!yes && p.Length > 3 && p[3] == "SYS") { var r = cur.Find(p[1]); yes = r != null && r.Mode == Mode.Code && ruleAuth.TryGetValue(p[1], out var t) && (DateTime.UtcNow - t).TotalMinutes < 15; }
+            if (yes && clientPid > 0) grants[(clientPid, p[1])] = DateTime.UtcNow;
+            return yes ? "OK" : "NO";
           }
         case "INTERNAL": {
             if (!admin || p.Length < 4 || !TokenOk(p[1]) || !int.TryParse(p[2], out var ip)) return "DENY";
             InternalAdd(ip, p[3] == "1" ? 1 : -1); return "OK";
           }
-        case "AUTHPID": { if (!FromGate(clientPid) || p.Length < 3 || !int.TryParse(p[1], out var ap)) return "DENY"; RegisterAuth(ap, p[2]); return "OK"; }
+        case "AUTHPID": {
+            // השער רץ בהרשאות המשתמש ולכן לא סומכים עליו: נדרש אישור שהשירות עצמו נתן לאותו תהליך שער ולאותו חוק (חד-פעמי, עד 60 שניות),
+            // והתהליך המאושר חייב להיות בן של השער – או התהליך שעליו נשאל הקוד (PromptKill)
+            if (!FromGate(clientPid) || p.Length < 3 || !int.TryParse(p[1], out var ap)) return "DENY";
+            if (!grants.TryRemove((clientPid, p[2]), out var gt) || (DateTime.UtcNow - gt).TotalSeconds > 60) return "DENY";
+            bool child = Native.ParentOf(ap) == clientPid;
+            bool prompted = promptedPid.TryGetValue(ap, out var pr) && pr.Rule == p[2] && Native.SameStart(ap, pr.Start);
+            if (!child && !prompted) return "DENY";
+            RegisterAuth(ap, p[2]); return "OK";
+          }
         case "KILL": {
             if (!FromGate(clientPid) || p.Length < 3 || !int.TryParse(p[1], out var kp)) return "DENY";
             if (promptedPid.TryGetValue(kp, out var rr) && rr.Rule == p[2] && Native.SameStart(kp, rr.Start) && !IsAuth(kp, rr.Rule)) { KillPid(kp); Alerts.Log("תוכנה חסומה נסגרה (לא הוקש קוד)", false); }
             return "OK";
           }
-        case "PING": lease[p[1]] = DateTime.UtcNow; return "OK";
+        case "PING": {   // PING|ruleId|token
+            if (p.Length < 3 || !leaseTok.TryGetValue(p[2], out var lid) || lid != p[1] || !lease.ContainsKey(p[1])) return "DENY";
+            lease[p[1]] = DateTime.UtcNow; return "OK";
+          }
         case "RELOCK": {
-            lease.TryRemove(p[1], out _); var c = cur; var r = c.Find(p[1]);
+            lease.TryRemove(p[1], out _); DropTokens(p[1]); var c = cur; var r = c.Find(p[1]);
             if (r != null && Blocking(c) && r.On) Enforcer.Relock(r, c); return "OK";
           }
         case "SCAN": return $"{Enforcer.ScanId}|{Enforcer.ScanStartTicks}|{Enforcer.ScanDone}|{Enforcer.ScanTotal}|{(Enforcer.ScanRunning ? 1 : 0)}|{(Enforcer.ScanFinished ? 1 : 0)}|{string.Join(",", Enforcer.NoAclDrives.Keys)}";
@@ -295,12 +317,19 @@ public static class Program {
     ps.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null), PipeAccessRights.ReadWrite, AccessControlType.Allow));
     ps.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null), PipeAccessRights.FullControl, AccessControlType.Allow));
     ps.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(WellKnownSidType.NetworkSid, null), PipeAccessRights.FullControl, AccessControlType.Deny));
+    bool first = true; DateTime lastWarn = DateTime.MinValue;
     while (true) {
       NamedPipeServerStream? st = null;
       try {
-        st = NamedPipeServerStreamAcl.Create("DeviceGuard.Unlock", PipeDirection.InOut, 254, PipeTransmissionMode.Byte, PipeOptions.Asynchronous, 0, 0, ps);
+        // המופע הראשון נוצר עם FirstPipeInstance: אם מישהו אחר כבר פתח Pipe בשם הזה – היצירה נכשלת (ומתועדת) במקום לחלוק איתו את השם
+        st = NamedPipeServerStreamAcl.Create("DeviceGuard.Unlock", PipeDirection.InOut, 254, PipeTransmissionMode.Byte, PipeOptions.Asynchronous | (first ? PipeOptions.FirstPipeInstance : 0), 0, 0, ps);
+        first = false;
         st.WaitForConnection(); var s2 = st; st = null; _ = Task.Run(() => Serve(s2));
-      } catch { try { st?.Dispose(); } catch { } Thread.Sleep(500); }
+      } catch {
+        try { st?.Dispose(); } catch { }
+        if (first && (DateTime.UtcNow - lastWarn).TotalMinutes >= 10) { lastWarn = DateTime.UtcNow; Alerts.Log("תהליך אחר תפס את ערוץ התקשורת של שירות ההגנה"); }
+        Thread.Sleep(500);
+      }
     }
   }
   // קריאת שורה אחת עם הגבלת גודל: 64KB לפקודות רגילות, 12MB ל-SAVE. מונע מלקוח לנפח את זיכרון השירות
@@ -393,7 +422,7 @@ public static class Program {
           }
         }
         var blocking = Blocking(c); var now = DateTime.UtcNow;
-        foreach (var kv in lease.ToArray()) if ((now - kv.Value).TotalSeconds > 15 && lease.TryRemove(kv.Key, out _)) { var lr = c.Find(kv.Key); if (lr != null && blocking && lr.On) Enforcer.Relock(lr, c); }
+        foreach (var kv in lease.ToArray()) if ((now - kv.Value).TotalSeconds > 15 && lease.TryRemove(kv.Key, out _)) { DropTokens(kv.Key); var lr = c.Find(kv.Key); if (lr != null && blocking && lr.On) Enforcer.Relock(lr, c); }
         if ((now - lastRec).TotalSeconds >= 5) { lastRec = now; Reconcile(c); }
         if (blocking) {
           if ((now - lastPoll).TotalSeconds >= 3 && (killSet.Count > 0 || codeKillMap.Count > 0)) {   // גיבוי לאירועי ה-WMI
@@ -406,7 +435,7 @@ public static class Program {
           }
           if (scanTask.IsCompleted && curMap.Count > 0) {
             if (overflow && (now - lastOverflow).TotalMinutes >= 5) { overflow = false; lastOverflow = now; StartScan(curMap, false); lastScan = now; }
-            else if ((now - lastScan).TotalMinutes >= 60) { StartScan(curMap, false); lastScan = now; }
+            else if ((now - lastScan).TotalMinutes >= 60) { Enforcer.ForgetKnown(); StartScan(curMap, false); lastScan = now; }
           }
           bool quiet = !Enforcer.Applying() && Interlocked.CompareExchange(ref applyBusy, 0, 0) == 0 && (now - stamp).TotalSeconds > 5;
           if (quiet && (now - lastIfeo).TotalSeconds >= 5) { lastIfeo = now; var n = Enforcer.Heal(ifeo); if (n > 0) Alerts.Log($"זוהה שינוי בחסימות תוכנות ({n}) – שוחזר"); }
@@ -422,6 +451,7 @@ public static class Program {
           foreach (var k in internalPids.Keys.ToArray()) if (!Native.Alive(k)) internalPids.TryRemove(k, out _);
           foreach (var kv in tokens.ToArray()) if ((now - kv.Value).TotalHours >= 8) tokens.TryRemove(kv.Key, out _);
           foreach (var kv in ruleAuth.ToArray()) if ((now - kv.Value).TotalHours >= 1) ruleAuth.TryRemove(kv.Key, out _);
+          foreach (var kv in grants.ToArray()) if ((now - kv.Value).TotalSeconds > 60) grants.TryRemove(kv.Key, out _);
         }
       } catch { }
       Thread.Sleep(1000);

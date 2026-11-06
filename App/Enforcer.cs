@@ -66,6 +66,170 @@ public static class Enforcer
   {
     lock (c.Applied)
       c.Applied.Add(e);
+    JournalAdd(e);
+  }
+
+  // ---------- יומן החלה (נרשם לפני כל שינוי) ----------
+  // רשימת "מה הוחל" נשמרת בקובץ ההגדרות רק בסוף ההחלה. החלה שנקטעה באמצע (כיבוי המחשב בתחילת חלון הזמנים, הפסקת חשמל, תהליך שנסגר)
+  // השאירה שינויים בלי רישום – והם לא בוטלו אף פעם (ובהחלה הבאה אף נרשמו כ"ערך המקורי"). עכשיו כל רשומה נכתבת ליומן לפני הפעולה עצמה,
+  // והיומן נמחק רק אחרי שההגדרות נשמרו. יומן שנשאר = החלה שנקטעה: הרשומות שלו מצטרפות לרשימה, כך שהביטול הבא מבטל אותן.
+  // השירות: תיקייה שרק המערכת כותבת אליה (run). החלון: var – ורק החלון קורא את היומן הזה (השירות לא מקבל רשומות מקובץ שמנהלים יכולים לכתוב)
+  static string JournalPath =>
+    InService ? System.IO.Path.Combine(Config.Dir, "run", "applying.journal") : System.IO.Path.Combine(Config.Dir, "var", "applying-ui.journal");
+
+  static readonly object JLock = new();
+  static FileStream? jfs;
+  static StreamWriter? jw;
+
+  [ThreadStatic]
+  static bool savedOk; // ההחלה הנוכחית שמרה את ההגדרות (אפשר למחוק את היומן)
+
+  static void JournalBegin(Config c)
+  {
+    lock (JLock)
+    {
+      try
+      {
+        JournalClose();
+        Directory.CreateDirectory(System.IO.Path.GetDirectoryName(JournalPath)!);
+        jfs = new FileStream(JournalPath, FileMode.Create, FileAccess.Write, FileShare.Read);
+        jw = new StreamWriter(jfs, new UTF8Encoding(false));
+        // מה שכבר רשום (כולל רשומות שנמצאו ביומן קודם): אם ההחלה הזו תיקטע, גם הן לא ילכו לאיבוד
+        List<string> snap;
+        lock (c.Applied)
+          snap = c.Applied.ToList();
+        foreach (var l in snap)
+          if (l.IndexOfAny(new[] { '\r', '\n' }) < 0)
+            jw.WriteLine(l);
+        jw.Flush();
+        jfs.Flush(true);
+      }
+      catch (Exception __e)
+      {
+        Diag.Log(__e);
+        JournalClose();
+      }
+    }
+  }
+
+  static void JournalAdd(string e)
+  {
+    lock (JLock)
+    {
+      if (jw == null || e.IndexOfAny(new[] { '\r', '\n' }) >= 0)
+        return;
+      try
+      {
+        jw.WriteLine(e);
+        jw.Flush();
+        // רשומות של מדיניות/רשת/התקנים – גם לדיסק עצמו (מעטות). רשומות קבצים (אלפים) – רק למערכת ההפעלה, כדי לא להאט
+        if (!(e.StartsWith("acl|") || e.StartsWith("fid|") || e.StartsWith("hid|")))
+          jfs!.Flush(true);
+      }
+      catch (Exception __e)
+      {
+        Diag.Log(__e);
+      }
+    }
+  }
+
+  static void JournalClose()
+  {
+    try
+    {
+      jw?.Dispose();
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
+    }
+    jw = null;
+    jfs = null;
+  }
+
+  static void JournalEnd(bool delete)
+  {
+    lock (JLock)
+    {
+      JournalClose();
+      if (delete)
+        try
+        {
+          File.Delete(JournalPath);
+        }
+        catch (Exception __e)
+        {
+          Diag.Log(__e);
+        }
+    }
+  }
+
+  // רשומות מיומן של החלה שנקטעה, שלא נמצאות ברשימה: מצטרפות אליה (הביטול הבא יבטל אותן). true = נוספו רשומות
+  static bool JournalMerge(Config c)
+  {
+    try
+    {
+      if (!File.Exists(JournalPath))
+        return false;
+      var lines = File.ReadAllLines(JournalPath).Where(l => l.Length > 0 && l.Contains('|')).ToList();
+      int n = 0;
+      lock (c.Applied)
+        foreach (var l in lines)
+          if (!c.Applied.Contains(l))
+          {
+            c.Applied.Add(l);
+            n++;
+          }
+      if (n > 0)
+        Alerts.Log($"נמצאו {n} שינויים מהחלה שנקטעה באמצע – נרשמו, כדי שיבוטלו בביטול החסימה", false);
+      return n > 0;
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
+      return false;
+    }
+  }
+
+  public static bool HasJournal()
+  {
+    try
+    {
+      return File.Exists(JournalPath);
+    }
+    catch
+    {
+      return false;
+    }
+  }
+
+  // בשירות (טעינת ההגדרות הראשונה) ובחלון (בפתיחה): יומן של החלה שנקטעה מצטרף לרשימה ונשמר. true = נמצאו רשומות.
+  // מחזיר false גם כשאין יומן. היומן נמחק רק אחרי שמירה מוצלחת
+  public static bool RecoverJournal(Config c)
+  {
+    if (!HasJournal())
+      return false;
+    using var lk = ApplyLock();
+    if (!InService)
+      RefreshRuntime(c);
+    var any = JournalMerge(c);
+    try
+    {
+      if (any)
+        c.Save(true);
+      JournalEnd(true);
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e); // השמירה נכשלה: היומן נשאר, וננסה שוב בפעם הבאה
+    }
+    return any;
+  }
+
+  static void SaveRt(Config c)
+  {
+    c.Save(true);
+    savedOk = true;
   }
 
   static readonly int Par = Math.Min(16, Math.Max(4, Environment.ProcessorCount * 2));
@@ -174,7 +338,7 @@ public static class Enforcer
         if (Config.InService)
           Program.InternalAdd(Environment.ProcessId, on == 1 ? 1 : -1);
         else if (Config.Token != null)
-          Config.Pipe($"INTERNAL|{Config.Token}|{Environment.ProcessId}|{on}", 2000);
+          Config.PipeAuth(t => $"INTERNAL|{t}|{Environment.ProcessId}|{on}", 2000); // טוקן שפג – אימות מחדש (אחרת כלי מערכת חסום שהחלון מריץ היה נחסם בשקט)
       }
       catch (Exception __e)
       {
@@ -368,11 +532,12 @@ public static class Enforcer
     bool existed;
     using (var t = root.OpenSubKey(path))
       existed = t != null;
+    // הרישום לפני הפעולה (יומן ההחלה): גם אם התהליך נקטע מיד אחריה, הביטול ימצא אותה
+    if (!existed)
+      AddA(c, $"regkey|{hive}|{path}");
     using var k = root.CreateSubKey(path, true);
     if (k == null)
       return;
-    if (!existed)
-      AddA(c, $"regkey|{hive}|{path}");
     string pk = "-",
       pv = "";
     var old = k.GetValue(name, null, RegistryValueOptions.DoNotExpandEnvironmentNames);
@@ -390,8 +555,8 @@ public static class Enforcer
         pv = Enc(old, ok);
       }
     }
-    k.SetValue(name, value, kind);
     AddA(c, $"reg|{hive}|{path}|{name}|{pk}|{pv}|{kind}|{Enc(value, kind)}");
+    k.SetValue(name, value, kind);
   }
 
   static bool HasValues(RegistryKey k, int depth = 0)
@@ -886,16 +1051,24 @@ public static class Enforcer
       if (InService)
         Interlocked.Increment(ref localApplying);
       else
+      {
+        // השירות חייב לדעת שהחלון מחיל/מבטל עכשיו, אחרת הוא "משחזר" כל שינוי ברגע שהוא נעשה – וחסימות שבוטלו חוזרות בלי רישום
+        // ונשארות אחרי הפתיחה. השירות דחה את ההודעה גם אחרי אימות מחדש: לא ממשיכים. (השירות לא זמין – אין מי שישחזר; ממשיכים)
+        if (Notify(true) == "DENY")
+          throw new IOException(
+            "לא ניתן היה לתאם את הפעולה עם שירות ההגנה (האימות נדחה – ייתכן שיש נעילה זמנית אחרי ניסיונות שגויים). סגור את התוכנה, פתח אותה שוב ונסה שוב."
+          );
         current = this;
-      Touch();
-      t = new System.Threading.Timer(_ => Touch(), null, 20_000, 20_000);
+      }
+      Touch(false);
+      t = new System.Threading.Timer(_ => Touch(true), null, 20_000, 20_000);
     }
 
-    void Touch()
+    void Touch(bool notify)
     {
       if (done)
         return;
-      if (!InService)
+      if (!InService && notify)
         Notify(true);
       try
       {
@@ -908,16 +1081,17 @@ public static class Enforcer
       }
     }
 
-    static void Notify(bool on)
+    // מחזיר את תשובת השירות (null = לא זמין). טוקן שפג מחודש אוטומטית (PipeAuth)
+    static string? Notify(bool on)
     {
       try
       {
-        if (Config.Token != null)
-          Config.Pipe($"APPLYING|{Config.Token}|{(on ? 1 : 0)}", 2000);
+        return Config.PipeAuth(t => $"APPLYING|{t}|{(on ? 1 : 0)}", 2000);
       }
       catch (Exception __e)
       {
         Diag.Log(__e);
+        return null;
       }
     }
 
@@ -957,18 +1131,30 @@ public static class Enforcer
   {
     using var lk = ApplyLock();
     RefreshRuntime(c);
+    JournalMerge(c); // החלה קודמת שנקטעה: מה שהיא שינתה מבוטל עכשיו (Revert) לפני ההחלה החדשה
     using var fl = new ApplyingFlag();
-    ApplyInner(c);
+    JournalBegin(c);
+    savedOk = false;
+    try
+    {
+      ApplyInner(c);
+    }
+    finally
+    {
+      JournalEnd(savedOk); // לא נשמר – היומן נשאר, והרשומות שלו יצטרפו בפעם הבאה
+    }
   }
 
   public static void Release(Config c)
   {
     using var lk = ApplyLock();
     RefreshRuntime(c);
+    JournalMerge(c);
     using var fl = new ApplyingFlag();
     Revert(c);
     c.State = 0;
     c.Save(true);
+    JournalEnd(true);
   }
 
   // פתיחה זמנית מהחלון: הדגל מסמן לשירות לא "לשחזר" חסימות בזמן הביטול. הדגל נשאר עוד רגע אחרי השמירה, כדי שהשירות יטען את ההגדרות החדשות לפני שהוא בודק שוב
@@ -976,10 +1162,12 @@ public static class Enforcer
   {
     using var lk = ApplyLock();
     RefreshRuntime(c);
+    JournalMerge(c);
     using var fl = new ApplyingFlag();
     Revert(c);
     c.TempOpenUntil = until;
     c.Save(true);
+    JournalEnd(true);
     Thread.Sleep(3000);
   }
 
@@ -1000,13 +1188,13 @@ public static class Enforcer
         FinishRevert(c);
         SafeBootSet(false); // החסימות כבויות: השירות לא צריך לעלות ב-Safe Mode (נרשם שוב בהחלה הבאה, אם האפשרות מסומנת)
         c.State = 0;
-        c.Save(true);
+        SaveRt(c);
         return;
       }
       ApplyCore(c);
       FinishRevert(c); // משחרר רק מה שכבר לא נדרש
       c.State = 1;
-      c.Save(true);
+      SaveRt(c);
       Alerts.Log("הוחלו חסימות", false);
     }
     catch
@@ -1021,7 +1209,7 @@ public static class Enforcer
       }
       try
       {
-        c.Save(true);
+        SaveRt(c);
       }
       catch (Exception __e)
       {
@@ -1601,10 +1789,10 @@ public static class Enforcer
         var fi = new FileInfo(HostsPath);
         if (fi.Exists)
         {
+          AddA(c, "hostslock"); // לפני השינוי (יומן ההחלה)
           var sec = fi.GetAccessControl();
           sec.AddAccessRule(HostsDeny);
           fi.SetAccessControl(sec);
-          AddA(c, "hostslock");
         }
       }
       catch (Exception __e)
@@ -1637,10 +1825,17 @@ public static class Enforcer
         continue;
       }
       foreach (var sid in holders.Where(StrongTarget))
-        if (Lsa.Change(sid, r, false))
-          AddA(c, $"lsaright|{sid}|{r}");
-        else
+      {
+        // לפני ההסרה (יומן ההחלה): זכות שהוסרה בלי רישום לא הייתה חוזרת אף פעם. נכשלה – הרישום יורד (ביומן הוא נשאר, ובשחזור רק מוסיף זכות שכבר קיימת)
+        var e = $"lsaright|{sid}|{r}";
+        AddA(c, e);
+        if (!Lsa.Change(sid, r, false))
+        {
+          lock (c.Applied)
+            c.Applied.Remove(e);
           failed.Add(r + " (" + sid + ")");
+        }
+      }
     }
     // Windows סירב (למשל מדיניות קבוצתית שמנהלת את הזכויות): ההקשחה החזקה לא פעילה במלואה – מודיעים, ולא בשקט
     if (failed.Count > 0)
@@ -1782,11 +1977,7 @@ public static class Enforcer
     if (root != null && t.Length > root.TrimEnd('\\').Length)
     {
       var first = t[root.TrimEnd('\\').Length..].TrimStart('\\').Split('\\')[0];
-      if (
-        new[] { "Boot", "Recovery", "EFI", "$Recycle.Bin", "System Volume Information", "$WinREAgent", "Config.Msi" }.Any(x =>
-          x.Equals(first, StringComparison.OrdinalIgnoreCase)
-        )
-      )
+      if (RootSystemNames.Any(x => x.Equals(first, StringComparison.OrdinalIgnoreCase)))
         return true;
     }
     try
@@ -1797,13 +1988,136 @@ public static class Enforcer
           return true;
         if (Under(t, System.IO.Path.Combine(u, "AppData"))) // חסימת AppData שוברת את פרופיל המשתמש ואת כל התוכנות שלו
           return true;
+        // הרישום הפרטי של המשתמש (NTUSER.DAT והקבצים הנלווים) בשורש הפרופיל: חסימה שלו עלולה למנוע כניסה לחשבון
+        if (
+          string.Equals(System.IO.Path.GetDirectoryName(t), u, StringComparison.OrdinalIgnoreCase)
+          && System.IO.Path.GetFileName(t).StartsWith("ntuser", StringComparison.OrdinalIgnoreCase)
+        )
+          return true;
       }
     }
     catch (Exception __e)
     {
       Diag.Log(__e);
     }
+    // תיקייה/קובץ שמכילים שירות או מנהל התקן רשומים של Windows (למשל אנטי-וירוס או מנהל התקן ב-Program Files): חסימה מונעת מהם לעלות
+    if (HasServiceBinary(t))
+      return true;
     return false;
+  }
+
+  // שמות בשורש של כל כונן שחסימתם מסכנת את המחשב: תיקיות מערכת, קובצי זיכרון/שינה ואתחול, ותיקיות עדכון של Windows
+  static readonly string[] RootSystemNames =
+  {
+    "Boot",
+    "Recovery",
+    "EFI",
+    "$Recycle.Bin",
+    "System Volume Information",
+    "$WinREAgent",
+    "Config.Msi",
+    "pagefile.sys",
+    "hiberfil.sys",
+    "swapfile.sys",
+    "DumpStack.log",
+    "DumpStack.log.tmp",
+    "bootmgr",
+    "BOOTNXT",
+    "BOOTSECT.BAK",
+    "$WINDOWS.~BT",
+    "$Windows.~WS",
+    "$SysReset",
+    "$GetCurrent",
+  };
+
+  // קובצי ההפעלה של כל השירותים ומנהלי ההתקן הרשומים (מתוך הרישום, נשמר לדקה)
+  static List<string>? svcBins;
+  static DateTime svcBinsAt = DateTime.MinValue;
+  static readonly object SvcLock = new();
+
+  static bool HasServiceBinary(string t)
+  {
+    List<string> bins;
+    lock (SvcLock)
+    {
+      if (svcBins == null || (DateTime.UtcNow - svcBinsAt).TotalMinutes >= 1)
+      {
+        svcBins = ServiceBinaries();
+        svcBinsAt = DateTime.UtcNow;
+      }
+      bins = svcBins;
+    }
+    return bins.Any(b => Under(b, t));
+  }
+
+  static List<string> ServiceBinaries()
+  {
+    var res = new List<string>();
+    try
+    {
+      using var k = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services");
+      if (k == null)
+        return res;
+      foreach (var n in k.GetSubKeyNames())
+        try
+        {
+          using var sk = k.OpenSubKey(n);
+          if (sk?.GetValue("ImagePath") is string ip && ServicePath(ip) is { } f)
+            res.Add(f);
+        }
+        catch (Exception __e)
+        {
+          Diag.Log(__e);
+        }
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
+    }
+    return res;
+  }
+
+  // נתיב קובץ ההפעלה מתוך ImagePath של שירות ("C:\x\a.exe" -k ..., \SystemRoot\..., \??\C:\..., system32\drivers\...). null = לא ניתן לפענח
+  public static string? ServicePath(string ip)
+  {
+    var s = Environment.ExpandEnvironmentVariables(ip.Trim());
+    if (s.Length == 0)
+      return null;
+    string path;
+    if (s[0] == '"')
+    {
+      var e = s.IndexOf('"', 1);
+      if (e < 0)
+        return null;
+      path = s[1..e];
+    }
+    else
+    {
+      // בלי מרכאות: עד סוף ה-exe/sys הראשון (נתיבים עם רווחים בלי מרכאות קיימים)
+      var low = s.ToLowerInvariant();
+      int cut = -1;
+      foreach (var ext in new[] { ".exe", ".sys", ".dll" })
+      {
+        var i = low.IndexOf(ext, StringComparison.Ordinal);
+        if (i >= 0 && (cut < 0 || i < cut))
+          cut = i + ext.Length;
+      }
+      path = cut > 0 ? s[..cut] : s.Split(' ')[0];
+    }
+    if (path.StartsWith(@"\??\", StringComparison.Ordinal))
+      path = path[4..];
+    if (path.StartsWith(@"\SystemRoot\", StringComparison.OrdinalIgnoreCase))
+      path = WinDir + path[11..];
+    else if (!System.IO.Path.IsPathRooted(path) || path.StartsWith('\\'))
+      path = System.IO.Path.Combine(WinDir, path.TrimStart('\\')); // system32\drivers\x.sys – יחסית לתיקיית Windows
+    try
+    {
+      return System.IO.Path.GetFullPath(path);
+    }
+    catch
+    {
+      return null;
+    }
   }
 
   static IEnumerable<string> SharedSystemDirs()
@@ -1859,6 +2173,7 @@ public static class Enforcer
   {
     if (IsCritical(exe))
       return;
+    AddA(c, "ifeo|" + exe + "|" + r.Id); // לפני הכתיבה (יומן ההחלה)
     foreach (var v in Views)
     {
       using var b = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, v);
@@ -1868,7 +2183,6 @@ public static class Enforcer
         AddA(c, $"ifeoprev|{exe}|{(int)v}|{Convert.ToBase64String(Encoding.UTF8.GetBytes(old))}");
       k.SetValue("Debugger", GateCmd(r.Id));
     }
-    AddA(c, "ifeo|" + exe + "|" + r.Id);
   }
 
   // שער של DeviceGuard: קובץ כלשהו בתיקיית DeviceGuard עם --gate. כולל שערים של גרסאות ישנות (Gate.exe), כדי ששער יתום כזה
@@ -1997,9 +2311,9 @@ public static class Enforcer
         return;
       }
       var a = File.GetAttributes(p);
-      File.SetAttributes(p, a | FileAttributes.Hidden | FileAttributes.System);
       AddA(c, $"hid|{p}|{(int)a}");
       AddFid(c, p);
+      File.SetAttributes(p, a | FileAttributes.Hidden | FileAttributes.System);
     }
     catch (Exception __e)
     {
@@ -2506,6 +2820,10 @@ public static class Enforcer
       }
       if ((r.Hidden && r.Mode == Mode.Full) || (r.Mode == Mode.Code && c.Paths.Contains(r)))
         Hide(c, p);
+      // הרישום לפני הנעילה (יומן ההחלה): גם אם ההחלה נקטעת באמצע, הביטול ימצא את הפריט. נעילה שנכשלה – השחרור פשוט לא ישנה כלום
+      bool same = !dir && prevAcl.ContainsKey(p) && (!fids.TryGetValue(p, out var oid) || Native.FileId(p) == oid);
+      AddA(c, "acl|" + p + (Harden ? "|h2" : ""));
+      AddFid(c, p);
       if (dir)
       {
         var subs = ListDirs(p);
@@ -2515,14 +2833,11 @@ public static class Enforcer
       else
       {
         // כבר נעול מההחלה הקודמת – רק אם זה אותו קובץ (ולא קובץ חדש באותו שם, אחרי שהמקורי הועבר: המקורי ישוחרר ב-FinishRevert לפי המזהה)
-        bool same = prevAcl.ContainsKey(p) && (!fids.TryGetValue(p, out var oid) || Native.FileId(p) == oid);
         if (same)
           prevAcl.TryRemove(p, out _);
         else
           AclOn(new FileInfo(p), false);
       }
-      AddA(c, "acl|" + p + (Harden ? "|h2" : ""));
-      AddFid(c, p);
       Interlocked.Increment(ref Blocked);
     }
     catch (Exception x)
@@ -3085,6 +3400,15 @@ public static class Enforcer
         return true;
       }
       var a = File.GetAttributes(p);
+      // החוק פתוח עכשיו בקוד ("פתיחת תמונות (קוד)"): לא נועלים – לא קובץ חדש ולא בסריקה התקופתית. רק רושמים ביומן,
+      // כך שכשהחלון נסגר (RelockExt) גם הקובץ הזה ננעל
+      if (openIds.ContainsKey(r.Id))
+      {
+        if (!logged.ContainsKey(p))
+          EnqueueLog($"{p}|{(int)a}");
+        known[p] = 0;
+        return true;
+      }
       if (r.Hidden && r.Mode == Mode.Full)
         File.SetAttributes(p, a | FileAttributes.Hidden | FileAttributes.System);
       Mine(p);
@@ -3693,27 +4017,32 @@ public static class Enforcer
   // ---- ניקוי מטמוני צפייה (נקרא מהחלון אחרי שהסריקה הסתיימה) ----
   static DateTime lastClear = DateTime.MinValue;
 
-  static void ClearDir(string d)
+  // מוחק רק קובצי תמונה/וידאו (עותקים שמורים של מה שנחסם) בתוך תיקיית מטמון. שום קובץ אחר (מסדי נתונים, הגדרות) ושום תיקייה לא נמחקים
+  static void ClearDir(string d, HashSet<string> exts)
   {
     try
     {
-      foreach (var f in Directory.GetFiles(d))
+      if (!Directory.Exists(d))
+        return;
+      foreach (
+        var f in Directory.EnumerateFiles(
+          d,
+          "*",
+          new EnumerationOptions
+          {
+            RecurseSubdirectories = true,
+            IgnoreInaccessible = true,
+            AttributesToSkip = FileAttributes.ReparsePoint,
+          }
+        )
+      )
       {
+        if (!exts.Contains(System.IO.Path.GetExtension(f).TrimStart('.')))
+          continue;
         try
         {
           File.SetAttributes(f, FileAttributes.Normal);
           File.Delete(f);
-        }
-        catch (Exception __e)
-        {
-          Diag.Log(__e);
-        }
-      }
-      foreach (var s in Directory.GetDirectories(d))
-      {
-        try
-        {
-          Directory.Delete(s, true);
         }
         catch (Exception __e)
         {
@@ -3727,54 +4056,50 @@ public static class Enforcer
     }
   }
 
+  // אחרי שהסריקה נעלה תמונות/סרטים: עותקים שמורים שלהם במטמון של אפליקציית התמונות/הסרטים ובמטמון התמונות הממוזערות היו עדיין מוצגים.
+  // אפליקציה שפתוחה עכשיו לא נסגרת (עבודה שלא נשמרה הייתה הולכת לאיבוד) – המטמון שלה ינוקה בפעם הבאה
   public static void ClearViewerCaches(Config c)
   {
     if (!(c.Master && (c.Images.On || c.Movies.On)))
       return;
     if ((DateTime.UtcNow - lastClear).TotalMinutes < 10)
-      return; // לא סוגרים את אפליקציית התמונות שוב ושוב
+      return;
     lastClear = DateTime.UtcNow;
-    try
+    var exts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    if (c.Images.On)
+      exts.UnionWith(Config.Img);
+    if (c.Movies.On)
+      exts.UnionWith(Config.Vid);
+    bool Running(string n)
     {
-      var names = new List<string> { "Microsoft.Photos" };
-      if (c.Movies.On)
-        names.Add("Video.UI");
-      foreach (var n in names)
-      foreach (var pr in Process.GetProcessesByName(n))
+      try
       {
-        try
-        {
-          pr.Kill();
-          pr.WaitForExit(3000);
-        }
-        catch (Exception __e)
-        {
-          Diag.Log(__e);
-        }
-        finally
-        {
-          pr.Dispose();
-        }
+        var ps = Process.GetProcessesByName(n);
+        foreach (var p in ps)
+          p.Dispose();
+        return ps.Length > 0;
+      }
+      catch
+      {
+        return true;
       }
     }
-    catch (Exception __e)
-    {
-      Diag.Log(__e);
-    }
     try
     {
+      var pkgs = new List<string>();
+      if (!Running("Microsoft.Photos"))
+        pkgs.Add("Microsoft.Windows.Photos_*");
+      if (c.Movies.On && !Running("Video.UI"))
+        pkgs.Add("Microsoft.ZuneVideo_*");
       foreach (var u in Directory.GetDirectories(UsersDir))
       {
         var pk = System.IO.Path.Combine(u, @"AppData\Local\Packages");
         if (!Directory.Exists(pk))
           continue;
-        foreach (
-          var pkg in Directory
-            .GetDirectories(pk, "Microsoft.Windows.Photos_*")
-            .Concat(Directory.GetDirectories(pk, "Microsoft.ZuneVideo_*"))
-        )
+        foreach (var pat in pkgs)
+        foreach (var pkg in Directory.GetDirectories(pk, pat))
         foreach (var sub in new[] { "TempState", "LocalCache" })
-          ClearDir(System.IO.Path.Combine(pkg, sub));
+          ClearDir(System.IO.Path.Combine(pkg, sub), exts);
       }
     }
     catch (Exception __e)
@@ -4851,8 +5176,8 @@ public static class Enforcer
       l.TargetPath = GateExe;
       l.Arguments = "--openext " + r.Id;
       l.IconLocation = GateExe + ",0";
+      AddA(c, "lnk|" + lnk); // לפני היצירה (יומן ההחלה). הנתיב פנוי או של קיצור שלנו – ביטול מוחק רק אותו
       l.Save();
-      AddA(c, "lnk|" + lnk);
       AddFid(c, lnk);
     }
     catch (Exception __e)
@@ -5222,8 +5547,8 @@ public static class Enforcer
       l.TargetPath = GateExe;
       l.Arguments = "--open " + r.Id;
       l.IconLocation = Directory.Exists(path) ? Environment.SystemDirectory + @"\shell32.dll,3" : path + ",0";
+      AddA(c, "lnk|" + lnk); // לפני היצירה (יומן ההחלה)
       l.Save();
-      AddA(c, "lnk|" + lnk);
       AddFid(c, lnk);
     }
     catch (Exception __e)
@@ -5244,8 +5569,12 @@ public static class Enforcer
       return;
     var e = $"fid|{id}|{p}";
     lock (c.Applied)
-      if (!c.Applied.Contains(e))
-        c.Applied.Add(e);
+    {
+      if (c.Applied.Contains(e))
+        return;
+      c.Applied.Add(e);
+    }
+    JournalAdd(e);
   }
 
   static void LoadFids(IEnumerable<string> all)
@@ -5496,8 +5825,9 @@ public static class Enforcer
     var others = all.Where(x => !(x.StartsWith("reg|") || x.StartsWith("regkey|") || x.StartsWith("acl|") || x.StartsWith("hid|")))
       .OrderBy(x =>
         x.StartsWith("task") ? 0
+        : x.StartsWith("ifeoprev|") ? 2 // אחרי מחיקת השער: אחרת הערך המקורי לא הוחזר (השער עוד היה שם), ואז נמחק יחד איתו
         : x.StartsWith("ifeo") ? 1
-        : 2
+        : 3
       )
       .ToList();
     foreach (var e in others)

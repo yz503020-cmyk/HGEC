@@ -224,6 +224,49 @@ public class DangerousPathTests
       Assert.True(Enforcer.IsDangerous(j));
   }
 
+  // קובצי זיכרון/שינה/אתחול בשורש הכונן, והרישום הפרטי של המשתמש (NTUSER.DAT) בשורש הפרופיל
+  [Fact]
+  public void SystemFilesAreDangerous()
+  {
+    Assert.True(Enforcer.IsDangerous(Path.Combine(Sys + "\\", "pagefile.sys")));
+    Assert.True(Enforcer.IsDangerous(Path.Combine(Sys + "\\", "hiberfil.sys")));
+    Assert.True(Enforcer.IsDangerous(Path.Combine(Sys + "\\", "$WINDOWS.~BT")));
+    Assert.True(Enforcer.IsDangerous(Path.Combine(F(Environment.SpecialFolder.UserProfile), "NTUSER.DAT")));
+    Assert.True(Enforcer.IsDangerous(Path.Combine(F(Environment.SpecialFolder.UserProfile), "ntuser.dat.LOG1")));
+    Assert.False(Enforcer.IsDangerous(Path.Combine(F(Environment.SpecialFolder.UserProfile), "Desktop")));
+  }
+
+  // פענוח נתיב קובץ ההפעלה מתוך ImagePath של שירות
+  [Fact]
+  public void ServiceImagePathIsParsed()
+  {
+    var win = F(Environment.SpecialFolder.Windows);
+    Assert.Equal(@"C:\Program Files\Av\svc.exe", Enforcer.ServicePath("\"C:\\Program Files\\Av\\svc.exe\" -k run"));
+    Assert.Equal(@"C:\Program Files\Av\svc.exe", Enforcer.ServicePath(@"C:\Program Files\Av\svc.exe -k run"));
+    Assert.Equal(Path.Combine(win, @"System32\drivers\x.sys"), Enforcer.ServicePath(@"\SystemRoot\System32\drivers\x.sys"));
+    Assert.Equal(Path.Combine(win, @"system32\drivers\y.sys"), Enforcer.ServicePath(@"system32\drivers\y.sys"));
+    Assert.Equal(@"D:\Drv\z.sys", Enforcer.ServicePath(@"\??\D:\Drv\z.sys"));
+  }
+
+  // תיקייה שיש בה שירות רשום (מחוץ ל-Windows) – אסור לחסום
+  [Fact]
+  public void FolderWithServiceIsDangerous()
+  {
+    using var k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services");
+    var win = F(Environment.SpecialFolder.Windows);
+    foreach (var n in k!.GetSubKeyNames())
+    {
+      using var sk = k.OpenSubKey(n);
+      if (sk?.GetValue("ImagePath") is not string ip || Enforcer.ServicePath(ip) is not { } bin)
+        continue;
+      if (bin.StartsWith(win + "\\", StringComparison.OrdinalIgnoreCase) || !File.Exists(bin))
+        continue;
+      Assert.True(Enforcer.IsDangerous(Path.GetDirectoryName(bin)!), bin);
+      Assert.True(Enforcer.IsDangerous(bin), bin);
+      return;
+    }
+  }
+
   [Fact]
   public void OrdinaryFoldersAreNotDangerous()
   {

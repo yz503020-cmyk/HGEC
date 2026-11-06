@@ -30,6 +30,10 @@ public static class Clock
     lastJumpAlert = long.MinValue / 2;
   static int netBusy;
   static volatile bool on;
+  // הפער הידוע בין שעון המחשב לשעה האמינה (שעון המחשב פחות השעה האמינה). 0 = אין פער (או פער קטן שעוקבים אחריו).
+  // נשמר יחד עם השעה: אחרי הפעלה מחדש או יציאה משינה בלי אינטרנט, מורידים אותו משעון המחשב –
+  // כך ששעון שהוזז קדימה (או אחורה) לפני הכיבוי לא מזיז את התזמון
+  static long skew;
 
   static long TickNow => Environment.TickCount64 * TimeSpan.TicksPerMillisecond;
   static readonly long Min = TimeSpan.TicksPerMinute;
@@ -40,10 +44,16 @@ public static class Clock
   public static void StartTrusted()
   {
     // נשמר במפתח הרישום המוגן (Trust) – לא בתיקייה שמנהלים יכולים לכתוב אליה
-    long saved = Trust.ClockGet();
+    var (saved, savedSkew) = Trust.ClockGet();
     var now = DateTime.UtcNow.Ticks;
-    // אחרי הפעלה מחדש: השעה לא חוזרת אחורה מעבר למה שנשמר לפני הכיבוי (החזרת השעון אחורה בזמן שהמחשב כבוי)
-    Interlocked.Exchange(ref offset, Math.Max(now, saved) - TickNow);
+    // שעון שהוזז לפני הכיבוי: הפער הידוע מורד משעון המחשב. ואחרי הפעלה מחדש השעה לא חוזרת אחורה מעבר למה שנשמר לפני הכיבוי
+    var est = now - savedSkew;
+    Interlocked.Exchange(ref offset, Math.Max(est, saved) - TickNow);
+    skew = DateTime.UtcNow.Ticks - Trusted().Ticks;
+    if (Math.Abs(skew) <= 2 * Min)
+      skew = 0;
+    if (savedSkew != 0)
+      Alerts.Log("שעון המחשב שונה לפני ההפעלה מחדש – התזמון ממשיך לפי השעה האמינה", false);
     src = Trusted;
     on = true;
     if (saved > now + 2 * Min)
@@ -59,6 +69,7 @@ public static class Clock
       return;
     var tn = TickNow;
     var diff = DateTime.UtcNow.Ticks - (tn + Interlocked.Read(ref offset));
+    Interlocked.Exchange(ref skew, Math.Abs(diff) <= 2 * Min ? 0 : diff);
     if (Math.Abs(diff) <= 2 * Min)
     {
       // תיקונים קטנים (סנכרון השעון של Windows): עוקבים לאט – עד 2 שניות בדקה, כדי שאי אפשר יהיה "לגרור" את השעה בצעדים קטנים
@@ -89,9 +100,12 @@ public static class Clock
     if (tn - lastPersist >= Min)
     {
       lastPersist = tn;
-      Trust.ClockSet(Trusted().Ticks);
+      Trust.ClockSet(Trusted().Ticks, Interlocked.Read(ref skew));
     }
   }
+
+  // הסרת התוכנה: מפסיקים לשמור את השעה (אחרת המפתח שנמחק היה נוצר מחדש)
+  public static void Stop() => on = false;
 
   // יציאה ממצב שינה / שינה עמוקה: אם המונה לא כלל את זמן השינה – מסתנכרנים מול האינטרנט, ואם אין חיבור – מקבלים את שעון המערכת
   // (עדיף טעות לטובת השעה האמיתית מאשר תזמון שזז לצמיתות)
@@ -99,13 +113,15 @@ public static class Clock
   {
     if (!on)
       return;
+    var before = Interlocked.Read(ref skew); // הפער שהיה ידוע לפני השינה (שעון שהוזז ידנית)
     _ = Task.Run(async () =>
     {
       if (!await NetSyncCore())
       {
-        var diff = DateTime.UtcNow.Ticks - Trusted().Ticks;
-        if (diff > 2 * Min)
-          Interlocked.Add(ref offset, diff); // רק קדימה: אחרי שינה הזמן התקדם
+        // בלי אינטרנט: רק מה שמעבר לפער הידוע נחשב זמן שינה (אם המונה לא ספר אותו). שעון שהוזז לפני השינה לא מתקבל
+        var extra = DateTime.UtcNow.Ticks - Trusted().Ticks - before;
+        if (extra > 2 * Min)
+          Interlocked.Add(ref offset, extra); // רק קדימה: אחרי שינה הזמן התקדם
       }
     });
   }
@@ -118,26 +134,36 @@ public static class Clock
       return false;
     try
     {
-      foreach (var u in new[] { "https://www.google.com/", "https://www.microsoft.com/", "https://www.cloudflare.com/" })
+      // שעה מכמה אתרים, בלי מטמון (תשובה שמורה הייתה מביאה שעה ישנה). מתקבלת רק כששני אתרים מסכימים (עד 2 דקות): אתר אחד עם שעון שגוי לא מזיז את התזמון
+      var got = new List<long>(); // offset שכל אתר נותן
+      foreach (var u in new[] { "https://www.google.com/", "https://www.microsoft.com/", "https://www.cloudflare.com/", "https://www.bing.com/" })
       {
         try
         {
           using var h = new HttpClient { Timeout = TimeSpan.FromSeconds(8) };
+          var req = new HttpRequestMessage(HttpMethod.Head, u);
+          req.Headers.CacheControl = new System.Net.Http.Headers.CacheControlHeaderValue { NoCache = true, NoStore = true };
+          req.Headers.Pragma.ParseAdd("no-cache");
           var t0 = TickNow;
-          using var r = await h.SendAsync(new HttpRequestMessage(HttpMethod.Head, u));
+          using var r = await h.SendAsync(req);
           var t1 = TickNow;
-          if (r.Headers.Date is DateTimeOffset d)
-          {
-            var real = d.UtcDateTime.Ticks + (t1 - t0) / 2;
-            Interlocked.Exchange(ref offset, real - t1);
-            lastNet = t1;
-            return true;
-          }
+          if (r.Headers.Date is DateTimeOffset d && r.Headers.Age is null)
+            got.Add(d.UtcDateTime.Ticks + (t1 - t0) / 2 - t1);
         }
         catch (Exception __e)
         {
           Diag.Log(__e);
         }
+        // שני אתרים שמסכימים: משתמשים בממוצע שלהם
+        for (int i = 0; i < got.Count; i++)
+          for (int j = i + 1; j < got.Count; j++)
+            if (Math.Abs(got[i] - got[j]) <= 2 * Min)
+            {
+              Interlocked.Exchange(ref offset, got[i] / 2 + got[j] / 2);
+              lastNet = TickNow;
+              Interlocked.Exchange(ref skew, Math.Abs(DateTime.UtcNow.Ticks - Trusted().Ticks) <= 2 * Min ? 0 : DateTime.UtcNow.Ticks - Trusted().Ticks);
+              return true;
+            }
       }
       return false;
     }
@@ -655,25 +681,27 @@ static class Trust
   }
 
   // השעה האמינה האחרונה (Clock)
-  public static long ClockGet()
+  // השעה האמינה האחרונה, והפער הידוע של שעון המחשב ממנה (0 = אין)
+  public static (long Clock, long Skew) ClockGet()
   {
     try
     {
       using var k = Open(false, ClockKey);
-      return k?.GetValue("Clock") is long v ? v : 0;
+      return (k?.GetValue("Clock") is long v ? v : 0, k?.GetValue("Skew") is long s ? s : 0);
     }
     catch
     {
-      return 0;
+      return (0, 0);
     }
   }
 
-  public static void ClockSet(long ticks)
+  public static void ClockSet(long ticks, long skew)
   {
     try
     {
       using var k = Open(true, ClockKey);
       k?.SetValue("Clock", ticks, RegistryValueKind.QWord);
+      k?.SetValue("Skew", skew, RegistryValueKind.QWord);
     }
     catch (Exception __e)
     {

@@ -1391,16 +1391,35 @@ public static class Enforcer
   // גיבוי/שחזור (קריאה וכתיבה של כל קובץ, למשל robocopy /B), לקיחת בעלות, ודיבאג (סגירת השירות ממנהל המשימות).
   // נכנס לתוקף בכניסה הבאה למשתמש. כל זכות שהוסרה נרשמת (lsaright) ומוחזרת בביטול / בסוף חלון הזמנים / בהסרה.
   // חשבונות המערכת והשירותים (SYSTEM, NT SERVICE\...) לא נוגעים בהם – Windows ממשיך לעבוד כרגיל
+  public static string? StrongWarn; // החלון מציג אחרי ההחלה, אם ההקשחה החזקה לא הוחלה במלואה
+
   static readonly string[] StrongRights = { "SeBackupPrivilege", "SeRestorePrivilege", "SeTakeOwnershipPrivilege", "SeDebugPrivilege" };
 
   static bool StrongTarget(string sid) => sid == "S-1-5-32-544" || sid == "S-1-5-32-551" || sid.StartsWith("S-1-5-21-");
 
   static void StrongApply(Config c)
   {
+    var failed = new List<string>();
     foreach (var r in StrongRights)
-      foreach (var sid in (Lsa.Holders(r) ?? new()).Where(StrongTarget))
+    {
+      var holders = Lsa.Holders(r);
+      if (holders == null)
+      {
+        failed.Add(r);
+        continue;
+      }
+      foreach (var sid in holders.Where(StrongTarget))
         if (Lsa.Change(sid, r, false))
           AddA(c, $"lsaright|{sid}|{r}");
+        else
+          failed.Add(r + " (" + sid + ")");
+    }
+    // Windows סירב (למשל מדיניות קבוצתית שמנהלת את הזכויות): ההקשחה החזקה לא פעילה במלואה – מודיעים, ולא בשקט
+    if (failed.Count > 0)
+    {
+      StrongWarn = "ההקשחה החזקה לא הוחלה במלואה: Windows לא אפשר להסיר את הזכויות " + string.Join(", ", failed) + ". שאר החסימות הוחלו.";
+      Alerts.Log(StrongWarn);
+    }
   }
 
   // נקרא מהשירות: זכות שהוחזרה בזמן החסימה (למשל דרך secpol.msc) מוסרת שוב. השינוי של מנהל ייכנס לתוקף רק בכניסה הבאה – והשירות מקדים אותו.
@@ -2529,6 +2548,15 @@ public static class Enforcer
   {
     if (InService && --bgDepth == 0)
       SetThreadPriority(GetCurrentThread(), 0x00020000); // THREAD_MODE_BACKGROUND_END
+  }
+
+  // מחזיר תהליכון לעדיפות רגילה (נקרא בתחילת כל תשובה ב-Pipe). התשובה אף פעם לא רצה בתוך סריקה באותו תהליכון, ולכן בטוח לאפס
+  public static void BgReset()
+  {
+    if (!InService)
+      return;
+    bgDepth = 0;
+    SetThreadPriority(GetCurrentThread(), 0x00020000); // THREAD_MODE_BACKGROUND_END (אם לא היה במצב רקע – לא קורה כלום)
   }
 
   // כמו Parallel.ForEach, אבל כל תהליכון עובד במצב רקע (ויוצא ממנו בסוף, לפני שהוא חוזר למאגר)

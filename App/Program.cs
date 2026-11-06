@@ -676,18 +676,22 @@ public static class Program
           var inc = JsonSerializer.Deserialize<Config>(json, Config.O);
           if (inc == null)
             return "ERR";
-          if (p[0] == "SAVE")
+          var save = p[0];
+          Config.Locked(() =>
           {
-            var latest = Config.TryLoad();
-            if (latest != null)
+            if (save == "SAVE")
             {
-              inc.Applied = latest.Applied;
-              inc.State = latest.State;
-              inc.TempOpenUntil = latest.TempOpenUntil;
-              json = JsonSerializer.Serialize(inc, Config.O);
+              var latest = Config.TryLoad();
+              if (latest != null)
+              {
+                inc.Applied = latest.Applied;
+                inc.State = latest.State;
+                inc.TempOpenUntil = latest.TempOpenUntil;
+                json = JsonSerializer.Serialize(inc, Config.O);
+              }
             }
-          }
-          Config.WriteSecure(json);
+            Config.WriteSecure(json);
+          });
           return "OK";
         }
         case "RULE":
@@ -748,6 +752,21 @@ public static class Program
           if (yes && clientPid > 0)
             grants[(clientPid, p[1])] = DateTime.UtcNow;
           return yes ? "OK" : "NO";
+        }
+        case "CANCELTEMP":
+        { // CANCELTEMP|token: ביטול פתיחה זמנית בלבד (ההגדרות המהימנות + זמן פתיחה 0). מצב ההחלה לא מגיע מהחלון ולכן לא נדרס
+          if (!admin || p.Length < 2 || !TokenOk(p[1]))
+            return "DENY";
+          Config.Locked(() =>
+          {
+            var latest = Config.TryLoad();
+            if (latest != null && latest.TempOpenUntil != 0)
+            {
+              latest.TempOpenUntil = 0;
+              Config.WriteSecure(JsonSerializer.Serialize(latest, Config.O));
+            }
+          });
+          return "OK";
         }
         case "APPLYING":
         { // APPLYING|token|1/0: החלון מחיל/מבטל עכשיו (השירות לא "משחזר" באמצע). מאומת בקוד הכניסה – אי אפשר לזייף מבחוץ
@@ -856,6 +875,7 @@ public static class Program
     Thread.Sleep(1000);
     if (full)
     {
+      Clock.Stop();
       Trust.Remove();
       try
       {
@@ -1025,7 +1045,11 @@ public static class Program
         {
           Diag.Log(__e);
         }
-        var resp = await Task.Run(() => Handle(l, cpid, admin, sid));
+        var resp = await Task.Run(() =>
+        {
+          Enforcer.BgReset(); // תהליכון שנשאר בטעות בעדיפות נמוכה (סריקה שנעצרה באמצע) – התשובה לשער לא תתעכב
+          return Handle(l, cpid, admin, sid);
+        });
         var wr = new StreamWriter(st, new UTF8Encoding(false)) { AutoFlush = true };
         await wr.WriteLineAsync(resp);
       }

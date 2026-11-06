@@ -267,6 +267,20 @@ public class Config
 
   public static bool Up(int ms = 1500) => Pipe("HELLO", ms) == "OK";
 
+  // ביטול פתיחה זמנית ("החל שינויים" מחוץ לחלון הזמנים): השירות מאפס רק את זמן הפתיחה, בלי לגעת ברשימת "מה הוחל"
+  public static void CancelTemp()
+  {
+    for (int i = 0; i < 2; i++)
+    {
+      if (Token == null && !(Program.Code != null && Auth(Program.Code)))
+        return;
+      var r = Pipe("CANCELTEMP|" + Token, 5000);
+      if (r != "DENY")
+        return;
+      Token = null; // הטוקן פג: אימות מחדש
+    }
+  }
+
   public static bool Auth(string code)
   {
     var t = Pipe("AUTH|" + code);
@@ -344,6 +358,19 @@ public class Config
 
   // שמירה מתוך השירות: משנה רק את מצב ההחלה בקובץ העדכני, ולא דורסת הגדרות שהמשתמש שמר בינתיים
   void SaveRuntimeMerged(string fallbackJson)
+  {
+    lock (WriteLock) // קריאה-שינוי-כתיבה אטומיים מול שמירות אחרות בשירות (Pipe, ביטול פתיחה זמנית)
+      SaveRuntimeMergedCore(fallbackJson);
+  }
+
+  // קריאת הקובץ העדכני, שינוי וכתיבה – בלי ששמירה אחרת בשירות תיכנס באמצע (אחרת אחת מהן הייתה דורסת את רשימת "מה הוחל" של השנייה)
+  public static void Locked(Action a)
+  {
+    lock (WriteLock)
+      a();
+  }
+
+  void SaveRuntimeMergedCore(string fallbackJson)
   {
     var latest = TryLoad();
     if (latest == null || ReferenceEquals(latest, this))

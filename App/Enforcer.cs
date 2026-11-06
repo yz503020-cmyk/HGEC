@@ -3948,7 +3948,7 @@ public static class Enforcer
         applied = c.Applied.Any(x => x == "acl|" + p || x.StartsWith("acl|" + p + "|", StringComparison.Ordinal) || x == "acl|" + r.Path || x.StartsWith("acl|" + r.Path + "|", StringComparison.Ordinal));
       if (!applied)
         return false; // לא נחסם בהחלה (למשל לא היה קיים) – לא נועלים בלי רישום, אחרת לא היה משתחרר בביטול
-      var cur = CurPath(c, r.Path);
+      var cur = CurPath(c, p);
       if (Directory.Exists(cur))
         return !HasDeny(cur, false);
       if (File.Exists(cur))

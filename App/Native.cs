@@ -352,11 +352,11 @@ static class Native
         return (null, true);
       var serial = Convert.ToUInt32(q[0], 16);
       var idx = Convert.ToInt64(q[1], 16);
-      foreach (var d in DriveInfo.GetDrives())
+      foreach (var d in System.IO.DriveInfo.GetDrives())
       {
         try
         {
-          if (!d.IsReady || (d.DriveType != DriveType.Fixed && d.DriveType != DriveType.Removable))
+          if (!d.IsReady || (d.DriveType != System.IO.DriveType.Fixed && d.DriveType != System.IO.DriveType.Removable))
             continue;
           var root = CreateFileW(d.RootDirectory.FullName, ReadAttr, 7, 0, 3, IdFlags, 0);
           if (root == 0 || root == -1)

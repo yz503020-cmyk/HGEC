@@ -247,6 +247,7 @@ public static class Program
       );
       Config.SecureFile(Config.CfgPath);
       Config.SecureFile(Config.BakPath);
+      Enforcer.CleanOldExes();
     }
     catch (Exception __e)
     {
@@ -881,7 +882,7 @@ public static class Program
       {
         InternalAdd(Environment.ProcessId, 1);
         Process.Start(
-          new ProcessStartInfo("cmd.exe", $"/c ping -n 4 127.0.0.1 >nul & del /f /q \"{Enforcer.GateExe}\" \"{Enforcer.LightGateExe}\"")
+          new ProcessStartInfo("cmd.exe", $"/c ping -n 4 127.0.0.1 >nul & del /f /q \"{Enforcer.GateExe}\" \"{Enforcer.LightGateExe}\" \"{System.IO.Path.Combine(Config.Dir, "*.old-*")}\"")
           {
             CreateNoWindow = true,
             UseShellExecute = false,
@@ -1611,6 +1612,7 @@ public static class Program
               regs = Enforcer.RegWants(c);
             }
             Enforcer.ProcessDevPending(c, blocking);
+            Enforcer.ProcessNetPending(c, blocking); // חומת אש / Wi-Fi / hosts שהביטול שלהם לא הושלם
             Enforcer.ProcessLsaPending(c, blocking);
             var np = Enforcer.ProcessPathPending(c); // קבצים/תיקיות שהיו בכונן לא מחובר בזמן הביטול
             if (np > 0)
@@ -1713,7 +1715,7 @@ public static class Program
     } // מצב ישן: רק כ-SYSTEM
     if (args.Length >= 2 && args[0] == "--gate")
     {
-      GateMode.RunGate(args);
+      Environment.ExitCode = GateMode.RunGate(args); // קוד היציאה של התוכנה שהופעלה (או "נחסם")
       return;
     }
     if (args.Length >= 3 && args[0] == "--promptkill")

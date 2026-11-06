@@ -217,6 +217,35 @@ static class Native
     return WindowsIdentity.GetCurrent().User?.Value;
   }
 
+  // חשבונות משתמש שיש להם פרופיל במחשב (משתמשים אמיתיים בלבד: S-1-5-21-...), לבחירת החשבון שעליו חלות החסימות במצב "רק משתמש אחד"
+  public static List<(string Sid, string Name)> LocalProfiles()
+  {
+    var res = new List<(string, string)>();
+    try
+    {
+      using var k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList");
+      if (k == null)
+        return res;
+      foreach (var sid in k.GetSubKeyNames())
+      {
+        if (!sid.StartsWith("S-1-5-21-", StringComparison.Ordinal) || sid.EndsWith(".bak", StringComparison.OrdinalIgnoreCase))
+          continue;
+        string? name = AccountName(sid);
+        if (name == null)
+        {
+          using var pk = k.OpenSubKey(sid);
+          name = pk?.GetValue("ProfileImagePath") is string pp ? System.IO.Path.GetFileName(pp) : sid;
+        }
+        res.Add((sid, name));
+      }
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
+    }
+    return res.OrderBy(x => x.Item2, StringComparer.OrdinalIgnoreCase).ToList();
+  }
+
   public static string? AccountName(string? sid)
   {
     try
@@ -399,6 +428,39 @@ static class Native
     catch
     {
       return (null, false);
+    }
+  }
+
+  // הנתיב האמיתי של קובץ/תיקייה אחרי מעבר דרך קיצורי תיקייה (junction / symlink), גם באמצע הנתיב. null = לא קיים / לא ניתן לבדוק.
+  // משמש לבדיקת "נתיב מסוכן": תיקייה שמפנה ל-C:\Windows או ל-C:\ProgramData נראית כטקסט כמו תיקייה רגילה
+  public static string? FinalPath(string path)
+  {
+    try
+    {
+      var h = CreateFileW(path, ReadAttr, 7, 0, 3, 0x02000000, 0); // BACKUP_SEMANTICS בלי OPEN_REPARSE_POINT: עוקב אחרי הקישור
+      if (h == 0 || h == -1)
+        return null;
+      try
+      {
+        var sb = new StringBuilder(1024);
+        var n = GetFinalPathNameByHandleW(h, sb, (uint)sb.Capacity, 0);
+        if (n == 0 || n >= sb.Capacity)
+          return null;
+        var p = sb.ToString();
+        if (p.StartsWith(@"\\?\UNC\", StringComparison.Ordinal))
+          p = @"\\" + p[8..];
+        else if (p.StartsWith(@"\\?\", StringComparison.Ordinal))
+          p = p[4..];
+        return p;
+      }
+      finally
+      {
+        CloseHandle(h);
+      }
+    }
+    catch
+    {
+      return null;
     }
   }
 

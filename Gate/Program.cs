@@ -66,6 +66,12 @@ static unsafe class Program
   static extern bool CloseHandle(nint h);
 
   [DllImport("kernel32")]
+  static extern uint WaitForSingleObject(nint h, uint ms);
+
+  [DllImport("kernel32")]
+  static extern bool GetExitCodeProcess(nint h, out uint code);
+
+  [DllImport("kernel32")]
   static extern nint GetStdHandle(int n);
 
   [DllImport("kernel32")]
@@ -118,7 +124,13 @@ static unsafe class Program
 
   static bool Ok(nint h) => h != 0 && h != -1;
 
-  static bool Run(string cmd, string? reg, bool debug)
+  // קוד יציאה כשהתוכנה נחסמה (ERROR_ACCESS_DISABLED_BY_POLICY), כדי שמי שהפעיל אותה (סקריפט, תוכנת התקנה, Windows) לא יחשוב שהיא הצליחה
+  const int Blocked = 1260;
+
+  // מפעיל את התוכנה וממתין לסיומה: השער נשאר "התהליך" שמי שהפעיל אותה מחכה לו, ומחזיר את קוד היציאה שלה.
+  // בלי ההמתנה, מי שהפעיל (תוכנת התקנה שמריצה msiexec, Windows שמריץ reagentc, או מנהל השירותים שמפעיל את שירות Windows Installer)
+  // קיבל "הצליח" מיד – לפני שהתוכנה בכלל התחילה לעבוד. מחזיר -1 אם ההפעלה נכשלה
+  static int Run(string cmd, string? reg, bool debug)
   {
     var si = new SI { cb = sizeof(SI) };
     nint hi = GetStdHandle(-10),
@@ -141,16 +153,18 @@ static unsafe class Program
     fixed (char* pc = buf)
     {
       if (!CreateProcessW(0, pc, 0, 0, any, fl, 0, 0, ref si, out var pi))
-        return false;
+        return -1;
       if (debug)
       {
         if (reg != null)
           Pipe($"AUTHPID|{pi.pid}|{reg}", 1500);
         DebugActiveProcessStop(pi.pid);
       }
-      CloseHandle(pi.hp);
       CloseHandle(pi.ht);
-      return true;
+      WaitForSingleObject(pi.hp, 0xFFFFFFFF);
+      int code = GetExitCodeProcess(pi.hp, out var ec) ? unchecked((int)ec) : 0;
+      CloseHandle(pi.hp);
+      return code;
     }
   }
 
@@ -192,28 +206,25 @@ static unsafe class Program
     catch { }
     // Windows עצמו (SYSTEM / LocalService / NetworkService) עובר תמיד – משתמש רגיל לא יכול להריץ תוכנה בחשבונות האלה (ראו GateMode.RunGate)
     if (sidStr == "S-1-5-18" || sidStr == "S-1-5-19" || sidStr == "S-1-5-20")
-    {
-      Run(orig, null, true);
-      return 0;
-    }
-    // נתיב השער המלא: אותה תיקייה
+      return Run(orig, null, true);
+    // נתיב השער המלא: אותה תיקייה. גם הוא ממתין לתוכנה ומחזיר את קוד היציאה שלה
     var full = Path.Combine(AppContext.BaseDirectory, "DeviceGuardWatch.exe");
-    int Delegate() => File.Exists(full) && Run("\"" + full + "\" --gate " + id + " " + orig, null, false) ? 0 : 1;
+    int Delegate()
+    {
+      if (!File.Exists(full))
+        return Blocked;
+      var c = Run("\"" + full + "\" --gate " + id + " " + orig, null, false);
+      return c == -1 ? Blocked : c;
+    }
 
     var r = Pipe("RULE|" + id + "|" + sidStr, 3000);
     if (r == null)
-      return sys ? 0 : Delegate(); // שירות לא זמין: השער המלא מציג הודעה
+      return sys ? Blocked : Delegate(); // שירות לא זמין: השער המלא מציג הודעה
     var p = r.Split('|', 7);
     if (p.Length < 7 || p[0] != "OK" || p[4] != "1")
-    {
-      Run(orig, null, true);
-      return 0;
-    } // החוק לא קיים / לא חל כרגע
+      return Run(orig, null, true); // החוק לא קיים / לא חל כרגע
     if (Pipe($"ISAUTH|{id}|{ParentPid()}" + (sys ? "|SYS" : ""), 2000) == "OK")
-    {
-      Run(orig, id, true);
-      return 0;
-    }
-    return sys ? 0 : Delegate();
+      return Run(orig, id, true);
+    return sys ? Blocked : Delegate();
   }
 }

@@ -45,13 +45,57 @@ public partial class MainWin
   {
     var all = new CheckBox
     {
-      Content = "החסימות יחולו על כל המשתמשים במחשב (אחרת – רק על משתמש זה)",
+      Content = "החסימות יחולו על כל המשתמשים במחשב (אחרת – רק על החשבון שנבחר למטה)",
       IsChecked = C.AllUsers,
-      Margin = new Thickness(0, 8, 0, 8),
+      Margin = new Thickness(0, 8, 0, 4),
+    };
+    // החשבון שעליו חלות החסימות כשהן לא לכל המשתמשים. קודם זה היה תמיד מי שפתח את התוכנה בפעם הראשונה, בלי אפשרות לראות או לשנות –
+    // ובמחשב עם כמה חשבונות, פתיחה ראשונה מחשבון המנהל הפעילה את ההגבלות על המנהל במקום על החשבון שרצית
+    var ownerTxt = new TextBlock { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 10, 0) };
+    void OwnerShow()
+    {
+      var n = Native.AccountName(C.OwnerSid) ?? C.OwnerUser ?? "(לא ידוע)";
+      ownerTxt.Text = "החשבון שעליו חלות החסימות: " + n;
+    }
+    OwnerShow();
+    var ownerBtn = Btn(
+      "בחר חשבון…",
+      () =>
+      {
+        var list = Native.LocalProfiles();
+        if (list.Count == 0)
+        {
+          Say("לא נמצאו חשבונות משתמש במחשב.");
+          return;
+        }
+        var res = Pick("בחר חשבון אחד", list.Select(x => (x.Name, x.Sid)), string.IsNullOrEmpty(C.OwnerSid) ? Array.Empty<string>() : new[] { C.OwnerSid });
+        if (res == null)
+          return;
+        if (res.Count != 1)
+        {
+          Say("יש לבחור חשבון אחד בלבד.");
+          return;
+        }
+        if (string.Equals(res[0], C.OwnerSid, StringComparison.OrdinalIgnoreCase))
+          return;
+        C.OwnerSid = res[0];
+        C.OwnerUser = Native.AccountName(res[0]) ?? list.First(x => x.Sid == res[0]).Name;
+        C.Save();
+        OwnerShow();
+        Say("החשבון נשמר. לחץ 'החל שינויים' כדי שהחסימות יעברו לחשבון הזה (ההגבלות בחשבון הקודם יבוטלו).");
+      }
+    );
+    var ownerRow = new StackPanel
+    {
+      Orientation = Orientation.Horizontal,
+      Margin = new Thickness(24, 0, 0, 8),
+      Children = { ownerTxt, ownerBtn },
+      Visibility = C.AllUsers ? Visibility.Collapsed : Visibility.Visible,
     };
     all.Click += (s, e) =>
     {
       C.AllUsers = all.IsChecked == true;
+      ownerRow.Visibility = C.AllUsers ? Visibility.Collapsed : Visibility.Visible;
       C.Save();
     };
     var hard = new CheckBox
@@ -116,6 +160,7 @@ public partial class MainWin
       "\uE713",
       code,
       all,
+      ownerRow,
       hard,
       SkipAppCheck(),
       ScanOpts(),
@@ -129,7 +174,9 @@ public partial class MainWin
     );
   }
 
-  // הסרה: ביטול החסימות רץ ברקע (החלון לא נתקע), ותוצאת ההסרה נבדקת לפני שמודיעים שהשירות יוסר
+  // הסרה: ביטול החסימות רץ ברקע (החלון לא נתקע), ותוצאת ההסרה נבדקת לפני שמודיעים שהשירות יוסר.
+  // לפני הסרת השירות נבדק שלא נשאר שום דבר שרק השירות יכול לשחרר אחר כך (משתמש לא מחובר, כונן לא מחובר, Wi-Fi / חומת אש):
+  // אם נשאר – מציעים לדחות את ההסרה. החסימות כבר כבויות, והשירות ישחרר את השאר לבד (כשהמשתמש ייכנס / כשהכונן יחובר)
   async Task Uninstall()
   {
     IsEnabled = false;
@@ -162,6 +209,15 @@ public partial class MainWin
           {
             Diag.Log(__e);
           }
+          // הגבלות ברישום של משתמשים שלא מחוברים עכשיו: טעינה זמנית של הרישום שלהם וביטול
+          try
+          {
+            Enforcer.ProcessRegPendingOffline();
+          }
+          catch (Exception __e)
+          {
+            Diag.Log(__e);
+          }
           // זכויות מנהל שלא הוחזרו בביטול (ההקשחה החזקה): אחרי ההסרה אין שירות שינסה שוב – מנסים עכשיו, ואם לא הצליח – מודיעים
           Enforcer.ProcessLsaPending(C, false);
           if (Enforcer.HasLsaPending())
@@ -172,6 +228,8 @@ public partial class MainWin
           // אחרי ההסרה אין שירות שישחרר קבצים מאוחר יותר: סורקים את כל הכוננים ומשחררים כל קובץ שעדיין נעול על ידינו
           // (גם קבצים שהועברו ממקומם בזמן החסימה, וגם אם יומן החסימות נפגע)
           Enforcer.SweepAll(C);
+          // חומת אש / מסנן Wi-Fi / hosts: וידוא שבאמת שוחררו (בלי המתנה)
+          Enforcer.ProcessNetPending(C, false, true);
           if (err != null)
             throw new IOException("החסימות בוטלו, אך " + err.Message, err);
         },
@@ -179,6 +237,46 @@ public partial class MainWin
         TaskCreationOptions.None,
         Enforcer.Sta
       );
+      // מה שעדיין לא שוחרר. "כן" = לנסות שוב (אחרי חיבור הכונן), "לא" = להחליט אם להסיר בכל זאת
+      while (true)
+      {
+        var left = await Task.Run(() => (Users: Enforcer.PendingUsers(), Drives: Enforcer.PendingDrives(), Net: Enforcer.ProcessNetPending(C, false, true)));
+        if (left.Users.Count == 0 && left.Drives.Count == 0 && left.Net.Count == 0)
+          break;
+        var msg = "החסימות בוטלו, אבל לא הכול שוחרר:\n";
+        if (left.Users.Count > 0)
+          msg += "\n• ההגבלות בחשבון " + string.Join(", ", left.Users.Select(u => Native.AccountName(u) ?? u)) + " (המשתמש לא מחובר, ולא ניתן היה לטעון את הרישום שלו).";
+        if (left.Drives.Count > 0)
+          msg += "\n• קבצים/תיקיות בכונן " + string.Join(", ", left.Drives) + " (הכונן לא מחובר). אפשר לחבר אותו עכשיו.";
+        if (left.Net.Count > 0)
+          msg += "\n• חסימת רשת (חומת אש / Wi-Fi) לא הוסרה במלואה.";
+        msg += "\n\nלנסות שוב עכשיו? (\"לא\" – לבחור אם להסיר בכל זאת)";
+        if (Say(msg, "הסרה", yesNo: true))
+        {
+          status.Text = "מנסה שוב...";
+          await Task.Run(() =>
+          {
+            Enforcer.RetryReleases(C);
+            Enforcer.ProcessRegPendingOffline();
+          });
+          continue;
+        }
+        if (
+          !Say(
+            "מומלץ לא להסיר עכשיו: החסימות כבר כבויות, ושירות ההגנה ישחרר את השאר לבד – כשהמשתמש ייכנס לחשבון שלו / כשהכונן יחובר. אחר כך אפשר להסיר.\n\n"
+              + "להסיר בכל זאת? (מה שלא שוחרר יישאר כך)",
+            "הסרה",
+            yesNo: true
+          )
+        )
+        {
+          status.Text = "החסימות בוטלו; הסרת השירות נדחתה";
+          busy = false;
+          IsEnabled = true;
+          return;
+        }
+        break;
+      }
       var r = await Task.Run(() =>
       {
         var x = Config.Token != null ? Config.Pipe("UNINSTALL|" + Config.Token, 5000) : null;

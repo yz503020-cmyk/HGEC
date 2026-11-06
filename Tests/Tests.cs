@@ -173,6 +173,57 @@ public class DangerousPathTests
     Assert.False(Enforcer.IsGenericName(@"C:\x\Discord.exe"));
   }
 
+  // תיקייה שהיא קישור (junction) לתיקיית מערכת: הנתיב נראה רגיל, אבל חסימה דרכו נועלת את תיקיית המערכת האמיתית
+  [Fact]
+  public void JunctionToSystemFolderIsDangerous()
+  {
+    var root = Path.Combine(Path.GetTempPath(), "dg-junction-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(root);
+    try
+    {
+      var toWin = Path.Combine(root, "win");
+      var toData = Path.Combine(root, "data");
+      var ok = Path.Combine(root, "ok");
+      Directory.CreateDirectory(Path.Combine(root, "target"));
+      foreach (var (link, target) in new[] { (toWin, F(Environment.SpecialFolder.Windows)), (toData, F(Environment.SpecialFolder.CommonApplicationData)), (ok, Path.Combine(root, "target")) })
+      {
+        using var p = System.Diagnostics.Process.Start(
+          new System.Diagnostics.ProcessStartInfo("cmd.exe", $"/c mklink /J \"{link}\" \"{target}\"") { CreateNoWindow = true, UseShellExecute = false }
+        )!;
+        p.WaitForExit();
+      }
+      Assert.True(Directory.Exists(toWin));
+      Assert.True(Enforcer.IsDangerous(toWin));
+      Assert.True(Enforcer.IsDangerous(Path.Combine(toWin, "System32"))); // גם כשהקישור באמצע הנתיב
+      Assert.True(Enforcer.IsDangerous(toData));
+      Assert.False(Enforcer.IsDangerous(ok)); // קישור לתיקייה רגילה – מותר
+    }
+    finally
+    {
+      // מחיקת הקישורים עצמם בלבד (Directory.Delete על junction לא נכנס לתיקיית היעד)
+      foreach (var d in Directory.GetDirectories(root))
+        try
+        {
+          Directory.Delete(d, false);
+        }
+        catch { }
+      try
+      {
+        Directory.Delete(root, false);
+      }
+      catch { }
+    }
+  }
+
+  // קישור מובנה של Windows: C:\ProgramData\Application Data מפנה ל-C:\ProgramData עצמה
+  [Fact]
+  public void BuiltInProgramDataJunctionIsDangerous()
+  {
+    var j = Path.Combine(F(Environment.SpecialFolder.CommonApplicationData), "Application Data");
+    if (Directory.Exists(j))
+      Assert.True(Enforcer.IsDangerous(j));
+  }
+
   [Fact]
   public void OrdinaryFoldersAreNotDangerous()
   {

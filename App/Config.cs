@@ -42,6 +42,7 @@ public class AdvOpts
     NoProxy;
   public bool Browsers = true; // כיבוי DoH וגלישה פרטית בדפדפנים
   public bool SafeBoot = true; // השירות רץ גם ב-Safe Mode
+  public bool StrongAdmin; // הקשחה חזקה (כבוי כברירת מחדל): בזמן החסימה מנהלים מאבדים את זכויות הגיבוי/שחזור, לקיחת בעלות ודיבאג
 }
 
 // תזמון: החסימות פעילות רק בתוך החלון (מחוץ לו הכול נפתח אוטומטית)
@@ -70,11 +71,11 @@ public class Schedule
     try
     {
       var tz = string.IsNullOrEmpty(TzId) ? TimeZoneInfo.Local : TimeZoneInfo.FindSystemTimeZoneById(TzId);
-      return TimeZoneInfo.ConvertTime(DateTime.UtcNow, tz);
+      return TimeZoneInfo.ConvertTime(Clock.UtcNow(), tz); // בשירות: שעה אמינה (שינוי שעון המחשב לא מזיז את החלון)
     }
     catch
     {
-      return DateTime.Now;
+      return Clock.UtcNow().ToLocalTime();
     }
   }
 
@@ -266,6 +267,20 @@ public class Config
 
   public static bool Up(int ms = 1500) => Pipe("HELLO", ms) == "OK";
 
+  // ביטול פתיחה זמנית ("החל שינויים" מחוץ לחלון הזמנים): השירות מאפס רק את זמן הפתיחה, בלי לגעת ברשימת "מה הוחל"
+  public static void CancelTemp()
+  {
+    for (int i = 0; i < 2; i++)
+    {
+      if (Token == null && !(Program.Code != null && Auth(Program.Code)))
+        return;
+      var r = Pipe("CANCELTEMP|" + Token, 5000);
+      if (r != "DENY")
+        return;
+      Token = null; // הטוקן פג: אימות מחדש
+    }
+  }
+
   public static bool Auth(string code)
   {
     var t = Pipe("AUTH|" + code);
@@ -328,12 +343,34 @@ public class Config
     }
     catch (UnauthorizedAccessException)
     {
+      // התיקייה נעולה (רק השירות כותב אליה) והשירות לא עונה: כתיבה בעזרת הרשאת השחזור של מנהל מורם
+      // חתימה בקוד הכניסה: כשהשירות יחזור לעבוד הוא יקבל את הקובץ (קובץ לא חתום שנכתב מבחוץ – משוחזר)
+      if (
+        File.Exists(CfgPath)
+        && Program.Code != null
+        && Enforcer.WriteFileBackup(CfgPath, json)
+        && Enforcer.WriteFileBackup(Trust.SigPath, Trust.Sign(Trust.Derive(Program.Code, AppCode), json))
+      )
+        return;
       throw new IOException("שירות ההגנה אינו פעיל, ולכן לא ניתן לשמור. המתן רגע ונסה שוב, או הפעל מחדש את המחשב");
     }
   }
 
   // שמירה מתוך השירות: משנה רק את מצב ההחלה בקובץ העדכני, ולא דורסת הגדרות שהמשתמש שמר בינתיים
   void SaveRuntimeMerged(string fallbackJson)
+  {
+    lock (WriteLock) // קריאה-שינוי-כתיבה אטומיים מול שמירות אחרות בשירות (Pipe, ביטול פתיחה זמנית)
+      SaveRuntimeMergedCore(fallbackJson);
+  }
+
+  // קריאת הקובץ העדכני, שינוי וכתיבה – בלי ששמירה אחרת בשירות תיכנס באמצע (אחרת אחת מהן הייתה דורסת את רשימת "מה הוחל" של השנייה)
+  public static void Locked(Action a)
+  {
+    lock (WriteLock)
+      a();
+  }
+
+  void SaveRuntimeMergedCore(string fallbackJson)
   {
     var latest = TryLoad();
     if (latest == null || ReferenceEquals(latest, this))
@@ -351,8 +388,22 @@ public class Config
   }
 
   // כתיבה אטומית + הרשאות מוגבלות (SYSTEM ומנהלים בלבד). משמש את השירות
+  // התוכן האחרון שהשירות כתב (או טען בהפעלה). שינוי של הקובץ שלא דרך השירות (מנהל שלקח בעלות על הקובץ) מזוהה ומשוחזר
+  public static volatile string? LastWritten;
+
+  static readonly object WriteLock = new();
+
   public static void WriteSecure(string json)
   {
+    lock (WriteLock) // הכתיבה ו-LastWritten יחד: שתי כתיבות במקביל לא ייראו כ"שינוי מבחוץ"
+      WriteSecureCore(json);
+  }
+
+  static void WriteSecureCore(string json)
+  {
+    LastWritten = json;
+    if (InService)
+      Trust.SaveGood(json); // קודם העותק המהימן (במפתח רישום מוגן), ואז הקובץ – ראו Trust.SaveGood
     Directory.CreateDirectory(Dir);
     var tmp = CfgPath + ".tmp";
     File.WriteAllText(tmp, json);

@@ -273,6 +273,18 @@ public partial class MainWin : Window
     };
   }
 
+  void ShortcutNote()
+  {
+    if (!Enforcer.UiShortcutNote)
+      return;
+    Enforcer.UiShortcutNote = false;
+    Say(
+      "החסימה חוסמת הרצת תוכנות מתיקיות המשתמש (כמו הורדות ושולחן העבודה), ולכן גם את DeviceGuard.exe שהורד לשם.\n"
+        + "מעכשיו פותחים את DeviceGuard מהקיצור \"DeviceGuard\" בשולחן העבודה או בתפריט התחל.\n"
+        + "לעדכון גרסה: קודם 'פתיחה זמנית (30 דק׳)', ואז מפעילים את הגרסה החדשה."
+    );
+  }
+
   async Task Do()
   {
     if (C.Master && C.DefaultCode == null && C.All().Any(r => r.On && r.Mode == Mode.Code && r.OwnCode == null))
@@ -283,15 +295,32 @@ public partial class MainWin : Window
     C.TempOpenUntil = 0;
     if (C.Master && C.Sched.On && !C.Sched.Active(C.Sched.NowPinned()))
     { // מחוץ לחלון הזמנים: שומרים, והשירות יפעיל לבד בתחילת החלון
+      IsEnabled = false;
+      busy = true;
+      status.Text = "שומר...";
       try
       {
-        C.Save(true);
+        // השירות חייב להיות מותקן ומעודכן – הוא זה שיחיל את החסימות בתחילת החלון (בהתקנה ראשונה הוא עוד לא קיים)
+        await Task.Run(Enforcer.EnsureService);
+        // שמירה רגילה (SAVE) ולא של מצב ההחלה: העותק של "מה הוחל" בחלון עלול להיות ישן בשנייה-שתיים, ודריסה שלו (אם השירות
+        // בדיוק החיל בתחילת החלון) הייתה משאירה הגבלות אחרי הביטול. ביטול פתיחה זמנית נשלח בנפרד
+        C.Save();
+        Config.CancelTemp();
+        status.Text = "מחוץ לחלון הזמנים – החסימות יופעלו אוטומטית בתחילת החלון";
       }
       catch (Exception x)
       {
+        status.Text = "שגיאה: " + x.Message;
         Say(x.Message);
       }
-      status.Text = "מחוץ לחלון הזמנים – החסימות יופעלו אוטומטית בתחילת החלון";
+      busy = false;
+      IsEnabled = true;
+      // החסימה תופעל בתחילת החלון על ידי השירות: הקיצור לפתיחת DeviceGuard נוצר כבר עכשיו, וההודעה מוצגת עכשיו (השירות לא יכול להציג אותה)
+      if ((C.Install.On && C.Install.Mode == Mode.Full) || C.Portable.On)
+      {
+        Enforcer.EnsureUiShortcut();
+        ShortcutNote();
+      }
       return;
     }
     if (
@@ -312,6 +341,12 @@ public partial class MainWin : Window
             ? $" (נחסמו {Enforcer.Blocked} קבצים" + (Enforcer.Failed > 0 ? $", נכשלו {Enforcer.Failed}: {Enforcer.LastErr}" : "") + ")"
             : ""
         );
+      ShortcutNote();
+      if (Enforcer.StrongWarn is string sw)
+      {
+        Enforcer.StrongWarn = null;
+        Say(sw);
+      }
       if (Enforcer.NeedReboot)
         Say("תוקנה הגדרה של Windows 11 שמנעה את חסימת התוכנות הניידות / ההתקנות. החסימה הזו תפעל רק אחרי הפעלה מחדש של המחשב.");
       StartScanWatch();

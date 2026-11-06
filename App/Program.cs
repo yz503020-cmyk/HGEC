@@ -67,6 +67,9 @@ public static class Program
   static int applyBusy;
   static DateTime reconBackoff = DateTime.MinValue;
   static volatile bool overflow;
+  static int qBusy; // תהליכון הרקע של הקבצים החדשים רץ
+  static volatile bool netChanged; // שינוי ברשת (מתאם הופעל / חובר) – בדיקת מתאמים מיידית
+  static readonly ConcurrentDictionary<string, byte> secPend = new(StringComparer.OrdinalIgnoreCase); // קבצים חסומים שההרשאות שלהם שונו
   static ManagementEventWatcher? pw;
   static readonly Dictionary<string, string[]> alias = new(StringComparer.OrdinalIgnoreCase)
   {
@@ -76,7 +79,7 @@ public static class Program
 
   // האם החסימות אמורות להיות פעילות כרגע (מתג ראשי, פתיחה זמנית, תזמון)
   public static bool Blocking(Config c) =>
-    c.Master && c.TempOpenUntil <= DateTime.UtcNow.Ticks && (!c.Sched.On || c.Sched.Active(c.Sched.NowPinned()));
+    c.Master && c.TempOpenUntil <= Clock.UtcNow().Ticks && (!c.Sched.On || c.Sched.Active(c.Sched.NowPinned()));
 
   public static void InternalAdd(int pid, int d)
   {
@@ -194,6 +197,18 @@ public static class Program
     {
       ServiceName = "DeviceGuard";
       CanShutdown = true;
+      CanHandlePowerEvent = true;
+    }
+
+    // יציאה ממצב שינה: השעה האמינה מתעדכנת (ראו Clock.OnResume)
+    protected override bool OnPowerEvent(System.ServiceProcess.PowerBroadcastStatus s)
+    {
+      if (
+        s == System.ServiceProcess.PowerBroadcastStatus.ResumeSuspend
+        || s == System.ServiceProcess.PowerBroadcastStatus.ResumeAutomatic
+      )
+        Clock.OnResume();
+      return true;
     }
 
     protected override void OnStart(string[] a)
@@ -450,6 +465,8 @@ public static class Program
       ppid = Native.ParentOf(pid);
     if (ppid > 0 && internalPids.ContainsKey(ppid))
       return; // כלי מערכת שהאפליקציה עצמה הפעילה (PowerShell, netsh, sc ...)
+    if (Native.IsServiceSid(Native.ProcSid(pid)))
+      return; // תהליך של Windows עצמו (SYSTEM / שירות), למשל משימה מתוזמנת של המערכת שמריצה PowerShell – כמו בשער
     if (killSet.Contains(n))
     {
       if (!OwnerApplies(c, pid) || IsAuthAny(pid))
@@ -533,6 +550,19 @@ public static class Program
         Names(r, r.Mode == Mode.Full);
       if (c.Settings.On && c.Settings.Mode == Mode.Code)
         ck["SystemSettings"] = c.Settings.Id; // רשת ביטחון: אפליקציית ההגדרות של Windows לא תמיד נתפסת ב-IFEO
+      // כל מה שנחסם ב-IFEO (כלי אתחול, וירטואליזציה, התקנת MSI, לוח הבקרה...) נסגר גם אם הופעל בכל זאת – למשל מנהל שמחק את החסימה
+      // מהרישום והפעיל את הכלי באותו רגע, לפני שהשירות שחזר אותה. תהליכים של Windows עצמו (SYSTEM) ושל השירות לא נסגרים (HandleProc)
+      foreach (var (exe, id) in Enforcer.IfeoList(c))
+      {
+        var n = System.IO.Path.GetFileNameWithoutExtension(exe);
+        var r = c.Find(id);
+        if (n.Length == 0 || r == null || Enforcer.IsCritical(n) || ks.Contains(n) || ck.ContainsKey(n))
+          continue;
+        if (r.Mode == Mode.Full)
+          ks.Add(n);
+        else
+          ck[n] = r.Id;
+      }
     }
     killSet = ks;
     codeKillMap = ck;
@@ -600,6 +630,7 @@ public static class Program
         authFails = 0;
         authLevel = 0;
       }
+      Trust.SetCode(code, cur.AppCode); // מפתח החתימה של ההגדרות (ראו Trust)
       var t = Guid.NewGuid().ToString("N");
       tokens[t] = DateTime.UtcNow;
       return "TOKEN|" + t;
@@ -645,18 +676,22 @@ public static class Program
           var inc = JsonSerializer.Deserialize<Config>(json, Config.O);
           if (inc == null)
             return "ERR";
-          if (p[0] == "SAVE")
+          var save = p[0];
+          Config.Locked(() =>
           {
-            var latest = Config.TryLoad();
-            if (latest != null)
+            if (save == "SAVE")
             {
-              inc.Applied = latest.Applied;
-              inc.State = latest.State;
-              inc.TempOpenUntil = latest.TempOpenUntil;
-              json = JsonSerializer.Serialize(inc, Config.O);
+              var latest = Config.TryLoad();
+              if (latest != null)
+              {
+                inc.Applied = latest.Applied;
+                inc.State = latest.State;
+                inc.TempOpenUntil = latest.TempOpenUntil;
+                json = JsonSerializer.Serialize(inc, Config.O);
+              }
             }
-          }
-          Config.WriteSecure(json);
+            Config.WriteSecure(json);
+          });
           return "OK";
         }
         case "RULE":
@@ -717,6 +752,28 @@ public static class Program
           if (yes && clientPid > 0)
             grants[(clientPid, p[1])] = DateTime.UtcNow;
           return yes ? "OK" : "NO";
+        }
+        case "CANCELTEMP":
+        { // CANCELTEMP|token: ביטול פתיחה זמנית בלבד (ההגדרות המהימנות + זמן פתיחה 0). מצב ההחלה לא מגיע מהחלון ולכן לא נדרס
+          if (!admin || p.Length < 2 || !TokenOk(p[1]))
+            return "DENY";
+          Config.Locked(() =>
+          {
+            var latest = Config.TryLoad();
+            if (latest != null && latest.TempOpenUntil != 0)
+            {
+              latest.TempOpenUntil = 0;
+              Config.WriteSecure(JsonSerializer.Serialize(latest, Config.O));
+            }
+          });
+          return "OK";
+        }
+        case "APPLYING":
+        { // APPLYING|token|1/0: החלון מחיל/מבטל עכשיו (השירות לא "משחזר" באמצע). מאומת בקוד הכניסה – אי אפשר לזייף מבחוץ
+          if (!admin || p.Length < 3 || !TokenOk(p[1]))
+            return "DENY";
+          Enforcer.UiApplying(p[2] == "1");
+          return "OK";
         }
         case "INTERNAL":
         {
@@ -818,6 +875,8 @@ public static class Program
     Thread.Sleep(1000);
     if (full)
     {
+      Clock.Stop();
+      Trust.Remove();
       try
       {
         InternalAdd(Environment.ProcessId, 1);
@@ -986,7 +1045,11 @@ public static class Program
         {
           Diag.Log(__e);
         }
-        var resp = await Task.Run(() => Handle(l, cpid, admin, sid));
+        var resp = await Task.Run(() =>
+        {
+          Enforcer.BgReset(); // תהליכון שנשאר בטעות בעדיפות נמוכה (סריקה שנעצרה באמצע) – התשובה לשער לא תתעכב
+          return Handle(l, cpid, admin, sid);
+        });
         var wr = new StreamWriter(st, new UTF8Encoding(false)) { AutoFlush = true };
         await wr.WriteLineAsync(resp);
       }
@@ -1024,6 +1087,24 @@ public static class Program
     Config.InService = true;
     Enforcer.InService = true;
     LockDir();
+    // הקשחה נגד עקיפה בחשבון מנהל (Hardening.cs)
+    Trust.Init();
+    Clock.StartTrusted();
+    ProcGuard.Protect();
+    SvcGuard.Init();
+    RegWatch.Start();
+    try
+    { // מתאם רשת שהופעל מחדש / חובר: בדיקה מיידית
+      System.Net.NetworkInformation.NetworkChange.NetworkAddressChanged += (s, e) =>
+      {
+        netChanged = true;
+        RegWatch.Wake.Set();
+      };
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
+    }
     new Thread(PipeServer) { IsBackground = true }.Start();
     Alerts.Log("שירות ההגנה הופעל", false);
     StartWmi();
@@ -1032,7 +1113,7 @@ public static class Program
     var watched = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     void Add(string p)
     {
-      if (curMap.ContainsKey(ExtOf(p)))
+      if (curMap.ContainsKey(ExtOf(p)) && !Enforcer.CheapSkip(p))
         q.Enqueue((p, 0, DateTime.UtcNow.AddSeconds(2)));
     }
     void Watch1(string root)
@@ -1052,6 +1133,26 @@ public static class Program
         w.Error += (s, e) => overflow = true;
         w.EnableRaisingEvents = true;
         fsw.Add(w);
+        // שינוי הרשאות של קובץ חסום (למשל מנהל שהריץ icacls /reset): נבדק ונועל שוב תוך שניות, במקום בסריקה של כל שעה.
+        // שינויים שהשירות עצמו עשה מסוננים. מעקב נפרד – גלישה של המעקב הזה לא מפעילה סריקה מלאה (הסריקה של כל שעה מכסה)
+        var ws = new FileSystemWatcher(root)
+        {
+          IncludeSubdirectories = true,
+          NotifyFilter = NotifyFilters.Security,
+          InternalBufferSize = 65536,
+        };
+        ws.Changed += (s, e) =>
+        {
+          if (
+            secPend.Count < 20000
+            && curMap.ContainsKey(ExtOf(e.FullPath))
+            && !Enforcer.RecentlyMine(e.FullPath)
+            && !Enforcer.CheapSkip(e.FullPath)
+          )
+            secPend[e.FullPath] = 0;
+        };
+        ws.EnableRaisingEvents = true;
+        fsw.Add(ws);
       }
       catch (Exception __e)
       {
@@ -1062,6 +1163,12 @@ public static class Program
       DriveInfo.GetDrives().Where(x => Enforcer.ScanDrive(x) && x.IsReady).Select(x => x.RootDirectory.FullName);
     foreach (var d in Drives())
       Watch1(d);
+    // כוננים שכבר מחוברים בהפעלת השירות: השחרור שלהם נעשה בטעינת ההגדרות הראשונה (ReleaseStale), ולא כאן – לפני הטעינה המפה ריקה, ושחרור איתה היה פותח הכול
+    var otherSeen = DriveInfo
+      .GetDrives()
+      .Where(x => (x.DriveType == DriveType.Fixed || x.DriveType == DriveType.Removable) && x.IsReady)
+      .Select(x => x.RootDirectory.FullName)
+      .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
     var stamp = DateTime.MinValue;
     var c = new Config();
@@ -1079,12 +1186,21 @@ public static class Program
     var lastDrv = DateTime.MinValue;
     var lastWmi = DateTime.UtcNow;
     var lastPend = DateTime.UtcNow;
+    var lastLost = DateTime.UtcNow;
+    var lastSvc = DateTime.UtcNow;
+    var lastSec = DateTime.UtcNow;
+    var lastPaths = DateTime.UtcNow;
+    var lastUsbT = DateTime.UtcNow;
+    var lastIter = DateTime.UtcNow;
+    var lastTamper = DateTime.MinValue;
+    var lastStrong = DateTime.MinValue;
     string? lastSig = null;
     bool pendingDone = false;
     Task scanTask = Task.CompletedTask;
     CancellationTokenSource? scanCts = null;
     // cancel = לעצור סריקה מלאה שרצה (בשינוי הגדרות). בחיבור כונן משחררים קבצים בלי לעצור את הסריקה
-    void StartScan(Dictionary<string, Rule> map, bool release, string? root = null, bool? cancel = null)
+    // scan = false: רק שחרור (כונן שלא סורקים בו, למשל דיסק USB חיצוני שחובר מחדש וקבצים בו ננעלו בגרסה קודמת)
+    void StartScan(Dictionary<string, Rule> map, bool release, string? root = null, bool? cancel = null, bool scan = true)
     {
       bool cn = cancel ?? release;
       if (cn)
@@ -1101,15 +1217,21 @@ public static class Program
         {
           Diag.Log(__e);
         }
+        Enforcer.BgEnter(); // סריקה בעדיפות נמוכה (מעבד ודיסק)
         try
         {
           if (release)
             Enforcer.ReleaseStale(map);
-          Enforcer.ScanNew(map, cts.Token, root);
+          if (scan)
+            Enforcer.ScanNew(map, cts.Token, root);
         }
         catch (Exception __e)
         {
           Diag.Log(__e);
+        }
+        finally
+        {
+          Enforcer.BgExit();
         }
       });
     }
@@ -1117,12 +1239,42 @@ public static class Program
     {
       try
       {
-        if ((DateTime.UtcNow - lastDrv).TotalSeconds >= 5)
-        { // בדיקת כוננים חדשים כל כמה שניות (ולא כל שנייה)
+        Clock.Tick();
+        if (RegWatch.Dirty)
+        { // שינוי ברישום: כל בדיקות השחזור רצות עכשיו (ולא בעוד כמה שניות)
+          RegWatch.Dirty = false;
+          lastIfeo = lastReg = lastFw = lastSvc = DateTime.MinValue;
+        }
+        if (netChanged)
+        {
+          netChanged = false;
+          lastAd = DateTime.MinValue;
+        }
+        if ((DateTime.UtcNow - lastDrv).TotalSeconds >= 2 && stamp != DateTime.MinValue)
+        { // בדיקת כוננים חדשים כל כמה שניות (ולא כל שנייה). רק אחרי שההגדרות נטענו, כדי לא לשחרר עם מפה ריקה
           lastDrv = DateTime.UtcNow;
+          var blockingNow = Blocking(c);
           try
           {
+            // כוננים שלא סורקים בהם (דיסק USB חיצוני): כשהם מתחברים משחררים בהם קבצים שננעלו בעבר, בלי לנעול חדשים
+            var ready = DriveInfo
+              .GetDrives()
+              .Where(dv => (dv.DriveType == DriveType.Fixed || dv.DriveType == DriveType.Removable) && dv.IsReady)
+              .Select(dv => dv.RootDirectory.FullName)
+              .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            otherSeen.RemoveWhere(x => !ready.Contains(x));
+            var newOther = ready.Where(r => !otherSeen.Contains(r)).ToList();
+            foreach (var r in newOther)
+              otherSeen.Add(r);
+            if (newOther.Count > 0)
+            {
+              Enforcer.ResetDriveCache();
+              if (blockingNow && c.Usb.On)
+                _ = Task.Run(() => Enforcer.UsbDiskHeal(c));
+            }
             var present = Drives().ToHashSet(StringComparer.OrdinalIgnoreCase);
+            foreach (var r in newOther.Where(nr => !present.Contains(nr)))
+              StartScan(curMap, true, r, false, false);
             foreach (var gone in watched.Where(w => !present.Contains(w)).ToList())
             { // כונן שנותק: מפסיקים לעקוב, כדי שחיבור מחדש שלו יזוהה כחיבור חדש
               watched.Remove(gone);
@@ -1161,11 +1313,93 @@ public static class Program
           StartWmi();
         } // ניטור WMI שנפל – מפעילים מחדש
         var ts = File.GetLastWriteTimeUtc(Config.CfgPath);
+        string? raw = null;
         if (ts != stamp)
+          try
+          {
+            if (File.Exists(Config.CfgPath))
+              raw = File.ReadAllText(Config.CfgPath);
+          }
+          catch (Exception __e)
+          {
+            Diag.Log(__e);
+          }
+        // רק השירות כותב את קובץ ההגדרות (החלון שומר דרכו). קובץ שונה מקבל רק אם: השירות כתב אותו, הוא זהה לעותק המהימן,
+        // או שהוא חתום בקוד הכניסה (החלון כתב אותו כשהשירות לא עבד). אחרת – שינוי מבחוץ (למשל robocopy /B, או לקיחת בעלות): משחזרים.
+        // גם בהפעלת השירות (Trust.Good נשמר במפתח רישום מוגן), וגם כשהקובץ נמחק
+        string? restore = null;
+        if (ts != stamp && !removing)
+        {
+          var lw = Config.LastWritten;
+          var gd = Trust.Good;
+          if (raw != null)
+          {
+            bool trusted = raw == lw || raw == gd || Trust.SigOk(raw) || (lw == null && gd == null);
+            if (!trusted)
+              restore = lw ?? gd;
+          }
+          else if (!File.Exists(Config.CfgPath))
+            restore = lw ?? gd;
+        }
+        if (restore != null)
+        {
+          if ((DateTime.UtcNow - lastTamper).TotalMinutes >= 1)
+          {
+            lastTamper = DateTime.UtcNow;
+            Alerts.Log("קובץ ההגדרות שונה שלא דרך התוכנה – שוחזר");
+          }
+          try
+          {
+            Config.WriteSecure(restore);
+          }
+          catch (Exception __e)
+          {
+            Diag.Log(__e);
+          }
+          // stamp לא מתעדכן: בסבב הבא הקובץ (ששוחזר) נטען כרגיל
+        }
+        else if (ts != stamp)
         {
           var nc = Config.TryLoad(); // null = קריאה נכשלה: נשארים עם ההגדרות הקודמות ומנסים שוב (לא מתאפסים להגדרות ריקות)
           if (nc != null)
           {
+            if (raw != null && raw != Config.LastWritten)
+            { // התקבל (טעינה ראשונה, או קובץ חתום שהחלון כתב): הוא המהימן מעכשיו
+              Config.LastWritten = raw;
+              Trust.SaveGood(raw);
+            }
+            // פתיחה זמנית: החלון מחשב את זמן הסיום לפי שעון המחשב. השירות ממיר אותו לשעה האמינה (אותו משך, עד 30 דקות) –
+            // כך ששעון שהוזז קדימה לא מאריך את הפתיחה בשעות, ושעון שמאחר לא מסיים אותה מיד
+            if (nc.TempOpenUntil != 0 && nc.TempOpenUntil != c.TempOpenUntil)
+            {
+              var left = Math.Clamp(nc.TempOpenUntil - DateTime.UtcNow.Ticks, 0, TimeSpan.FromMinutes(30).Ticks);
+              var want = Clock.UtcNow().Ticks + left;
+              if (Math.Abs(want - nc.TempOpenUntil) > TimeSpan.TicksPerMinute)
+              {
+                nc.TempOpenUntil = want;
+                try
+                {
+                  nc.Save(true);
+                }
+                catch (Exception __e)
+                {
+                  Diag.Log(__e);
+                }
+              }
+            }
+            else if (nc.TempOpenUntil > Clock.UtcNow().AddMinutes(33).Ticks)
+            { // ערך שכבר היה (למשל אחרי הפעלה מחדש) – לא יותר מ-30 דקות מעכשיו
+              nc.TempOpenUntil = Clock.UtcNow().AddMinutes(30).Ticks;
+              Alerts.Log("זמן הפתיחה הזמנית קוצר ל-30 דקות (שעון המחשב לא תאם)");
+              try
+              {
+                nc.Save(true);
+              }
+              catch (Exception __e)
+              {
+                Diag.Log(__e);
+              }
+            }
             stamp = ts;
             c = nc;
             cur = nc;
@@ -1223,16 +1457,34 @@ public static class Program
               }
             }
           }
-          for (int n = q.Count; n > 0 && q.TryDequeue(out var it); n--)
-          {
-            if (it.At > DateTime.UtcNow)
+          // קבצים חדשים: בתהליכון רקע (עדיפות נמוכה), ולא בלולאה הראשית – אלפי קבצים חדשים (חילוץ ארכיון, העתקה) לא מעכבים את השחזורים
+          if (!q.IsEmpty && Interlocked.CompareExchange(ref qBusy, 1, 0) == 0)
+            _ = Task.Run(() =>
             {
-              q.Enqueue(it);
-              continue;
-            }
-            if (curMap.TryGetValue(ExtOf(it.P), out var rule) && !Enforcer.BlockNewFile(rule, it.P) && it.T < 5)
-              q.Enqueue((it.P, it.T + 1, DateTime.UtcNow.AddSeconds(3)));
-          }
+              Enforcer.BgEnter();
+              try
+              {
+                for (int n = q.Count; n > 0 && q.TryDequeue(out var it); n--)
+                {
+                  if (it.At > DateTime.UtcNow)
+                  {
+                    q.Enqueue(it);
+                    continue;
+                  }
+                  if (Blocking(cur) && curMap.TryGetValue(ExtOf(it.P), out var rule) && !Enforcer.BlockNewFile(rule, it.P) && it.T < 5)
+                    q.Enqueue((it.P, it.T + 1, DateTime.UtcNow.AddSeconds(3)));
+                }
+              }
+              catch (Exception __e)
+              {
+                Diag.Log(__e);
+              }
+              finally
+              {
+                Enforcer.BgExit();
+                Interlocked.Exchange(ref qBusy, 0);
+              }
+            });
           if (scanTask.IsCompleted && curMap.Count > 0)
           {
             if (overflow && (now - lastOverflow).TotalMinutes >= 5)
@@ -1269,14 +1521,76 @@ public static class Program
             lastFw = now;
             Enforcer.NetHeal(c);
           }
-          if ((now - lastAd).TotalSeconds >= 15)
+          if ((now - lastAd).TotalSeconds >= 5)
           {
             lastAd = now;
             Enforcer.NetAdapterHeal(c);
           }
+          if (quiet && (now - lastPaths).TotalSeconds >= 30)
+          { // חסימות קבצים/תיקיות והנעילה של hosts שהוסרו מבחוץ
+            lastPaths = now;
+            foreach (var r in c.Paths.Where(r => r.On).ToList())
+              if (!lease.ContainsKey(r.Id) && Enforcer.PathUnlocked(c, r))
+              {
+                Enforcer.Relock(r, c);
+                Alerts.Log("זוהתה הסרה של חסימה – ננעל שוב: " + r.Name);
+              }
+            Enforcer.HostsHeal(c);
+          }
+          if (quiet && c.Adv.On && c.AdvOpts.StrongAdmin && (now - lastStrong).TotalSeconds >= 5)
+          {
+            lastStrong = now;
+            Enforcer.StrongHeal(c);
+          }
+          if (quiet && c.Usb.On && (now - lastUsbT).TotalSeconds >= 10)
+          {
+            lastUsbT = now;
+            var cu = c;
+            _ = Task.Run(() => Enforcer.UsbTamperHeal(cu));
+          }
+          // קבצים חסומים שההרשאות שלהם שונו (מעקב ההרשאות ב-Watch1). רץ בתור של הסריקות, ולא בזמן סריקה מלאה (היא נועלת ממילא)
+          if (!quiet)
+            secPend.Clear(); // שינויים בזמן החלה/ביטול הם של התוכנה עצמה
+          else if (!secPend.IsEmpty && (now - lastSec).TotalSeconds >= 2 && scanTask.IsCompleted && !Enforcer.ScanRunning)
+          {
+            lastSec = now;
+            var batch = secPend.Keys.Take(5000).ToList();
+            foreach (var bp in batch)
+              secPend.TryRemove(bp, out _);
+            var mp = curMap;
+            scanTask = Task.Run(() =>
+            {
+              Enforcer.BgEnter();
+              try
+              {
+                Enforcer.RecheckLocks(mp, batch);
+              }
+              catch (Exception __e)
+              {
+                Diag.Log(__e);
+              }
+              finally
+              {
+                Enforcer.BgExit();
+              }
+            });
+          }
         }
         else
+        {
           while (q.TryDequeue(out _)) { }
+          secPend.Clear();
+        }
+        // הגדרות השירות ברישום ומפתחות Safe Mode – תמיד (גם כשהחסימות כבויות), מיד אחרי שינוי ברישום
+        if ((now - lastSvc).TotalSeconds >= 30)
+        {
+          lastSvc = now;
+          SvcGuard.Heal(removing);
+          Trust.Heal(removing);
+          Enforcer.GuardOwnIfeo(removing);
+          if (!removing && c.AdvOpts.SafeBoot && Enforcer.SafeBootHeal())
+            Alerts.Log("מפתחות Safe Mode של שירות ההגנה נמחקו – שוחזרו");
+        }
         // פעולות שהמתינו: ביטול/החלה של הגבלות למשתמש שלא היה מחובר, והחזרה לפעולה של מתאמי רשת והתקנים שלא חזרו בביטול
         if (
           (now - lastPend).TotalSeconds >= 15
@@ -1297,11 +1611,40 @@ public static class Program
               regs = Enforcer.RegWants(c);
             }
             Enforcer.ProcessDevPending(c, blocking);
+            Enforcer.ProcessLsaPending(c, blocking);
           }
           catch (Exception __e)
           {
             Diag.Log(__e);
           }
+        }
+        // קבצים שהועברו ממקומם בזמן החסימה ולא שוחררו (Enforcer.ProcessLost). רץ בתור של הסריקות, כדי לא לרוץ במקביל לסריקה מלאה
+        if ((now - lastLost).TotalSeconds >= 60 && stamp != DateTime.MinValue && scanTask.IsCompleted && !Enforcer.Applying() && Enforcer.HasLost())
+        {
+          lastLost = now;
+          var mp = curMap;
+          HashSet<string> keepAcl;
+          lock (c.Applied)
+            keepAcl = c
+              .Applied.Where(x => x.StartsWith("acl|"))
+              .Select(x => x.Split('|')[1])
+              .ToHashSet(StringComparer.OrdinalIgnoreCase);
+          scanTask = Task.Run(() =>
+          {
+            Enforcer.BgEnter();
+            try
+            {
+              Enforcer.ProcessLost(mp, keepAcl);
+            }
+            catch (Exception __e)
+            {
+              Diag.Log(__e);
+            }
+            finally
+            {
+              Enforcer.BgExit();
+            }
+          });
         }
         if ((now - lastSweep).TotalSeconds >= 30)
         {
@@ -1333,7 +1676,12 @@ public static class Program
       {
         Diag.Log(__e);
       }
-      Thread.Sleep(1000);
+      // שינה עד שנייה, או עד שינוי ברישום / ברשת (RegWatch). לפחות רבע שנייה בין סבבים, כדי שרצף שינויים לא יעסיק את המעבד
+      RegWatch.Wake.WaitOne(1000);
+      var since = (DateTime.UtcNow - lastIter).TotalMilliseconds;
+      if (since >= 0 && since < 250)
+        Thread.Sleep(250 - (int)since);
+      lastIter = DateTime.UtcNow;
     }
   }
 

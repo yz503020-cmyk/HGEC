@@ -229,6 +229,100 @@ static class Native
     }
   }
 
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  static extern nint CreateFileW(string name, uint access, uint share, nint sec, uint disp, uint flags, nint tmpl);
+
+  [DllImport("kernel32.dll", SetLastError = true)]
+  static extern bool DeviceIoControl(nint h, uint code, byte[] inb, int inSize, byte[] outb, int outSize, out int ret, nint ov);
+
+  // האם הכונן מחובר דרך USB (או כרטיס SD/MMC). דיסק USB חיצוני מסווג ב-Windows כ"קבוע" (Fixed), ולכן אי אפשר לסמוך על DriveType.
+  // root = "E:\". בכל ספק מחזיר false
+  public static bool IsUsbBus(string root)
+  {
+    try
+    {
+      if (root.Length < 2 || root[1] != ':')
+        return false;
+      var h = CreateFileW(@"\\.\" + root[..2], 0, 3, 0, 3, 0, 0); // בלי הרשאות קריאה: מספיק לשאילתת מאפיינים
+      if (h == 0 || h == -1)
+        return false;
+      try
+      {
+        var q = new byte[12]; // STORAGE_PROPERTY_QUERY: StorageDeviceProperty, PropertyStandardQuery
+        var o = new byte[1024];
+        if (!DeviceIoControl(h, 0x002D1400, q, q.Length, o, o.Length, out var n, 0) || n < 32) // IOCTL_STORAGE_QUERY_PROPERTY
+          return false;
+        var bus = BitConverter.ToInt32(o, 28); // STORAGE_DEVICE_DESCRIPTOR.BusType
+        return bus == 7 || bus == 12 || bus == 13; // Usb, Sd, Mmc
+      }
+      finally
+      {
+        CloseHandle(h);
+      }
+    }
+    catch
+    {
+      return false;
+    }
+  }
+
+  // חשבונות המערכת (SYSTEM, LocalService, NetworkService). משתמש רגיל לא יכול להריץ תוכנה בחשבונות האלה
+  public static bool IsServiceSid(string? sid) => sid == "S-1-5-18" || sid == "S-1-5-19" || sid == "S-1-5-20";
+
+  public static bool IsServiceAccount()
+  {
+    try
+    {
+      using var id = WindowsIdentity.GetCurrent();
+      return IsServiceSid(id.User?.Value);
+    }
+    catch
+    {
+      return false;
+    }
+  }
+
+  [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+  static extern int CM_Locate_DevNodeW(out uint dev, string id, int flags);
+
+  [DllImport("cfgmgr32.dll")]
+  static extern int CM_Get_DevNode_Status(out uint status, out uint problem, uint dev, int flags);
+
+  // מצב התקן לפי מזהה המופע: -1 = לא מחובר כרגע, 1 = מושבת (CM_PROB_DISABLED), 0 = מחובר ולא מושבת. בדיקה זולה (בלי PowerShell)
+  public static int DevState(string id)
+  {
+    try
+    {
+      if (CM_Locate_DevNodeW(out var d, id, 0) != 0) // CM_LOCATE_DEVNODE_NORMAL: רק התקנים מחוברים
+        return -1;
+      if (CM_Get_DevNode_Status(out _, out var pr, d, 0) != 0)
+        return 0;
+      return pr == 22 ? 1 : 0;
+    }
+    catch
+    {
+      return 0;
+    }
+  }
+
+  // מנקה את סימון "מושבת" של התקן שאינו מחובר (CONFIGFLAG_DISABLED ברישום). כשיחובר שוב – יעבוד כרגיל. רק בשירות (SYSTEM)
+  public static bool ClearDisabledFlag(string id)
+  {
+    try
+    {
+      using var k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Enum\" + id, true);
+      if (k == null)
+        return false;
+      if (k.GetValue("ConfigFlags") is int f && (f & 1) != 0)
+        k.SetValue("ConfigFlags", f & ~1, Microsoft.Win32.RegistryValueKind.DWord);
+      return true;
+    }
+    catch
+    {
+      return false;
+    }
+  }
+
   public static bool IsSystemContext()
   {
     try

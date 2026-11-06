@@ -135,6 +135,7 @@ public partial class MainWin
     IsEnabled = false;
     busy = true;
     status.Text = "מסיר...";
+    string? lsaWarn = null;
     try
     {
       await Task.Factory.StartNew(
@@ -152,6 +153,21 @@ public partial class MainWin
           {
             err = x;
           }
+          // שחרורים שהמתינו לכונן שלא היה מחובר: אחרי ההסרה אין מי שינסה שוב
+          try
+          {
+            Enforcer.ProcessPathPending(C);
+          }
+          catch (Exception __e)
+          {
+            Diag.Log(__e);
+          }
+          // זכויות מנהל שלא הוחזרו בביטול (ההקשחה החזקה): אחרי ההסרה אין שירות שינסה שוב – מנסים עכשיו, ואם לא הצליח – מודיעים
+          Enforcer.ProcessLsaPending(C, false);
+          if (Enforcer.HasLsaPending())
+            lsaWarn = (
+              "חלק מזכויות המנהל שהוסרו בהקשחה החזקה לא הוחזרו. אפשר להחזיר אותן ב-secpol.msc (מדיניות מקומית ← הקצאת זכויות משתמש): גיבוי קבצים, שחזור קבצים, לקיחת בעלות, ניפוי באגים – לקבוצת Administrators"
+            );
           Enforcer.PurgeAll();
           // אחרי ההסרה אין שירות שישחרר קבצים מאוחר יותר: סורקים את כל הכוננים ומשחררים כל קובץ שעדיין נעול על ידינו
           // (גם קבצים שהועברו ממקומם בזמן החסימה, וגם אם יומן החסימות נפגע)
@@ -174,7 +190,7 @@ public partial class MainWin
       {
         Config.Token = null;
         status.Text = "";
-        Say("השירות יוסר בעוד מספר שניות");
+        Say("השירות יוסר בעוד מספר שניות" + (lsaWarn != null ? "\n\nשים לב: " + lsaWarn : ""));
       }
       else
       {

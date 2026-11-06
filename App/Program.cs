@@ -1581,14 +1581,14 @@ public static class Program
           while (q.TryDequeue(out _)) { }
           secPend.Clear();
         }
-        // הגדרות השירות ברישום ומפתחות Safe Mode – תמיד (גם כשהחסימות כבויות), מיד אחרי שינוי ברישום
+        // הגדרות השירות ברישום – תמיד (גם כשהחסימות כבויות); מפתחות Safe Mode – רק כשהמתג הראשי פעיל. מיד אחרי שינוי ברישום
         if ((now - lastSvc).TotalSeconds >= 30)
         {
           lastSvc = now;
           SvcGuard.Heal(removing);
           Trust.Heal(removing);
           Enforcer.GuardOwnIfeo(removing);
-          if (!removing && c.AdvOpts.SafeBoot && Enforcer.SafeBootHeal())
+          if (!removing && c.Master && c.AdvOpts.SafeBoot && Enforcer.SafeBootHeal())
             Alerts.Log("מפתחות Safe Mode של שירות ההגנה נמחקו – שוחזרו");
         }
         // פעולות שהמתינו: ביטול/החלה של הגבלות למשתמש שלא היה מחובר, והחזרה לפעולה של מתאמי רשת והתקנים שלא חזרו בביטול
@@ -1612,6 +1612,9 @@ public static class Program
             }
             Enforcer.ProcessDevPending(c, blocking);
             Enforcer.ProcessLsaPending(c, blocking);
+            var np = Enforcer.ProcessPathPending(c); // קבצים/תיקיות שהיו בכונן לא מחובר בזמן הביטול
+            if (np > 0)
+              Alerts.Log($"שוחררו {np} קבצים/תיקיות שהמתינו לחיבור הכונן", false);
           }
           catch (Exception __e)
           {

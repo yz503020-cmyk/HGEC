@@ -66,6 +66,7 @@ public static class Program
   static DateTime authLock = DateTime.MinValue;
   static int applyBusy;
   static DateTime reconBackoff = DateTime.MinValue;
+  static volatile bool reapply; // נמצא יומן של החלה שנקטעה בשירות: בזמן חסימה מחילים שוב (הביטול הרך מבטל את החלקי, וההחלה משלימה)
   static volatile bool overflow;
   static int qBusy; // תהליכון הרקע של הקבצים החדשים רץ
   static volatile bool netChanged; // שינוי ברשת (מתאם הופעל / חובר) – בדיקת מתאמים מיידית
@@ -133,7 +134,10 @@ public static class Program
   static bool TokenOk(string t)
   {
     if (tokens.TryGetValue(t, out var d) && (DateTime.UtcNow - d).TotalHours < 8)
+    {
+      tokens[t] = DateTime.UtcNow; // תוקף מתחדש בכל שימוש: חלון שפתוח יום שלם לא מאבד את הטוקן באמצע עבודה
       return true;
+    }
     tokens.TryRemove(t, out _);
     return false;
   }
@@ -263,7 +267,7 @@ public static class Program
       return;
     bool need = Blocking(c),
       applied = c.State == 1 || c.Applied.Count > 0;
-    if (need && !applied && c.AnyOn() && (c.Sched.On || c.TempOpenUntil != 0))
+    if (need && c.AnyOn() && (reapply || (!applied && (c.Sched.On || c.TempOpenUntil != 0))))
       Job(true);
     else if (!need && applied)
       Job(false);
@@ -297,6 +301,7 @@ public static class Program
             Alerts.Log("מחוץ לחלון הזמנים: החסימות הוסרו", false);
             Enforcer.Release(cfg);
           }
+          reapply = false;
         }
         catch (Exception x)
         {
@@ -696,6 +701,9 @@ public static class Program
           return "OK";
         }
         case "RULE":
+          // שם החוק והנתיב החסום נמסרים רק לשער (השער הקל / המלא) ולחלון המורם – לא לכל תוכנה שמתחברת
+          if (!admin && !FromGate(clientPid))
+            return "DENY";
           return RuleInfo(p[1], p.Length > 2 && p[2].Length > 0 ? string.Join("|", p.Skip(2)) : sid); // בלי SID – משתמשים בזהות של הלקוח
         case "VERIFY":
         {
@@ -818,6 +826,9 @@ public static class Program
         }
         case "RELOCK":
         {
+          // רק השער שפתח בקוד (או החלון המורם): תוכנה אחרת לא יכולה לנעול באמצע פריט שנפתח בקוד
+          if (!admin && !FromGate(clientPid))
+            return "DENY";
           lease.TryRemove(p[1], out _);
           DropTokens(p[1]);
           var c = cur;
@@ -1412,6 +1423,10 @@ public static class Program
             {
               pendingDone = true;
               Enforcer.RelockPending(nc);
+              // החלה של השירות שנקטעה (כיבוי בתחילת חלון הזמנים, הפסקת חשמל): מה שכבר שונה נרשם עכשיו, כך שהביטול יבטל אותו.
+              // אם החסימה אמורה להיות פעילה – מחילים שוב, כדי להשלים את מה שלא הוחל
+              if (Enforcer.RecoverJournal(nc))
+                reapply = Blocking(nc);
             }
             var sig = MapSig(nc); // סורקים מחדש רק אם משהו שמשפיע על חסימת הקבצים השתנה (ולא בכל שמירה של הגדרה כלשהי)
             if (sig != lastSig)
@@ -1796,6 +1811,18 @@ public static class Program
       Enforcer.TryStartService(); // אם השירות מותקן אך כבוי – מפעילים אותו, אחרת אי אפשר לשמור הגדרות
       if (Code != null && Config.Up() && !Config.Auth(Code))
         MainWin.Say("האימות מול שירות ההגנה נכשל (ייתכן שיש נעילה זמנית אחרי ניסיונות שגויים)");
+      // החלה מהחלון שנקטעה באמצע (החלון נסגר בכוח, המחשב כבה): מה שכבר שונה נרשם עכשיו, כדי שהביטול יבטל אותו
+      try
+      {
+        if (Enforcer.RecoverJournal(c))
+          MainWin.Say(
+            "ההחלה הקודמת נקטעה באמצע. השינויים שכבר נעשו במחשב נרשמו, ויבוטלו בביטול החסימה.\n\nמומלץ ללחוץ 'החל שינויים' כדי להשלים את ההחלה."
+          );
+      }
+      catch (Exception __e)
+      {
+        Diag.Log(__e);
+      }
       if (string.IsNullOrEmpty(c.OwnerSid))
       {
         c.OwnerSid = Native.InteractiveUserSid();

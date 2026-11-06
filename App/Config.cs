@@ -281,6 +281,27 @@ public class Config
     }
   }
 
+  // פקודה מאומתת בטוקן: אם השירות דוחה את הטוקן (פג אחרי 8 שעות, או שהשירות הופעל מחדש) – אימות מחדש בקוד הכניסה וניסיון נוסף.
+  // build מקבל את הטוקן ומחזיר את הפקודה. null = השירות לא זמין; "DENY" = לא ניתן היה לאמת
+  public static string? PipeAuth(Func<string, string> build, int ms = 3000)
+  {
+    for (int i = 0; i < 2; i++)
+    {
+      if (Token == null)
+      {
+        if (Program.Code == null)
+          return Up(300) ? "DENY" : null;
+        if (!Auth(Program.Code))
+          return Up(300) ? "DENY" : null;
+      }
+      var r = Pipe(build(Token!), ms);
+      if (r != "DENY")
+        return r;
+      Token = null;
+    }
+    return "DENY";
+  }
+
   public static bool Auth(string code)
   {
     var t = Pipe("AUTH|" + code);

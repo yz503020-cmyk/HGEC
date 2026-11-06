@@ -269,6 +269,13 @@ public partial class MainWin : Window
     StartSync();
     Closing += (s, e) =>
     {
+      // סגירה באמצע החלה/ביטול/הסרה הייתה עוצרת אותם באמצע (העבודה רצה בתהליכון רקע של אותו תהליך)
+      if (busy)
+      {
+        e.Cancel = true;
+        Say("פעולה עדיין מתבצעת. המתן שתסתיים ואז סגור את החלון.");
+        return;
+      }
       syncTmr?.Stop();
     };
   }

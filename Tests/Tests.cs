@@ -177,7 +177,7 @@ public class DangerousPathTests
   [Fact]
   public void JunctionToSystemFolderIsDangerous()
   {
-    var root = Path.Combine(Path.GetTempPath(), "dg-junction-" + Guid.NewGuid().ToString("N"));
+    var root = Path.Combine(Sys + "\\", "dg-junction-" + Guid.NewGuid().ToString("N")); // לא בתיקייה הזמנית: היא בתוך AppData (שאסור לחסום ממילא)
     Directory.CreateDirectory(root);
     try
     {

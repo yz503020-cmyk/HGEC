@@ -42,6 +42,7 @@ public class AdvOpts
     NoProxy;
   public bool Browsers = true; // כיבוי DoH וגלישה פרטית בדפדפנים
   public bool SafeBoot = true; // השירות רץ גם ב-Safe Mode
+  public bool StrongAdmin; // הקשחה חזקה (כבוי כברירת מחדל): בזמן החסימה מנהלים מאבדים את זכויות הגיבוי/שחזור, לקיחת בעלות ודיבאג
 }
 
 // תזמון: החסימות פעילות רק בתוך החלון (מחוץ לו הכול נפתח אוטומטית)
@@ -329,7 +330,13 @@ public class Config
     catch (UnauthorizedAccessException)
     {
       // התיקייה נעולה (רק השירות כותב אליה) והשירות לא עונה: כתיבה בעזרת הרשאת השחזור של מנהל מורם
-      if (File.Exists(CfgPath) && Enforcer.WriteFileBackup(CfgPath, json))
+      // חתימה בקוד הכניסה: כשהשירות יחזור לעבוד הוא יקבל את הקובץ (קובץ לא חתום שנכתב מבחוץ – משוחזר)
+      if (
+        File.Exists(CfgPath)
+        && Program.Code != null
+        && Enforcer.WriteFileBackup(CfgPath, json)
+        && Enforcer.WriteFileBackup(Trust.SigPath, Trust.Sign(Trust.Derive(Program.Code, AppCode), json))
+      )
         return;
       throw new IOException("שירות ההגנה אינו פעיל, ולכן לא ניתן לשמור. המתן רגע ונסה שוב, או הפעל מחדש את המחשב");
     }
@@ -385,6 +392,8 @@ public class Config
       Diag.Log(__e);
     }
     File.Move(tmp, CfgPath, true);
+    if (InService)
+      Trust.SaveGood(json); // עותק מהימן במפתח רישום מוגן
   }
 
   public static void SecureFile(string p)

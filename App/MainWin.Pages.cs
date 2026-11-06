@@ -153,8 +153,9 @@ public partial class MainWin
             err = x;
           }
           Enforcer.PurgeAll();
-          // אחרי ההסרה אין שירות שיחפש קבצים שהועברו ממקומם בזמן החסימה – משחררים אותם עכשיו
-          Enforcer.ProcessLost(new(), new(StringComparer.OrdinalIgnoreCase));
+          // אחרי ההסרה אין שירות שישחרר קבצים מאוחר יותר: סורקים את כל הכוננים ומשחררים כל קובץ שעדיין נעול על ידינו
+          // (גם קבצים שהועברו ממקומם בזמן החסימה, וגם אם יומן החסימות נפגע)
+          Enforcer.SweepAll(C);
           if (err != null)
             throw new IOException("החסימות בוטלו, אך " + err.Message, err);
         },
@@ -1075,6 +1076,38 @@ public partial class MainWin
       v => C.AdvOpts.NoTcpip = v
     );
     Opt("נעילת קובץ hosts", "מונע עריכת קובץ hosts (עקיפת סינון בדרך זו).", () => C.AdvOpts.LockHosts, v => C.AdvOpts.LockHosts = v);
+    // הקשחה חזקה: כבויה כברירת מחדל, ומבקשת אישור עם הסבר לפני ההפעלה
+    var strong = new CheckBox
+    {
+      Content = "הקשחה חזקה נגד מנהל (מתקדם)",
+      IsChecked = C.AdvOpts.StrongAdmin,
+      Margin = new Thickness(18, 4, 0, 4),
+    };
+    strong.Click += (s, e) =>
+    {
+      if (
+        strong.IsChecked == true
+        && !Say(
+          "בזמן החסימה, חשבונות מנהל יאבדו את הזכויות: גיבוי ושחזור קבצים, לקיחת בעלות ודיבאג.\n"
+            + "כך מנהל לא יוכל להעתיק קבצים חסומים (למשל robocopy /B), לקחת בעלות על הגדרות ההגנה או לסגור את השירות ממנהל המשימות.\n\n"
+            + "שימו לב:\n• השינוי נכנס לתוקף רק אחרי יציאה וכניסה מחדש למשתמש.\n"
+            + "• בזמן החסימה כלי גיבוי שרצים כמנהל (robocopy /B, wbadmin), דיבאגרים ולקיחת בעלות לא יעבדו.\n"
+            + "• אם שירות ההגנה מפסיק לעבוד בזמן החסימה, ייתכן שלא אפשר יהיה לשמור את ביטול החסימות מהחלון עד שהשירות יחזור.\n"
+            + "• הזכויות חוזרות אוטומטית בביטול החסימה, בסוף חלון הזמנים ובהסרת התוכנה. אפשר גם להחזיר ידנית ב-secpol.msc (מדיניות מקומית › הקצאת זכויות משתמש).\n\n"
+            + "להפעיל?",
+          "הקשחה חזקה",
+          yesNo: true
+        )
+      )
+      {
+        strong.IsChecked = false;
+        return;
+      }
+      C.AdvOpts.StrongAdmin = strong.IsChecked == true;
+      C.Save();
+    };
+    Theme.Tipped(strong, "בזמן החסימה מנהלים מאבדים את זכויות הגיבוי/שחזור, לקיחת בעלות ודיבאג. נכנס לתוקף בכניסה הבאה למשתמש.");
+    sp.Children.Add(strong);
     var sb = new CheckBox
     {
       Content = "השירות פועל גם ב-Safe Mode (מומלץ)",

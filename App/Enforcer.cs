@@ -571,8 +571,18 @@ public static class Enforcer
   // ---------- החלה ----------
   static string ApplyFlag => System.IO.Path.Combine(Config.Dir, "var", "applying.flag");
 
+  // החלה/ביטול רץ כרגע. בשירות: לפי הזיכרון בלבד – החלה של השירות עצמו, או הודעה מהחלון דרך ה-Pipe (מאומתת בקוד הכניסה).
+  // הקובץ applying.flag בתיקיית var (שמנהלים יכולים לכתוב אליה) כבר לא נחשב בשירות: עדכון שלו כל כמה דקות כיבה את כל השחזורים.
+  // הוא עדיין נכתב, לטובת שירות מגרסה ישנה בזמן עדכון
+  static int localApplying;
+  static long uiApplyUntil; // ticks (UTC)
+
+  public static void UiApplying(bool on) => Interlocked.Exchange(ref uiApplyUntil, on ? DateTime.UtcNow.AddMinutes(5).Ticks : 0);
+
   public static bool Applying()
   {
+    if (InService)
+      return Volatile.Read(ref localApplying) > 0 || DateTime.UtcNow.Ticks < Interlocked.Read(ref uiApplyUntil);
     try
     {
       var f = ApplyFlag;
@@ -660,17 +670,24 @@ public static class Enforcer
   {
     readonly System.Threading.Timer t;
     volatile bool done;
+    static ApplyingFlag? current; // בחלון: ההחלה שרצה עכשיו (לשליחה מחדש לשירות חדש שהותקן באמצע)
 
     public ApplyingFlag()
     {
+      if (InService)
+        Interlocked.Increment(ref localApplying);
+      else
+        current = this;
       Touch();
-      t = new System.Threading.Timer(_ => Touch(), null, 60_000, 60_000);
+      t = new System.Threading.Timer(_ => Touch(), null, 20_000, 20_000);
     }
 
     void Touch()
     {
       if (done)
         return;
+      if (!InService)
+        Notify(true);
       try
       {
         Directory.CreateDirectory(System.IO.Path.GetDirectoryName(ApplyFlag)!);
@@ -682,10 +699,40 @@ public static class Enforcer
       }
     }
 
+    static void Notify(bool on)
+    {
+      try
+      {
+        if (Config.Token != null)
+          Config.Pipe($"APPLYING|{Config.Token}|{(on ? 1 : 0)}", 2000);
+      }
+      catch (Exception __e)
+      {
+        Diag.Log(__e);
+      }
+    }
+
+    // השירות הותקן/עודכן באמצע ההחלה: מודיעים לו מיד (בלי זה הוא היה "משחזר" באמצע ההחלה)
+    public static void Resend()
+    {
+      if (current is { done: false })
+        Notify(true);
+    }
+
     public void Dispose()
     {
+      if (done)
+        return;
       done = true;
       t.Dispose();
+      if (InService)
+        Interlocked.Decrement(ref localApplying);
+      else
+      {
+        Notify(false);
+        if (current == this)
+          current = null;
+      }
       try
       {
         File.Delete(ApplyFlag);
@@ -842,7 +889,7 @@ public static class Enforcer
     Task<string>? netT = c.Net.On
       ? Task.Run(() =>
         PS(
-          "Get-NetAdapter | % { $w = ($_.PhysicalMediaType -like '*802.11*' -or $_.InterfaceDescription -match 'Wireless|Wi-Fi'); $(if ($w) { 'W' } else { 'E' }) + '|' + $_.Status + '|' + $_.Name }"
+          "Get-NetAdapter | % { $w = ($_.PhysicalMediaType -like '*802.11*' -or $_.InterfaceDescription -match 'Wireless|Wi-Fi'); $(if ($w) { 'W' } else { 'E' }) + '|' + $_.Status + '|' + $_.PnPDeviceID + '|' + $_.Name }"
         )
       )
       : null;
@@ -862,18 +909,24 @@ public static class Enforcer
       var adapterWhite = c.Net.White.Where(w => !w.StartsWith("ssid:")).ToList();
       var nl = Lines(netT!.Result);
       // מתאמי רשת שאינם Wi-Fi (Ethernet וכדומה): נחסמים כולם חוץ מהרשימה הלבנה; מתאם שכבר מושבת לא נוגעים בו שוב
+      // שורה: סוג|מצב|מזהה התקן|שם. מזהה ההתקן נשמר בנוסף לשם (netpnp): מתאם שלא מחובר בזמן הביטול (מתאם רשת ב-USB)
+      // לא מופיע לפי השם, ובלי המזהה היה נשאר מושבת כשמחברים אותו שוב
       foreach (var l in nl)
       {
-        var q = l.Split('|', 3);
-        if (q.Length < 3 || q[0] != "E" || adapterWhite.Contains(q[2]))
+        var q = l.Split('|', 4);
+        if (q.Length < 4 || q[0] != "E" || adapterWhite.Contains(q[3]))
           continue;
         if (q[1] != "Disabled")
         {
-          netCmds.Add($"Disable-NetAdapter -Name '{Q(q[2])}' -Confirm:$false");
-          AddA(c, "net|" + q[2]);
+          netCmds.Add($"Disable-NetAdapter -Name '{Q(q[3])}' -Confirm:$false");
+          AddA(c, "net|" + q[3]);
         }
-        else if (prevNet.ContainsKey(q[2]))
-          AddA(c, "net|" + q[2]);
+        else if (prevNet.ContainsKey(q[3]))
+          AddA(c, "net|" + q[3]);
+        else
+          continue;
+        if (q[2].Length > 0)
+          AddA(c, $"netpnp|{q[2]}|{q[3]}");
       } // מתאם שהיה מושבת לפני כן (לא על ידינו) לא יופעל בביטול
       // Wi-Fi: חסימה לפי שם הרשת (SSID). נשלח ישירות ל-netsh (בלי PowerShell), כדי ששם רשת זדוני לא יוכל להריץ פקודות.
       // המסנן נוסף תמיד – גם כשאין כרגע מתאם Wi-Fi – כדי שמתאם Wi-Fi ב-USB שיחובר אחר כך לא יעקוף את החסימה (וגם NetAdapterHeal מוסיף אותו שוב כשמתאם כזה מופיע)
@@ -1302,6 +1355,8 @@ public static class Enforcer
       SetReg(c, "HKLM", @"SOFTWARE\Policies\Microsoft\Windows\Network Connections", "NC_AllowAdvancedTCPIPConfig", 0);
     if (a.NoProxy)
       SetReg(c, "HKLM", @"SOFTWARE\Policies\Microsoft\Internet Explorer\Control Panel", "Proxy", 1); // מונע הגדרת Proxy (עקיפת סינון) בהגדרות המערכת, שמשפיעות גם על Chrome ו-Edge
+    if (a.StrongAdmin)
+      StrongApply(c);
     if (a.LockHosts)
     {
       try
@@ -1320,6 +1375,37 @@ public static class Enforcer
         Diag.Log(__e);
       }
     }
+  }
+
+  // ---- הקשחה חזקה (אופציונלית) ----
+  // בזמן החסימה: מנהלים (וקבוצת Backup Operators, וחשבונות משתמש שקיבלו את הזכות ישירות) מאבדים את הזכויות שבעזרתן עוקפים הכול:
+  // גיבוי/שחזור (קריאה וכתיבה של כל קובץ, למשל robocopy /B), לקיחת בעלות, ודיבאג (סגירת השירות ממנהל המשימות).
+  // נכנס לתוקף בכניסה הבאה למשתמש. כל זכות שהוסרה נרשמת (lsaright) ומוחזרת בביטול / בסוף חלון הזמנים / בהסרה.
+  // חשבונות המערכת והשירותים (SYSTEM, NT SERVICE\...) לא נוגעים בהם – Windows ממשיך לעבוד כרגיל
+  static readonly string[] StrongRights = { "SeBackupPrivilege", "SeRestorePrivilege", "SeTakeOwnershipPrivilege", "SeDebugPrivilege" };
+
+  static bool StrongTarget(string sid) => sid == "S-1-5-32-544" || sid == "S-1-5-32-551" || sid.StartsWith("S-1-5-21-");
+
+  static void StrongApply(Config c)
+  {
+    foreach (var r in StrongRights)
+      foreach (var sid in (Lsa.Holders(r) ?? new()).Where(StrongTarget))
+        if (Lsa.Change(sid, r, false))
+          AddA(c, $"lsaright|{sid}|{r}");
+  }
+
+  // נקרא מהשירות: זכות שהוחזרה בזמן החסימה (למשל דרך secpol.msc) מוסרת שוב. השינוי של מנהל ייכנס לתוקף רק בכניסה הבאה – והשירות מקדים אותו
+  public static void StrongHeal(Config c)
+  {
+    if (!c.Master || !c.Adv.On || !c.AdvOpts.StrongAdmin || Applying())
+      return;
+    var back = new List<string>();
+    foreach (var r in StrongRights)
+      foreach (var sid in (Lsa.Holders(r) ?? new()).Where(StrongTarget))
+        if (Lsa.Change(sid, r, false))
+          back.Add(r + " (" + sid + ")");
+    if (back.Count > 0)
+      Alerts.Log("זכויות מנהל שהוסרו בהקשחה החזקה הוחזרו – הוסרו שוב: " + string.Join(", ", back));
   }
 
   static string HostsPath => System.IO.Path.Combine(Environment.SystemDirectory, @"drivers\etc\hosts");
@@ -1470,6 +1556,35 @@ public static class Enforcer
     }
     return t[(end + 1)..].TrimStart().StartsWith("--gate", StringComparison.Ordinal)
       && string.Equals(dir, CdT, StringComparison.OrdinalIgnoreCase);
+  }
+
+  // IFEO על הקבצים של DeviceGuard עצמו (Debugger, GlobalFlag, מסנני נתיב...) היה מאפשר לחטוף את השער – כל תוכנה חסומה הייתה רצה דרך כלי אחר –
+  // או למנוע מהשירות לעלות. השירות מוחק כל הגדרה כזו מיד (RegWatch). DeviceGuard עצמו אף פעם לא כותב לשם (IsCritical)
+  public static void GuardOwnIfeo(bool removing)
+  {
+    if (removing)
+      return;
+    var names = new List<string> { "DeviceGuard.exe", "DeviceGuardWatch.exe", "DeviceGuardGate.exe" };
+    if (!string.IsNullOrEmpty(UiExe))
+      names.Add(System.IO.Path.GetFileName(UiExe));
+    foreach (var v in Views)
+      try
+      {
+        using var b = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, v);
+        using var ifeo = b.OpenSubKey(IFEO.TrimEnd('\\'), true);
+        if (ifeo == null)
+          continue;
+        foreach (var n in ifeo.GetSubKeyNames())
+          if (names.Contains(n, StringComparer.OrdinalIgnoreCase))
+          {
+            ifeo.DeleteSubKeyTree(n, false);
+            Alerts.Log("זוהתה הגדרת IFEO על קובץ של DeviceGuard (" + n + ") – נמחקה");
+          }
+      }
+      catch (Exception __e)
+      {
+        Diag.Log(__e);
+      }
   }
 
   // מוחק כל שער של DeviceGuard מהרישום (גם יתומים שאינם רשומים ב-Applied)
@@ -2830,6 +2945,28 @@ public static class Enforcer
     }
   }
 
+  // הסרת התוכנה: סריקה של כל הכוננים (כולל נשלפים) לכל סוגי הקבצים שאי פעם יכלו להיחסם, ושחרור כל קובץ שעדיין יש בו את כלל החסימה שלנו.
+  // רשת ביטחון למקרה שיומן החסימות נפגע – אחרי ההסרה אין שירות שישחרר מאוחר יותר
+  public static void SweepAll(Config c)
+  {
+    try
+    {
+      var exts = Config.Vid.Concat(Config.Aud).Concat(Config.Img)
+        .Concat(c.Exts.Select(r => r.Path.TrimStart('.').ToLowerInvariant()))
+        .Where(x => x.Length > 0 && !Config.Danger.Contains(x))
+        .Distinct()
+        .ToList();
+      foreach (var d in DriveInfo.GetDrives().Where(d => (d.DriveType == DriveType.Fixed || d.DriveType == DriveType.Removable) && d.IsReady))
+        foreach (var x in exts)
+          AddLost(System.IO.Path.Combine(d.RootDirectory.FullName, "x." + x));
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
+    }
+    ProcessLost(new(), new(StringComparer.OrdinalIgnoreCase));
+  }
+
   static List<string> CrawlExt(string root, List<string> exts, CancellationToken ct)
   {
     var set = new HashSet<string>(exts.Select(e => "." + e), StringComparer.OrdinalIgnoreCase);
@@ -3384,6 +3521,7 @@ public static class Enforcer
 
   // מתאמי רשת חדשים (מתאם USB, שיתוף אינטרנט מהטלפון) שחוברו אחרי ההחלה: נחסמים אוטומטית. הבדיקה זולה (ללא PowerShell כשאין חדש)
   static string NetHealFile => System.IO.Path.Combine(Config.Dir, "var", "netheal.txt");
+  static string NetHealPnpFile => System.IO.Path.Combine(Config.Dir, "var", "netheal.pnp"); // מזהה|שם
   static readonly ConcurrentDictionary<string, DateTime> adBackoff = new(StringComparer.OrdinalIgnoreCase);
 
   static List<string> WlanArgs(List<string> ssidWhite)
@@ -3446,7 +3584,28 @@ public static class Enforcer
         .ToList();
       if (bad.Count == 0)
         return;
-      PSAll(bad.Select(n => $"Disable-NetAdapter -Name '{Q(n)}' -Confirm:$false").ToList());
+      // לפני ההשבתה נרשם גם מזהה ההתקן (netheal.pnp): מתאם USB שינותק עד הביטול יקבל בחזרה את מצבו לפי המזהה
+      var outp = PS(
+        string.Join(
+          "\n",
+          bad.Select(n =>
+            $"$a = Get-NetAdapter -Name '{Q(n)}' -ErrorAction SilentlyContinue; if ($a) {{ 'P|' + $a.PnPDeviceID + '|' + $a.Name; Disable-NetAdapter -Name '{Q(n)}' -Confirm:$false }}"
+          )
+        )
+      );
+      try
+      {
+        var pl = Lines(outp).Where(l => l.StartsWith("P|")).Select(l => l[2..]).Where(l => l.Contains('|') && !l.StartsWith("|")).ToList();
+        if (pl.Count > 0)
+        {
+          Directory.CreateDirectory(System.IO.Path.GetDirectoryName(NetHealPnpFile)!);
+          File.AppendAllLines(NetHealPnpFile, pl);
+        }
+      }
+      catch (Exception __e)
+      {
+        Diag.Log(__e);
+      }
       Directory.CreateDirectory(System.IO.Path.GetDirectoryName(NetHealFile)!);
       File.AppendAllLines(NetHealFile, bad);
       // מתאם שלא הצליח להיחסם: לא מנסים (ולא מתריעים) שוב כל 15 שניות, אלא רק בעוד 10 דקות
@@ -3681,7 +3840,7 @@ public static class Enforcer
       return want;
     var o = PS(
       "Get-NetAdapter -ErrorAction SilentlyContinue | ? Status -eq 'Disabled' | % { 'net|' + $_.Name }\n"
-        + "Get-PnpDevice -ErrorAction SilentlyContinue | ? ConfigManagerErrorCode -eq 'CM_PROB_DISABLED' | % { 'usb|' + $_.InstanceId }\n"
+        + "Get-PnpDevice -ErrorAction SilentlyContinue | ? ConfigManagerErrorCode -eq 'CM_PROB_DISABLED' | % { 'usb|' + $_.InstanceId; 'pnp|' + $_.InstanceId }\n"
         + "'#OK'"
     );
     var l = Lines(o);
@@ -3737,6 +3896,8 @@ public static class Enforcer
             return false;
           if (key.StartsWith("net|"))
             return c.Net.On && !c.Net.White.Contains(key[4..]);
+          if (key.StartsWith("pnp|"))
+            return c.Net.On; // מתאם רשת לפי מזהה: בזמן חסימת רשת לא מחזירים
           return c.Usb.On && !c.Usb.White.Contains(key[4..]);
         }
         // אחרי יום של ניסיונות (288) ממשיכים, אבל פעם בשעה (כל 12 סבבים) – לא מוותרים: התקן שנשאר מושבת לא היה חוזר לעבוד אף פעם
@@ -3757,9 +3918,9 @@ public static class Enforcer
         foreach (var x in items)
         {
           bool tried = now.Contains(x);
-          // התקן USB שלא מחובר: מנקים את סימון ההשבתה ברישום, וכשיחובר שוב הוא יעבוד (התקן מושבת לא "מופיע", ולכן אין הזדמנות אחרת להפעיל אותו).
+          // התקן USB / מתאם רשת שלא מחובר: מנקים את סימון ההשבתה ברישום, וכשיחובר שוב הוא יעבוד (התקן מושבת לא "מופיע", ולכן אין הזדמנות אחרת להפעיל אותו).
           // הבדיקה הזו קודמת: התקן לא מחובר לא מופיע כ"מושבת" בשאילתת PowerShell, ולכן היה נחשב בטעות כאילו חזר לפעול
-          if (tried && x.Key.StartsWith("usb|") && Native.DevState(x.Key[4..]) == -1)
+          if (tried && (x.Key.StartsWith("usb|") || x.Key.StartsWith("pnp|")) && Native.DevState(x.Key[4..]) == -1)
           {
             if (Native.ClearDisabledFlag(x.Key[4..]))
               continue;
@@ -4151,6 +4312,7 @@ public static class Enforcer
     Config.Token = null;
     if (Program.Code != null)
       Config.Auth(Program.Code); // הטוקן הישן לא תקף אחרי התקנה/עדכון
+    ApplyingFlag.Resend();
   }
 
   // עדכון: ההרשאות של השירות לא מאפשרות עצירה/מחיקה למנהל, ולכן מבקשים מהשירות עצמו (בעזרת טוקן תקף) להסיר את עצמו, ואז מתקינים את הגרסה החדשה
@@ -4375,6 +4537,7 @@ public static class Enforcer
     var keepAd = keepNet ? c.Net.White.Where(w => !w.StartsWith("ssid:")).ToHashSet() : null;
     var ps = new List<string>();
     var enDev = new List<string>(); // מתאמים/התקנים שאמורים לחזור לפעול: נבדק אחרי הביצוע, ומה שלא חזר נשמר לניסיון חוזר
+    var pnpPend = new List<string>(); // מתאמי רשת שלא מחוברים כרגע (לפי מזהה התקן)
     List<string> all;
     lock (c.Applied)
       all = c.Applied.ToList();
@@ -4439,6 +4602,16 @@ public static class Enforcer
                 k.SetValue("Debugger", Encoding.UTF8.GetString(Convert.FromBase64String(p[3])));
             }
             break;
+          case "netpnp": // netpnp|מזהה|שם: מתאם שלא מחובר עכשיו – השירות ינקה את סימון ההשבתה שלו (כמו בהתקן USB)
+            if (p.Length >= 3)
+            {
+              var nm = string.Join("|", p[2..]);
+              if (keepAd != null && !keepAd.Contains(nm))
+                break; // נשאר חסום
+              if (Native.DevState(p[1]) == -1)
+                pnpPend.Add("pnp|" + p[1]);
+            }
+            break;
           case "net":
             if (keepAd != null && !keepAd.Contains(p[1]))
             {
@@ -4468,6 +4641,10 @@ public static class Enforcer
           case "task":
             Schtasks("/End /TN DeviceGuardWatch");
             Schtasks("/Delete /TN DeviceGuardWatch /F");
+            break;
+          case "lsaright": // lsaright|SID|זכות: מחזירים זכות שהוסרה בהקשחה החזקה
+            if (p.Length >= 3)
+              Lsa.Change(p[1], p[2], true);
             break;
           case "hostslock":
           {
@@ -4569,6 +4746,24 @@ public static class Enforcer
           File.Delete(NetHealFile);
         else if (back.Count > 0)
           File.WriteAllLines(NetHealFile, rest);
+        // מתאמים שחוזרים לפעול אבל לא מחוברים עכשיו: לפי מזהה ההתקן (השירות ינקה את סימון ההשבתה)
+        if (File.Exists(NetHealPnpFile))
+        {
+          var pl = File.ReadAllLines(NetHealPnpFile).Where(l => l.Contains('|')).Distinct().ToList();
+          var backSet = back.ToHashSet(StringComparer.OrdinalIgnoreCase);
+          var done = pl.Where(l => backSet.Contains(l[(l.IndexOf('|') + 1)..])).ToList();
+          foreach (var l in done)
+          {
+            var id = l[..l.IndexOf('|')];
+            if (Native.DevState(id) == -1)
+              pnpPend.Add("pnp|" + id);
+          }
+          var keepPl = pl.Except(done).ToList();
+          if (keepPl.Count == 0)
+            File.Delete(NetHealPnpFile);
+          else
+            File.WriteAllLines(NetHealPnpFile, keepPl);
+        }
       }
     }
     catch (Exception __e)
@@ -4611,6 +4806,7 @@ public static class Enforcer
     AddDevPending(
       StillDisabled(enDev)
         .Concat(enDev.Where(e => e.StartsWith("usb|") && Native.DevState(e[4..]) == -1))
+        .Concat(pnpPend)
         .Distinct(StringComparer.OrdinalIgnoreCase)
         .ToList()
     );

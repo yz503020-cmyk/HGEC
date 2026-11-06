@@ -629,6 +629,7 @@ public static class Program
         authFails = 0;
         authLevel = 0;
       }
+      Trust.SetCode(code, cur.AppCode); // מפתח החתימה של ההגדרות (ראו Trust)
       var t = Guid.NewGuid().ToString("N");
       tokens[t] = DateTime.UtcNow;
       return "TOKEN|" + t;
@@ -747,6 +748,13 @@ public static class Program
             grants[(clientPid, p[1])] = DateTime.UtcNow;
           return yes ? "OK" : "NO";
         }
+        case "APPLYING":
+        { // APPLYING|token|1/0: החלון מחיל/מבטל עכשיו (השירות לא "משחזר" באמצע). מאומת בקוד הכניסה – אי אפשר לזייף מבחוץ
+          if (!admin || p.Length < 3 || !TokenOk(p[1]))
+            return "DENY";
+          Enforcer.UiApplying(p[2] == "1");
+          return "OK";
+        }
         case "INTERNAL":
         {
           if (!admin || p.Length < 4 || !TokenOk(p[1]) || !int.TryParse(p[2], out var ip))
@@ -847,6 +855,7 @@ public static class Program
     Thread.Sleep(1000);
     if (full)
     {
+      Trust.Remove();
       try
       {
         InternalAdd(Environment.ProcessId, 1);
@@ -1054,6 +1063,7 @@ public static class Program
     Enforcer.InService = true;
     LockDir();
     // הקשחה נגד עקיפה בחשבון מנהל (Hardening.cs)
+    Trust.Init();
     Clock.StartTrusted();
     ProcGuard.Protect();
     SvcGuard.Init();
@@ -1153,6 +1163,7 @@ public static class Program
     var lastUsbT = DateTime.UtcNow;
     var lastIter = DateTime.UtcNow;
     var lastTamper = DateTime.MinValue;
+    var lastStrong = DateTime.MinValue;
     string? lastSig = null;
     bool pendingDone = false;
     Task scanTask = Task.CompletedTask;
@@ -1278,8 +1289,24 @@ public static class Program
           {
             Diag.Log(__e);
           }
-        // רק השירות כותב את קובץ ההגדרות (החלון שומר דרכו). תוכן שונה ממה שהשירות כתב = שינוי מבחוץ (מנהל שלקח בעלות על הקובץ): משחזרים
-        if (ts != stamp && raw != null && Config.LastWritten is string lw && raw != lw && !removing)
+        // רק השירות כותב את קובץ ההגדרות (החלון שומר דרכו). קובץ שונה מקבל רק אם: השירות כתב אותו, הוא זהה לעותק המהימן,
+        // או שהוא חתום בקוד הכניסה (החלון כתב אותו כשהשירות לא עבד). אחרת – שינוי מבחוץ (למשל robocopy /B, או לקיחת בעלות): משחזרים.
+        // גם בהפעלת השירות (Trust.Good נשמר במפתח רישום מוגן), וגם כשהקובץ נמחק
+        string? restore = null;
+        if (ts != stamp && !removing)
+        {
+          var lw = Config.LastWritten;
+          var gd = Trust.Good;
+          if (raw != null)
+          {
+            bool trusted = raw == lw || raw == gd || Trust.SigOk(raw) || (lw == null && gd == null);
+            if (!trusted)
+              restore = lw ?? gd;
+          }
+          else if (!File.Exists(Config.CfgPath))
+            restore = lw ?? gd;
+        }
+        if (restore != null)
         {
           if ((DateTime.UtcNow - lastTamper).TotalMinutes >= 1)
           {
@@ -1288,7 +1315,7 @@ public static class Program
           }
           try
           {
-            Config.WriteSecure(lw);
+            Config.WriteSecure(restore);
           }
           catch (Exception __e)
           {
@@ -1301,11 +1328,32 @@ public static class Program
           var nc = Config.TryLoad(); // null = קריאה נכשלה: נשארים עם ההגדרות הקודמות ומנסים שוב (לא מתאפסים להגדרות ריקות)
           if (nc != null)
           {
-            if (Config.LastWritten == null && raw != null)
-              Config.LastWritten = raw; // הטעינה הראשונה אחרי הפעלת השירות
-            // פתיחה זמנית לא יכולה להיות ארוכה מ-30 דקות לפי השעה האמינה (שעון שהוזז קדימה לפני הפתיחה היה מאריך אותה בשעות)
-            if (nc.TempOpenUntil > Clock.UtcNow().AddMinutes(33).Ticks)
+            if (raw != null && raw != Config.LastWritten)
+            { // התקבל (טעינה ראשונה, או קובץ חתום שהחלון כתב): הוא המהימן מעכשיו
+              Config.LastWritten = raw;
+              Trust.SaveGood(raw);
+            }
+            // פתיחה זמנית: החלון מחשב את זמן הסיום לפי שעון המחשב. השירות ממיר אותו לשעה האמינה (אותו משך, עד 30 דקות) –
+            // כך ששעון שהוזז קדימה לא מאריך את הפתיחה בשעות, ושעון שמאחר לא מסיים אותה מיד
+            if (nc.TempOpenUntil != 0 && nc.TempOpenUntil != c.TempOpenUntil)
             {
+              var left = Math.Clamp(nc.TempOpenUntil - DateTime.UtcNow.Ticks, 0, TimeSpan.FromMinutes(30).Ticks);
+              var want = Clock.UtcNow().Ticks + left;
+              if (Math.Abs(want - nc.TempOpenUntil) > TimeSpan.TicksPerMinute)
+              {
+                nc.TempOpenUntil = want;
+                try
+                {
+                  nc.Save(true);
+                }
+                catch (Exception __e)
+                {
+                  Diag.Log(__e);
+                }
+              }
+            }
+            else if (nc.TempOpenUntil > Clock.UtcNow().AddMinutes(33).Ticks)
+            { // ערך שכבר היה (למשל אחרי הפעלה מחדש) – לא יותר מ-30 דקות מעכשיו
               nc.TempOpenUntil = Clock.UtcNow().AddMinutes(30).Ticks;
               Alerts.Log("זמן הפתיחה הזמנית קוצר ל-30 דקות (שעון המחשב לא תאם)");
               try
@@ -1436,6 +1484,11 @@ public static class Program
               }
             Enforcer.HostsHeal(c);
           }
+          if (quiet && c.Adv.On && c.AdvOpts.StrongAdmin && (now - lastStrong).TotalSeconds >= 5)
+          {
+            lastStrong = now;
+            Enforcer.StrongHeal(c);
+          }
           if (quiet && c.Usb.On && (now - lastUsbT).TotalSeconds >= 10)
           {
             lastUsbT = now;
@@ -1475,6 +1528,8 @@ public static class Program
         {
           lastSvc = now;
           SvcGuard.Heal(removing);
+          Trust.Heal(removing);
+          Enforcer.GuardOwnIfeo(removing);
           if (!removing && c.AdvOpts.SafeBoot && Enforcer.SafeBootHeal())
             Alerts.Log("מפתחות Safe Mode של שירות ההגנה נמחקו – שוחזרו");
         }

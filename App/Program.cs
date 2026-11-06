@@ -1553,6 +1553,7 @@ public static class Program
               regs = Enforcer.RegWants(c);
             }
             Enforcer.ProcessDevPending(c, blocking);
+            Enforcer.ProcessLsaPending(c, blocking);
           }
           catch (Exception __e)
           {

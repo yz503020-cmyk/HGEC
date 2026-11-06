@@ -1408,6 +1408,49 @@ public static class Enforcer
       Alerts.Log("זכויות מנהל שהוסרו בהקשחה החזקה הוחזרו – הוסרו שוב: " + string.Join(", ", back));
   }
 
+  static string LsaPendFile => System.IO.Path.Combine(Config.Dir, "var", "lsapending.txt");
+
+  static void AddLsaPending(string line)
+  {
+    try
+    {
+      Directory.CreateDirectory(System.IO.Path.GetDirectoryName(LsaPendFile)!);
+      File.AppendAllLines(LsaPendFile, new[] { line });
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
+    }
+  }
+
+  // נקרא מהשירות: זכויות שלא הוחזרו בביטול. רק זכויות וחשבונות שההקשחה עצמה מסירה (הקובץ בתיקייה שמנהלים יכולים לכתוב אליה – לא נותנים ממנו זכויות אחרות),
+  // ולא בזמן שההקשחה החזקה פעילה
+  public static void ProcessLsaPending(Config c, bool blocking)
+  {
+    try
+    {
+      if (!File.Exists(LsaPendFile) || (blocking && c.Master && c.Adv.On && c.AdvOpts.StrongAdmin))
+        return;
+      var keep = new List<string>();
+      foreach (var l in File.ReadAllLines(LsaPendFile).Distinct())
+      {
+        var q = l.Split('|');
+        if (q.Length != 2 || !StrongTarget(q[0]) || !StrongRights.Contains(q[1]))
+          continue;
+        if (!Lsa.Change(q[0], q[1], true))
+          keep.Add(l);
+      }
+      if (keep.Count == 0)
+        File.Delete(LsaPendFile);
+      else
+        File.WriteAllLines(LsaPendFile, keep);
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
+    }
+  }
+
   static string HostsPath => System.IO.Path.Combine(Environment.SystemDirectory, @"drivers\etc\hosts");
   static FileSystemAccessRule HostsDeny =>
     new(
@@ -1565,8 +1608,10 @@ public static class Enforcer
     if (removing)
       return;
     var names = new List<string> { "DeviceGuard.exe", "DeviceGuardWatch.exe", "DeviceGuardGate.exe" };
-    if (!string.IsNullOrEmpty(UiExe))
-      names.Add(System.IO.Path.GetFileName(UiExe));
+    // DeviceGuard.exe ששמו שונה (למשל "DeviceGuard (1).exe") – רק אם השם עדיין מתחיל ב-DeviceGuard: שם אחר עלול להיות של תוכנה שהמשתמש חוסם
+    var ui = string.IsNullOrEmpty(UiExe) ? null : System.IO.Path.GetFileName(UiExe);
+    if (ui != null && ui.StartsWith("DeviceGuard", StringComparison.OrdinalIgnoreCase))
+      names.Add(ui);
     foreach (var v in Views)
       try
       {
@@ -4642,9 +4687,9 @@ public static class Enforcer
             Schtasks("/End /TN DeviceGuardWatch");
             Schtasks("/Delete /TN DeviceGuardWatch /F");
             break;
-          case "lsaright": // lsaright|SID|זכות: מחזירים זכות שהוסרה בהקשחה החזקה
-            if (p.Length >= 3)
-              Lsa.Change(p[1], p[2], true);
+          case "lsaright": // lsaright|SID|זכות: מחזירים זכות שהוסרה בהקשחה החזקה. נכשל – נשמר לניסיון חוזר בשירות
+            if (p.Length >= 3 && !Lsa.Change(p[1], p[2], true))
+              AddLsaPending(p[1] + "|" + p[2]);
             break;
           case "hostslock":
           {

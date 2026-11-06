@@ -71,6 +71,15 @@ static class GateMode
   static extern bool CloseHandle(nint h);
 
   [DllImport("kernel32")]
+  static extern uint WaitForSingleObject(nint h, uint ms);
+
+  [DllImport("kernel32")]
+  static extern bool GetExitCodeProcess(nint h, out uint code);
+
+  // קוד יציאה כשהתוכנה נחסמה (ERROR_ACCESS_DISABLED_BY_POLICY): מי שהפעיל אותה לא יחשוב שהיא הצליחה
+  const int Blocked = 1260;
+
+  [DllImport("kernel32")]
   static extern nint GetStdHandle(int n);
 
   delegate bool EnumProc(nint h, nint l);
@@ -131,7 +140,8 @@ static class GateMode
 
   // הפעלה עם DEBUG_ONLY_THIS_PROCESS: Windows לא מפעיל שוב את ה-Debugger, ואז מנתקים את הדיבוג והתוכנה רצה כרגיל.
   // reg != null: התוכנה אושרה, והשירות מתעד אותה (לפני הניתוק, כדי שלא תהיה מרוץ מול לולאת הניטור). תהליכי בן של תוכנה מאושרת עוברים בלי קוד
-  static void Launch(string cmd, string? reg)
+  // ממתין לסיום התוכנה ומחזיר את קוד היציאה שלה (כמו השער הקל): מי שהפעיל אותה – תוכנת התקנה, סקריפט או Windows – מחכה לה באמת
+  static int Launch(string cmd, string? reg)
   {
     var si = new SI { cb = Marshal.SizeOf<SI>() };
     // מעבירים הלאה את הקלט/פלט הסטנדרטי (חשוב לסקריפטים וכלים שקוראים את הפלט של תוכנה חסומה)
@@ -149,20 +159,22 @@ static class GateMode
       fl |= 0x08000000;
     } // STARTF_USESTDHANDLES + CREATE_NO_WINDOW
     DebugSetProcessKillOnExit(false);
-    if (CreateProcessW(null, new StringBuilder(cmd), 0, 0, any, fl, 0, null, ref si, out var pi))
-    {
-      if (reg != null)
-        Config.Pipe($"AUTHPID|{pi.pid}|{reg}", 1500);
-      DebugActiveProcessStop(pi.pid);
-      CloseHandle(pi.hp);
-      CloseHandle(pi.ht);
-    }
+    if (!CreateProcessW(null, new StringBuilder(cmd), 0, 0, any, fl, 0, null, ref si, out var pi))
+      return -1;
+    if (reg != null)
+      Config.Pipe($"AUTHPID|{pi.pid}|{reg}", 1500);
+    DebugActiveProcessStop(pi.pid);
+    CloseHandle(pi.ht);
+    WaitForSingleObject(pi.hp, 0xFFFFFFFF);
+    int code = GetExitCodeProcess(pi.hp, out var ec) ? unchecked((int)ec) : 0;
+    CloseHandle(pi.hp);
+    return code;
   }
 
   static bool Ok(nint h) => h != 0 && h != -1;
 
   // נקרא על ידי Windows כשמנסים להפעיל תוכנה חסומה: DeviceGuard.exe --gate <id> <הפקודה המקורית>
-  public static void RunGate(string[] a)
+  public static int RunGate(string[] a)
   {
     var id = a[1];
     var cl = Environment.CommandLine;
@@ -170,14 +182,11 @@ static class GateMode
     var mi = cl.IndexOf(marker, StringComparison.Ordinal);
     var orig = (mi >= 0 ? cl[(mi + marker.Length)..] : "").Trim();
     if (orig.Length == 0)
-      return;
+      return 0;
     // Windows עצמו (SYSTEM / שירותים) – למשל שירות Windows Installer (msiexec /V) או עדכון שמריץ reagentc: עובר תמיד.
     // משתמש רגיל לא יכול להריץ דבר בחשבונות האלה, ולכן זה לא פותח עקיפה; בלי זה עדכוני Windows נכשלו בשקט בזמן החסימה
     if (Native.IsServiceAccount())
-    {
-      Launch(orig, null);
-      return;
-    }
+      return Launch(orig, null);
     bool sys = Native.IsSystemContext();
     var info = GetInfo(id);
     if (info == null)
@@ -187,47 +196,38 @@ static class GateMode
         Init();
         Msg("שירות ההגנה אינו פעיל, ולכן לא ניתן להפעיל תוכנה חסומה. פתח את DeviceGuard ולחץ 'החל שינויים'.");
       }
-      return;
+      return Blocked;
     }
     if (!info.Exists || !info.Applies)
-    {
-      Launch(orig, null);
-      return;
-    }
+      return Launch(orig, null);
     // תוכנה שהופעלה על ידי תוכנה מאושרת (תהליכי בן של דפדפן וכד'), או על ידי DeviceGuard עצמו – עוברת בלי קוד
     var ppid = Native.ParentPid();
     if (Config.Pipe($"ISAUTH|{id}|{ppid}" + (sys ? "|SYS" : ""), 2000) == "OK")
-    {
-      Launch(orig, id);
-      return;
-    }
+      return Launch(orig, id);
     if (sys)
-      return; // שירות/מערכת בלי אישור: נחסם בשקט (אין ממשק להצגת חלון)
+      return Blocked; // שירות/מערכת בלי אישור: נחסם בשקט (אין ממשק להצגת חלון)
     Init();
     if (info.Mode == (int)Mode.Full)
     {
       Msg("אנא פנה למנהל המערכת");
-      return;
+      return Blocked;
     }
     var need = info.HasOwn ? "הקוד הנפרד של התוכנה הזו" : "קוד ברירת המחדל (שהוגדר בחלון 1)";
     while (true)
     {
       var code = MainWin.Ask("נדרש " + need);
       if (code == null)
-        return;
+        return Blocked;
       var resp = Config.Pipe("VERIFY|" + id + "|" + code, 8000);
       if (resp == "OK")
-      {
-        Launch(orig, id);
-        return;
-      }
+        return Launch(orig, id);
       Msg(
         resp == null ? "שירות ההגנה אינו פעיל."
         : resp == "LOCK" ? "יותר מדי ניסיונות. נסה שוב בעוד זמן מה."
         : "קוד שגוי. יש להקיש את " + need + "."
       );
       if (resp == null || resp == "LOCK")
-        return;
+        return Blocked;
     }
   }
 

@@ -285,24 +285,48 @@ public static class Enforcer
     : string.IsNullOrEmpty(c.OwnerSid) ? "HKCU"
     : "HKU:" + c.OwnerSid;
 
-  static RegistryKey? Root(string hive)
+  // מפתח השורש של היבה. HKLM/HKCU הם מפתחות קבועים (לא נסגרים); HKU:SID נפתח בכל שימוש – ונסגר בסופו (using).
+  // קודם המפתח של המשתמש לא נסגר, ובמצב "רק המשתמש הנוכחי" השירות השאיר כל 10 שניות מפתח פתוח להיבה שלו – מה שמעכב את פריקת הפרופיל ביציאה
+  sealed class RootLease : IDisposable
+  {
+    public readonly RegistryKey? Key;
+    readonly bool own;
+
+    public RootLease(RegistryKey? key, bool own)
+    {
+      Key = key;
+      this.own = own;
+    }
+
+    public void Dispose()
+    {
+      if (own)
+        Key?.Dispose();
+    }
+  }
+
+  // היבות של משתמשים לא מחוברים שנטענו זמנית (בהסרת התוכנה): SID -> שם המפתח הזמני תחת HKEY_USERS
+  static readonly ConcurrentDictionary<string, string> hiveAlias = new(StringComparer.OrdinalIgnoreCase);
+
+  static RootLease Root(string hive)
   {
     if (hive == "HKLM")
-      return Registry.LocalMachine;
+      return new RootLease(Registry.LocalMachine, false);
     if (hive == "HKCU")
-      return Registry.CurrentUser;
+      return new RootLease(Registry.CurrentUser, false);
     if (hive.StartsWith("HKU:"))
     {
       try
       {
-        return Registry.Users.OpenSubKey(hive[4..], true);
+        var sid = hive[4..];
+        return new RootLease(Registry.Users.OpenSubKey(hiveAlias.TryGetValue(sid, out var a) ? a : sid, true), true);
       }
       catch
       {
-        return null;
+        return new RootLease(null, false);
       }
     }
-    return null;
+    return new RootLease(null, false);
   }
 
   // MultiString נשמר כמחרוזת אחת שהפריטים שלה מופרדים בתו 0
@@ -332,7 +356,8 @@ public static class Enforcer
 
   static void SetReg(Config c, string hive, string path, string name, object value, RegistryValueKind kind = RegistryValueKind.DWord)
   {
-    var root = Root(hive);
+    using var rl = Root(hive);
+    var root = rl.Key;
     if (root == null)
     {
       // רישום של משתמש שאינו מחובר כרגע (ההיבה שלו לא טעונה): נרשם כ"ממתין", והשירות מחיל אותו כשהמשתמש נכנס
@@ -388,7 +413,8 @@ public static class Enforcer
     var p = e.Split('|');
     if (p.Length < 4)
       return true;
-    var root = Root(p[1]);
+    using var rl = Root(p[1]);
+    var root = rl.Key;
     if (root == null)
       return !p[1].StartsWith("HKU:");
     using var k = root.OpenSubKey(p[2], true);
@@ -407,7 +433,8 @@ public static class Enforcer
     var p = e.Split('|');
     if (p.Length < 3)
       return true;
-    var root = Root(p[1]);
+    using var rl = Root(p[1]);
+    var root = rl.Key;
     if (root == null)
       return !p[1].StartsWith("HKU:");
     bool empty;
@@ -502,6 +529,175 @@ public static class Enforcer
     }
   }
 
+  // ---- הסרת התוכנה כשמשתמש מוגבל לא מחובר ----
+  // ההגבלות שלו (מנהל המשימות, עורך הרישום, לוח הבקרה, חסימת הרצה מתיקיות המשתמש...) נמצאות ברישום הפרטי שלו (NTUSER.DAT), שטעון רק כשהוא מחובר.
+  // בביטול רגיל השירות משחרר אותן כשהוא נכנס – אבל אחרי הסרה אין שירות, והן היו נשארות לתמיד (וגם עורך הרישום חסום אצלו).
+  // לכן בהסרה טוענים זמנית את הרישום שלו (RegLoadKey, בהרשאות הגיבוי/שחזור של מנהל מורם), מבטלים, ופורקים
+  [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+  static extern int RegLoadKeyW(IntPtr hKey, string sub, string file);
+
+  [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+  static extern int RegUnLoadKeyW(IntPtr hKey, string sub);
+
+  static readonly IntPtr HKEY_USERS = unchecked((IntPtr)(int)0x80000003);
+
+  // משתמשים (SID) שיש להם ביטולי רישום שממתינים
+  public static List<string> PendingUsers()
+  {
+    lock (RegPendLock)
+      try
+      {
+        if (!File.Exists(RegPendFile))
+          return new List<string>();
+        return File.ReadAllLines(RegPendFile)
+          .Select(l => l.Split('|'))
+          .Where(q => q.Length > 1 && q[1].StartsWith("HKU:"))
+          .Select(q => q[1][4..])
+          .Distinct(StringComparer.OrdinalIgnoreCase)
+          .ToList();
+      }
+      catch (Exception __e)
+      {
+        Diag.Log(__e);
+        return new List<string>();
+      }
+  }
+
+  static string? ProfileHive(string sid)
+  {
+    try
+    {
+      using var k = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\" + sid);
+      if (k?.GetValue("ProfileImagePath") is not string dir)
+        return null;
+      var f = System.IO.Path.Combine(Environment.ExpandEnvironmentVariables(dir), "NTUSER.DAT");
+      return File.Exists(f) ? f : null;
+    }
+    catch
+    {
+      return null;
+    }
+  }
+
+  // מבטל את כל ביטולי הרישום הממתינים, גם של משתמשים לא מחוברים. מחזיר את המשתמשים שעדיין נשארו (לא ניתן היה לטעון את הרישום שלהם)
+  public static List<string> ProcessRegPendingOffline()
+  {
+    ProcessRegPending(); // משתמשים שמחוברים עכשיו
+    foreach (var sid in PendingUsers())
+    {
+      try
+      {
+        using (var loaded = Registry.Users.OpenSubKey(sid))
+          if (loaded != null)
+            continue; // המשתמש מחובר: ProcessRegPending כבר טיפל
+        var file = ProfileHive(sid);
+        if (file == null)
+          continue;
+        EnablePrivs();
+        var tmp = "DG_" + Guid.NewGuid().ToString("N");
+        if (RegLoadKeyW(HKEY_USERS, tmp, file) != 0)
+          continue; // אין הרשאות (למשל ההקשחה החזקה) או שהקובץ תפוס
+        hiveAlias[sid] = tmp;
+        try
+        {
+          ProcessRegPending();
+        }
+        finally
+        {
+          hiveAlias.TryRemove(sid, out _);
+          // כל המפתחות לרישום הזה חייבים להיסגר לפני הפריקה
+          GC.Collect();
+          GC.WaitForPendingFinalizers();
+          for (int i = 0; i < 10 && RegUnLoadKeyW(HKEY_USERS, tmp) != 0; i++)
+            Thread.Sleep(300);
+        }
+      }
+      catch (Exception __e)
+      {
+        Diag.Log(__e);
+      }
+    }
+    return PendingUsers();
+  }
+
+  // ---- שחרורים שלא הושלמו לפני הסרה: כוננים לא מחוברים ----
+  // כוננים שיש בהם עדיין קבצים/תיקיות נעולים שלא ניתן היה לשחרר (הכונן לא מחובר)
+  public static List<string> PendingDrives()
+  {
+    var res = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    void Add(string? path)
+    {
+      try
+      {
+        var r = string.IsNullOrEmpty(path) ? null : System.IO.Path.GetPathRoot(path);
+        if (!string.IsNullOrEmpty(r) && !Directory.Exists(r))
+          res.Add(r);
+      }
+      catch (Exception __e)
+      {
+        Diag.Log(__e);
+      }
+    }
+    try
+    {
+      lock (PathPendLock)
+        if (File.Exists(PathPendFile))
+          foreach (var l in File.ReadAllLines(PathPendFile))
+          {
+            var q = l.Split('\t')[0].Split('|');
+            if (q.Length > 1)
+              Add(q[1]);
+          }
+      lock (LogLock)
+        if (File.Exists(WatchLog))
+          foreach (var l in File.ReadAllLines(WatchLog))
+          {
+            var i = l.LastIndexOf('|');
+            if (i > 0)
+              Add(l[..i]);
+          }
+      lock (LostLock)
+        if (File.Exists(LostFile))
+          foreach (var l in File.ReadAllLines(LostFile))
+            Add(l.Split('|')[0]);
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
+    }
+    return res.OrderBy(x => x).ToList();
+  }
+
+  // ניסיון חוזר לשחרר (אחרי שהמשתמש חיבר את הכונן)
+  public static void RetryReleases(Config c)
+  {
+    ResetDriveCache();
+    try
+    {
+      ProcessPathPending(c);
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
+    }
+    try
+    {
+      ReleaseWatchLogAll();
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
+    }
+    try
+    {
+      ProcessLost(new(), new(StringComparer.OrdinalIgnoreCase));
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
+    }
+  }
+
   // מחיל רשומות "ממתינות" (משתמש שלא היה מחובר בזמן ההחלה) כשההיבה שלו נטענת. true = משהו השתנה וצריך לשמור
   public static bool ApplyRegPending(Config c)
   {
@@ -512,8 +708,11 @@ public static class Enforcer
     foreach (var e in pend)
     {
       var p = e.Split('|');
-      if (p.Length < 6 || Root(p[1]) == null)
+      if (p.Length < 6)
         continue;
+      using (var rl = Root(p[1]))
+        if (rl.Key == null)
+          continue;
       try
       {
         var kind = Enum.Parse<RegistryValueKind>(p[4]);
@@ -546,7 +745,8 @@ public static class Enforcer
     {
       try
       {
-        var root = Root(w.Hive);
+        using var rl = Root(w.Hive);
+        var root = rl.Key;
         if (root == null)
           continue;
         using var k = root.CreateSubKey(w.Path, true);
@@ -1339,8 +1539,29 @@ public static class Enforcer
       foreach (var e in new[] { "bcdedit.exe", "msconfig.exe", "reagentc.exe" })
         Ifeo(c, e, c.Adv);
     if (a.NoVirt)
-      foreach (var e in new[] { "wsl.exe", "bash.exe", "WindowsSandbox.exe", "vmconnect.exe" })
+    {
+      // חסימה לפי שם קובץ (IFEO) חלה על כל קובץ בשם הזה במחשב. bash.exe לא נחסם כך: זה גם השם של Git Bash, MSYS2, Cygwin ועוד.
+      // במקום זה מושבתים שירותי WSL עצמם – כך ש-bash.exe של WSL (וכל דרך אחרת להפעיל WSL) לא עובד, ו-bash אחרים לא נפגעים.
+      // הערך הקודם נשמר ומוחזר בביטול (כמו כל מדיניות רישום). שירות שכבר רץ נעצר רק בהפעלה מחדש – wsl.exe נחסם מיד בכל מקרה
+      foreach (var e in new[] { "wsl.exe", "WindowsSandbox.exe", "vmconnect.exe" })
         Ifeo(c, e, c.Adv);
+      foreach (var svc in new[] { "LxssManager", "WslService" })
+      {
+        try
+        {
+          var sk = @"SYSTEM\CurrentControlSet\Services\" + svc;
+          bool has;
+          using (var k = Registry.LocalMachine.OpenSubKey(sk))
+            has = k?.GetValue("Start") is int;
+          if (has)
+            SetReg(c, "HKLM", sk, "Start", 4);
+        }
+        catch (Exception __e)
+        {
+          Diag.Log(__e);
+        }
+      }
+    }
     if (a.NoTaskMgr)
       SetReg(c, uh, SYSPOL, "DisableTaskMgr", 1);
     if (a.NoRegedit)
@@ -1528,8 +1749,19 @@ public static class Enforcer
   static bool Under(string p, string d) =>
     p.Equals(d, StringComparison.OrdinalIgnoreCase) || p.StartsWith(d + "\\", StringComparison.OrdinalIgnoreCase);
 
-  // נתיבים שחסימתם עלולה להקריס את המחשב (שורש כונן, Windows, Program Files, ProgramData, Users, ותיקיית הבית של כל משתמש)
-  public static bool IsDangerous(string p)
+  // נתיבים שחסימתם עלולה להקריס את המחשב (שורש כונן, Windows, Program Files, ProgramData, Users, ותיקיית הבית של כל משתמש).
+  // נבדק גם הנתיב האמיתי אחרי קיצורי תיקייה (junction / symlink): למשל "C:\ProgramData\Application Data" מפנה ל-C:\ProgramData עצמה,
+  // ותיקייה שמשתמש יצר עם mklink יכולה להפנות ל-C:\Windows. חסימה דרכה הייתה נועלת את תיקיית המערכת האמיתית
+  public static bool IsDangerous(string p) => IsDangerousText(p) || (Resolved(p) is { } f && IsDangerousText(f));
+
+  // הנתיב האמיתי, רק אם הוא שונה מהנתיב שנכתב (אחרת null)
+  static string? Resolved(string p)
+  {
+    var f = Native.FinalPath(p);
+    return f != null && !f.TrimEnd('\\').Equals(p.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase) ? f : null;
+  }
+
+  static bool IsDangerousText(string p)
   {
     var t = p.TrimEnd('\\');
     if (t.Length <= 2)
@@ -1594,7 +1826,9 @@ public static class Enforcer
   }
 
   // מגן על התוכנה עצמה: אי אפשר לחסום את תיקיית ההגדרות, את תיקיית ההרצה, תיקייה שמכילה אותן, או קובץ בשם התוכנה בכל מיקום
-  static bool Protected(string p)
+  static bool Protected(string p) => ProtectedText(p) || (Resolved(p) is { } f && ProtectedText(f));
+
+  static bool ProtectedText(string p)
   {
     var t = p.TrimEnd('\\');
     var cd = CdT;
@@ -4231,6 +4465,205 @@ public static class Enforcer
     }
   }
 
+  // ---- חומת אש, מסנן Wi-Fi ונעילת hosts שהיו אמורים להשתחרר בביטול ----
+  // הביטול מריץ את הפקודות פעם אחת. אם הן נכשלו (למשל בהפעלת המחשב, כששירות ה-Wi-Fi או חומת האש עוד לא עלו), או שבדיקת השחזור התקופתית
+  // הוסיפה אותם שוב בדיוק ברגע הביטול – ה-Wi-Fi או האינטרנט היו נשארים חסומים גם אחרי הפתיחה. לכן כל פריט נרשם כאן, נבדק מול המצב
+  // האמיתי ומבוצע שוב עד שהוא באמת שוחרר (ולפחות דקה אחרי הביטול, כדי לתפוס גם מרוץ כזה). שורה: רשומה<TAB>זמן הביטול (ticks)
+  static string NetPendFile => System.IO.Path.Combine(Config.Dir, "var", "netpending.txt");
+  static readonly object NetPendLock = new();
+
+  static void AddNetPending(List<string> items)
+  {
+    if (items.Count == 0)
+      return;
+    lock (NetPendLock)
+      try
+      {
+        var now = DateTime.UtcNow.Ticks;
+        var cur = File.Exists(NetPendFile) ? File.ReadAllLines(NetPendFile).Where(l => l.Length > 0).ToList() : new List<string>();
+        foreach (var i in items.Distinct())
+        {
+          cur.RemoveAll(l => l.Split('\t')[0] == i);
+          cur.Add(i + "\t" + now);
+        }
+        Directory.CreateDirectory(System.IO.Path.GetDirectoryName(NetPendFile)!);
+        File.WriteAllLines(NetPendFile, cur);
+      }
+      catch (Exception __e)
+      {
+        Diag.Log(__e);
+      }
+  }
+
+  public static bool HasNetPending() => File.Exists(NetPendFile);
+
+  static string FwProfileKey(string profile) =>
+    profile.Equals("Domain", StringComparison.OrdinalIgnoreCase) ? "DomainProfile"
+    : profile.Equals("Private", StringComparison.OrdinalIgnoreCase) ? "StandardProfile"
+    : "PublicProfile";
+
+  static int? FwValue(string profile, string name)
+  {
+    using var k = Registry.LocalMachine.OpenSubKey(FWPOL + FwProfileKey(profile));
+    return k?.GetValue(name) is int v ? v : null;
+  }
+
+  static bool FwRulesLeft()
+  {
+    using var k = Registry.LocalMachine.OpenSubKey(FWPOL + "FirewallRules");
+    if (k == null)
+      return false;
+    foreach (var n in k.GetValueNames())
+      if (
+        k.GetValue(n) is string v
+        && (
+          v.Contains("|EmbedCtxt=DeviceGuardNet|", StringComparison.OrdinalIgnoreCase)
+          || v.EndsWith("|EmbedCtxt=DeviceGuardNet", StringComparison.OrdinalIgnoreCase)
+        )
+      )
+        return true;
+    return false;
+  }
+
+  // מצב שירות Windows: null = לא קיים במחשב
+  static bool? SvcRunning(string name)
+  {
+    try
+    {
+      using var sc = new System.ServiceProcess.ServiceController(name);
+      return sc.Status == System.ServiceProcess.ServiceControllerStatus.Running;
+    }
+    catch (InvalidOperationException)
+    {
+      return null;
+    }
+    catch
+    {
+      return false;
+    }
+  }
+
+  // true = הפריט שוחרר באמת (אחרי ביצוע חוזר אם צריך). false = עדיין לא – לנסות שוב
+  static bool NetRelease(string e)
+  {
+    var p = e.Split('|');
+    switch (p[0])
+    {
+      case "fwpolicy":
+        if (p.Length < 3 || p[2].Equals("Block", StringComparison.OrdinalIgnoreCase))
+          return true;
+        if (FwValue(p[1], "DefaultOutboundAction") != 1)
+          return true;
+        PS($"Set-NetFirewallProfile -Profile {p[1]} -DefaultOutboundAction {p[2]}");
+        return FwValue(p[1], "DefaultOutboundAction") != 1;
+      case "fwenabled":
+        if (p.Length < 3 || !p[2].Equals("False", StringComparison.OrdinalIgnoreCase) || FwValue(p[1], "EnableFirewall") == 0)
+          return true;
+        PS($"Set-NetFirewallProfile -Profile {p[1]} -Enabled False");
+        return FwValue(p[1], "EnableFirewall") == 0;
+      case "fwrules":
+        if (!FwRulesLeft())
+          return true;
+        PS("Remove-NetFirewallRule -Group 'DeviceGuardNet' -ErrorAction SilentlyContinue");
+        return !FwRulesLeft();
+      case "wlanfilter":
+      {
+        // אין דרך אמינה לקרוא את המסננים (הפלט של netsh מתורגם לשפת Windows): מוחקים שוב כשהשירות של ה-Wi-Fi רץ. בלי השירות במחשב – אין Wi-Fi ואין מה לשחרר
+        var run = SvcRunning("WlanSvc");
+        if (run == null)
+          return true;
+        if (run == false)
+          return false;
+        if (p.Length > 1 && p[1] == "denyall")
+          for (int i = 0; i < 2; i++)
+            Netsh("wlan delete filter permission=denyall networktype=infrastructure");
+        else if (p.Length > 2 && p[1] == "allow")
+          Netsh($"wlan delete filter permission=allow ssid=\"{string.Join("|", p[2..]).Replace("\"", "")}\" networktype=infrastructure");
+        return true;
+      }
+      case "hostslock":
+      {
+        var fi = new FileInfo(HostsPath);
+        if (!fi.Exists)
+          return true;
+        var sec = fi.GetAccessControl();
+        if (!sec.GetAccessRules(true, false, typeof(SecurityIdentifier)).Cast<FileSystemAccessRule>().Any(x => x.AccessControlType == AccessControlType.Deny && x.IdentityReference.Value == "S-1-1-0" && (x.FileSystemRights & FileSystemRights.WriteData) != 0))
+          return true;
+        sec.RemoveAccessRule(HostsDeny);
+        fi.SetAccessControl(sec);
+        return true;
+      }
+    }
+    return true;
+  }
+
+  static DateTime lastNetPend = DateTime.MinValue;
+
+  // נקרא מהשירות (כל 15 שניות, לא בזמן החלה) ומההסרה (force: בלי המתנה של דקה). פריט שהחסימה הנוכחית שוב מחזיקה (הוחל מחדש) – יורד מהרשימה.
+  // מחזיר את מה שעדיין לא שוחרר
+  public static List<string> ProcessNetPending(Config c, bool blocking, bool force = false)
+  {
+    var left = new List<string>();
+    lock (NetPendLock)
+    {
+      try
+      {
+        if (!File.Exists(NetPendFile))
+          return left;
+        if (!force && (DateTime.UtcNow - lastNetPend).TotalSeconds < 15)
+          return File.ReadAllLines(NetPendFile).Where(l => l.Length > 0).Select(l => l.Split('\t')[0]).ToList();
+        lastNetPend = DateTime.UtcNow;
+        bool fwOwned,
+          wlanOwned,
+          hostsOwned;
+        lock (c.Applied)
+        {
+          fwOwned = blocking && c.Master && c.Applied.Any(x => x == "fwrules" || x.StartsWith("fwcfg|"));
+          wlanOwned = blocking && c.Master && c.Applied.Contains("wlanfilter|denyall");
+          hostsOwned = blocking && c.Master && c.Applied.Contains("hostslock");
+        }
+        var keep = new List<string>();
+        var now = DateTime.UtcNow.Ticks;
+        foreach (var l in File.ReadAllLines(NetPendFile).Where(l => l.Length > 0).Distinct())
+        {
+          var t = l.Split('\t', 2);
+          var e = t[0];
+          long at = t.Length > 1 && long.TryParse(t[1], out var v) ? v : 0;
+          if (
+            (e.StartsWith("fw") && fwOwned)
+            || (e.StartsWith("wlanfilter|") && wlanOwned)
+            || (e == "hostslock" && hostsOwned)
+          )
+            continue; // החסימה הנוכחית מחזיקה אותו (ותבטל אותו בביטול הבא)
+          bool ok;
+          try
+          {
+            ok = NetRelease(e);
+          }
+          catch (Exception __e)
+          {
+            Diag.Log(__e);
+            ok = false;
+          }
+          if (ok && (force || new TimeSpan(now - at).TotalSeconds >= 60))
+            continue;
+          keep.Add(l);
+          if (!ok)
+            left.Add(e);
+        }
+        if (keep.Count == 0)
+          File.Delete(NetPendFile);
+        else
+          File.WriteAllLines(NetPendFile, keep);
+      }
+      catch (Exception __e)
+      {
+        Diag.Log(__e);
+      }
+    }
+    return left;
+  }
+
   // שחזור חסימות שנמחקו מהרישום
   public static List<(string Exe, string Id)> IfeoList(Config c)
   {
@@ -4508,20 +4941,74 @@ public static class Enforcer
     return false;
   }
 
-  static void CopyGate(string wd)
+  // מחליף קובץ הפעלה שאולי רץ כרגע (שער שממתין לתוכנה שהפעיל, חלון "פתיחה בקוד", השירות הישן שעוד נסגר). Windows לא מאפשר לדרוס קובץ שרץ,
+  // אבל כן לשנות את שמו: אחרי כמה ניסיונות הקובץ הישן מקבל שם זמני (‎.old-…) ונמחק בהזדמנות הבאה. קודם, קובץ תפוס הכשיל את העדכון –
+  // אחרי שהשירות הישן כבר הוסר – והחסימות נשארו בלי שירות עד "החל שינויים" נוסף
+  static void ReplaceExe(string src, string dest)
   {
     for (int i = 0; ; i++)
     {
       try
       {
-        File.Copy(Environment.ProcessPath!, wd, true);
+        File.Move(src, dest, true);
         return;
+      }
+      catch (Exception ex) when ((ex is IOException || ex is UnauthorizedAccessException) && i < 20)
+      {
+        if (i >= 2 && File.Exists(dest))
+          try
+          {
+            File.Move(dest, dest + ".old-" + Guid.NewGuid().ToString("N"));
+          }
+          catch (Exception __e)
+          {
+            Diag.Log(__e);
+          }
+        Thread.Sleep(500);
+      }
+    }
+  }
+
+  // מחיקת קבצי הפעלה ישנים שהוחלפו בזמן שרצו (מה שעדיין רץ – יימחק בפעם הבאה)
+  public static void CleanOldExes()
+  {
+    try
+    {
+      if (!Directory.Exists(Config.Dir))
+        return;
+      foreach (var f in Directory.GetFiles(Config.Dir, "*.old-*"))
+        try
+        {
+          File.Delete(f);
+        }
+        catch (Exception __e)
+        {
+          Diag.Log(__e);
+        }
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
+    }
+  }
+
+  static void CopyGate(string wd)
+  {
+    CleanOldExes();
+    var tmp = wd + ".new";
+    for (int i = 0; ; i++)
+    {
+      try
+      {
+        File.Copy(Environment.ProcessPath!, tmp, true);
+        break;
       }
       catch (Exception ex) when ((ex is IOException || ex is UnauthorizedAccessException) && i < 20)
       {
         Thread.Sleep(500);
       }
     }
+    ReplaceExe(tmp, wd);
   }
 
   // שער קל (NativeAOT): מוטמע בתוך הקובץ הראשי ומופרד לדיסק. מטפל במסלול המהיר של כל הפעלה חסומה ופונה לשער המלא רק כשצריך חלון
@@ -4546,7 +5033,7 @@ public static class Enforcer
       var tmp = LightGateExe + ".new";
       using (var o = File.Create(tmp))
         s.CopyTo(o);
-      File.Move(tmp, LightGateExe, true);
+      ReplaceExe(tmp, LightGateExe); // שער קל שממתין לתוכנה שהפעיל – הקובץ שלו תפוס
     }
     catch
     {
@@ -4978,6 +5465,11 @@ public static class Enforcer
     var ps = new List<string>();
     var enDev = new List<string>(); // מתאמים/התקנים שאמורים לחזור לפעול: נבדק אחרי הביצוע, ומה שלא חזר נשמר לניסיון חוזר
     var pnpPend = new List<string>(); // מתאמי רשת שלא מחוברים כרגע (לפי מזהה התקן)
+    // חומת אש, מסנן Wi-Fi ונעילת hosts: נבדקים שוב בשירות אחרי הביטול (netpending.txt). בהחלה מחדש – רק מה שלא יוחל שוב
+    var netPend = new List<string>();
+    bool keepFw = soft && c.Master && c.NetApps.On,
+      keepWlan = soft && c.Master && c.Net.On,
+      keepHosts = soft && c.Master && c.Adv.On && c.AdvOpts.LockHosts;
     List<string> all;
     lock (c.Applied)
       all = c.Applied.ToList();
@@ -5068,7 +5560,11 @@ public static class Enforcer
             break;
           case "fwenabled":
             if (p.Length > 2)
+            {
               ps.Add($"Set-NetFirewallProfile -Profile {p[1]} -Enabled {p[2]}");
+              if (!keepFw)
+                netPend.Add(e);
+            }
             break;
           case "usbstor":
           {
@@ -5089,6 +5585,8 @@ public static class Enforcer
             break;
           case "hostslock":
           {
+            if (!keepHosts)
+              netPend.Add(e);
             var fi = new FileInfo(HostsPath);
             if (fi.Exists)
             {
@@ -5123,12 +5621,20 @@ public static class Enforcer
             break;
           case "fwpolicy":
             if (p.Length > 2)
+            {
               ps.Add($"Set-NetFirewallProfile -Profile {p[1]} -DefaultOutboundAction {p[2]}");
+              if (!keepFw)
+                netPend.Add(e);
+            }
             break;
           case "fwrules":
             ps.Add("Remove-NetFirewallRule -Group 'DeviceGuardNet' -ErrorAction SilentlyContinue");
+            if (!keepFw)
+              netPend.Add(e);
             break;
           case "wlanfilter":
+            if (!keepWlan)
+              netPend.Add(e);
             if (p.Length > 1 && p[1] == "denyall")
               for (int wi = 0; wi < 2; wi++) // פעמיים: אם בכל זאת נוצר עותק כפול, שלא יישאר Wi-Fi חסום אחרי הביטול
                 Netsh("wlan delete filter permission=denyall networktype=infrastructure");
@@ -5243,6 +5749,7 @@ public static class Enforcer
     {
       Diag.Log(__e);
     }
+    AddNetPending(netPend);
     // גם התקני USB שלא מחוברים כרגע: הם לא מופיעים כ"מושבתים", אבל יישארו מושבתים כשיחוברו – השירות ינקה את הסימון שלהם
     AddDevPending(
       StillDisabled(enDev)

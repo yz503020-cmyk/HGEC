@@ -273,6 +273,18 @@ public partial class MainWin : Window
     };
   }
 
+  void ShortcutNote()
+  {
+    if (!Enforcer.UiShortcutNote)
+      return;
+    Enforcer.UiShortcutNote = false;
+    Say(
+      "החסימה חוסמת הרצת תוכנות מתיקיות המשתמש (כמו הורדות ושולחן העבודה), ולכן גם את DeviceGuard.exe שהורד לשם.\n"
+        + "מעכשיו פותחים את DeviceGuard מהקיצור \"DeviceGuard\" בשולחן העבודה או בתפריט התחל.\n"
+        + "לעדכון גרסה: קודם 'פתיחה זמנית (30 דק׳)', ואז מפעילים את הגרסה החדשה."
+    );
+  }
+
   async Task Do()
   {
     if (C.Master && C.DefaultCode == null && C.All().Any(r => r.On && r.Mode == Mode.Code && r.OwnCode == null))
@@ -292,6 +304,12 @@ public partial class MainWin : Window
         Say(x.Message);
       }
       status.Text = "מחוץ לחלון הזמנים – החסימות יופעלו אוטומטית בתחילת החלון";
+      // החסימה תופעל בתחילת החלון על ידי השירות: הקיצור לפתיחת DeviceGuard נוצר כבר עכשיו, וההודעה מוצגת עכשיו (השירות לא יכול להציג אותה)
+      if ((C.Install.On && C.Install.Mode == Mode.Full) || C.Portable.On)
+      {
+        Enforcer.EnsureUiShortcut();
+        ShortcutNote();
+      }
       return;
     }
     if (
@@ -312,15 +330,7 @@ public partial class MainWin : Window
             ? $" (נחסמו {Enforcer.Blocked} קבצים" + (Enforcer.Failed > 0 ? $", נכשלו {Enforcer.Failed}: {Enforcer.LastErr}" : "") + ")"
             : ""
         );
-      if (Enforcer.UiShortcutNote)
-      {
-        Enforcer.UiShortcutNote = false;
-        Say(
-          "החסימה שהוחלה חוסמת הרצת תוכנות מתיקיות המשתמש (כמו הורדות ושולחן העבודה), ולכן גם את DeviceGuard.exe שהורד לשם.\n"
-            + "מעכשיו פותחים את DeviceGuard מהקיצור \"DeviceGuard\" בשולחן העבודה או בתפריט התחל.\n"
-            + "לעדכון גרסה: קודם 'פתיחה זמנית (30 דק׳)', ואז מפעילים את הגרסה החדשה."
-        );
-      }
+      ShortcutNote();
       if (Enforcer.NeedReboot)
         Say("תוקנה הגדרה של Windows 11 שמנעה את חסימת התוכנות הניידות / ההתקנות. החסימה הזו תפעל רק אחרי הפעלה מחדש של המחשב.");
       StartScanWatch();

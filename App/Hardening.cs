@@ -168,7 +168,7 @@ static class RegWatch
     (RegistryView.Registry64, @"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies"),
     (RegistryView.Registry64, @"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced\Folder\Hidden\SHOWALL"),
     (RegistryView.Registry64, @"SYSTEM\CurrentControlSet\Services\DeviceGuard"),
-    (RegistryView.Registry64, @"SOFTWARE\DeviceGuard"),
+    (RegistryView.Registry64, @"SOFTWARE\DeviceGuard\Trust"),
     (RegistryView.Registry64, @"SYSTEM\CurrentControlSet\Control\SafeBoot"),
     (RegistryView.Registry64, @"SYSTEM\CurrentControlSet\Services\USBSTOR"),
     (RegistryView.Registry64, @"SYSTEM\CurrentControlSet\Services\UASPStor"),
@@ -418,6 +418,8 @@ static class ProcGuard
 static class Trust
 {
   const string Key = @"SOFTWARE\DeviceGuard\Trust";
+  // השעה במפתח נפרד שלא במעקב RegWatch: שמירה כל דקה לא מפעילה סבב שחזור מלא
+  const string ClockKey = @"SOFTWARE\DeviceGuard\Clock";
   public static string SigPath => Path.Combine(Config.Dir, "config.sig");
 
   static string? good; // ההגדרות המהימנות האחרונות (בזיכרון)
@@ -496,13 +498,13 @@ static class Trust
     return s;
   }
 
-  static RegistryKey? Open(bool create)
+  static RegistryKey? Open(bool create, string key = Key)
   {
     try
     {
-      var k = Registry.LocalMachine.OpenSubKey(Key, RegistryKeyPermissionCheck.ReadWriteSubTree, RegistryRights.FullControl);
+      var k = Registry.LocalMachine.OpenSubKey(key, RegistryKeyPermissionCheck.ReadWriteSubTree, RegistryRights.FullControl);
       if (k == null && create)
-        k = Registry.LocalMachine.CreateSubKey(Key, RegistryKeyPermissionCheck.ReadWriteSubTree);
+        k = Registry.LocalMachine.CreateSubKey(key, RegistryKeyPermissionCheck.ReadWriteSubTree);
       return k;
     }
     catch (Exception __e)
@@ -529,6 +531,14 @@ static class Trust
         good = Unzip(z);
       if (k.GetValue("K") is byte[] e)
         kc = Dp(e, false);
+      using var ck = Open(true, ClockKey);
+      ck?.SetAccessControl(Wanted());
+      // מעבר מגרסה קודמת: השעה נשמרה במפתח של ההגדרות
+      if (k.GetValue("Clock") is long old)
+      {
+        ck?.SetValue("Clock", old, RegistryValueKind.QWord);
+        k.DeleteValue("Clock", false);
+      }
     }
     catch (Exception __e)
     {
@@ -561,21 +571,37 @@ static class Trust
     }
   }
 
-  // נקרא מהשירות אחרי כל כתיבה של קובץ ההגדרות
+  // נקרא מהשירות לפני כל כתיבה של קובץ ההגדרות (קודם העותק המהימן, ואז הקובץ): הפסקת חשמל באמצע משאירה עותק מהימן חדש
+  // מהקובץ – והוא זה שמשוחזר. אם השמירה ברישום נכשלה – העותק הישן נמחק, כדי שבהפעלה הבאה לא ישוחזר מצב ישן
+  // (רשימה ישנה של "מה הוחל" הייתה משאירה חסימות אחרי הביטול)
   public static void SaveGood(string json)
   {
     good = json;
     try
     {
       var z = Zip(json);
-      if (z.Length > 4_000_000)
-        return; // גדול מדי לרישום (לא צפוי): מסתפקים בעותק שבזיכרון
       using var k = Open(true);
-      k?.SetValue("Cfg", z, RegistryValueKind.Binary);
+      if (k == null)
+        return;
+      if (z.Length > 4_000_000)
+      { // גדול מדי לרישום (לא צפוי)
+        k.DeleteValue("Cfg", false);
+        return;
+      }
+      k.SetValue("Cfg", z, RegistryValueKind.Binary);
     }
     catch (Exception __e)
     {
       Diag.Log(__e);
+      try
+      {
+        using var k = Open(false);
+        k?.DeleteValue("Cfg", false);
+      }
+      catch (Exception __e2)
+      {
+        Diag.Log(__e2);
+      }
     }
   }
 
@@ -633,7 +659,7 @@ static class Trust
   {
     try
     {
-      using var k = Open(false);
+      using var k = Open(false, ClockKey);
       return k?.GetValue("Clock") is long v ? v : 0;
     }
     catch
@@ -646,7 +672,7 @@ static class Trust
   {
     try
     {
-      using var k = Open(true);
+      using var k = Open(true, ClockKey);
       k?.SetValue("Clock", ticks, RegistryValueKind.QWord);
     }
     catch (Exception __e)
@@ -688,6 +714,12 @@ static class Trust
           changed = true;
         }
       }
+      using (var ck = Open(true, ClockKey))
+        if (ck != null && ck.GetAccessControl(Sec).GetSecurityDescriptorSddlForm(Sec) != refSddl)
+        {
+          ck.SetAccessControl(Wanted());
+          changed = true;
+        }
       if (changed)
         Alerts.Log("זוהה שינוי במפתח ההגדרות המהימנות – שוחזר");
     }

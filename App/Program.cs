@@ -67,6 +67,7 @@ public static class Program
   static int applyBusy;
   static DateTime reconBackoff = DateTime.MinValue;
   static volatile bool overflow;
+  static int qBusy; // תהליכון הרקע של הקבצים החדשים רץ
   static volatile bool netChanged; // שינוי ברשת (מתאם הופעל / חובר) – בדיקת מתאמים מיידית
   static readonly ConcurrentDictionary<string, byte> secPend = new(StringComparer.OrdinalIgnoreCase); // קבצים חסומים שההרשאות שלהם שונו
   static ManagementEventWatcher? pw;
@@ -1088,7 +1089,7 @@ public static class Program
     var watched = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     void Add(string p)
     {
-      if (curMap.ContainsKey(ExtOf(p)))
+      if (curMap.ContainsKey(ExtOf(p)) && !Enforcer.CheapSkip(p))
         q.Enqueue((p, 0, DateTime.UtcNow.AddSeconds(2)));
     }
     void Watch1(string root)
@@ -1118,7 +1119,12 @@ public static class Program
         };
         ws.Changed += (s, e) =>
         {
-          if (secPend.Count < 20000 && curMap.ContainsKey(ExtOf(e.FullPath)) && !Enforcer.RecentlyMine(e.FullPath))
+          if (
+            secPend.Count < 20000
+            && curMap.ContainsKey(ExtOf(e.FullPath))
+            && !Enforcer.RecentlyMine(e.FullPath)
+            && !Enforcer.CheapSkip(e.FullPath)
+          )
             secPend[e.FullPath] = 0;
         };
         ws.EnableRaisingEvents = true;
@@ -1187,6 +1193,7 @@ public static class Program
         {
           Diag.Log(__e);
         }
+        Enforcer.BgEnter(); // סריקה בעדיפות נמוכה (מעבד ודיסק)
         try
         {
           if (release)
@@ -1197,6 +1204,10 @@ public static class Program
         catch (Exception __e)
         {
           Diag.Log(__e);
+        }
+        finally
+        {
+          Enforcer.BgExit();
         }
       });
     }
@@ -1422,16 +1433,34 @@ public static class Program
               }
             }
           }
-          for (int n = q.Count; n > 0 && q.TryDequeue(out var it); n--)
-          {
-            if (it.At > DateTime.UtcNow)
+          // קבצים חדשים: בתהליכון רקע (עדיפות נמוכה), ולא בלולאה הראשית – אלפי קבצים חדשים (חילוץ ארכיון, העתקה) לא מעכבים את השחזורים
+          if (!q.IsEmpty && Interlocked.CompareExchange(ref qBusy, 1, 0) == 0)
+            _ = Task.Run(() =>
             {
-              q.Enqueue(it);
-              continue;
-            }
-            if (curMap.TryGetValue(ExtOf(it.P), out var rule) && !Enforcer.BlockNewFile(rule, it.P) && it.T < 5)
-              q.Enqueue((it.P, it.T + 1, DateTime.UtcNow.AddSeconds(3)));
-          }
+              Enforcer.BgEnter();
+              try
+              {
+                for (int n = q.Count; n > 0 && q.TryDequeue(out var it); n--)
+                {
+                  if (it.At > DateTime.UtcNow)
+                  {
+                    q.Enqueue(it);
+                    continue;
+                  }
+                  if (Blocking(cur) && curMap.TryGetValue(ExtOf(it.P), out var rule) && !Enforcer.BlockNewFile(rule, it.P) && it.T < 5)
+                    q.Enqueue((it.P, it.T + 1, DateTime.UtcNow.AddSeconds(3)));
+                }
+              }
+              catch (Exception __e)
+              {
+                Diag.Log(__e);
+              }
+              finally
+              {
+                Enforcer.BgExit();
+                Interlocked.Exchange(ref qBusy, 0);
+              }
+            });
           if (scanTask.IsCompleted && curMap.Count > 0)
           {
             if (overflow && (now - lastOverflow).TotalMinutes >= 5)
@@ -1507,6 +1536,7 @@ public static class Program
             var mp = curMap;
             scanTask = Task.Run(() =>
             {
+              Enforcer.BgEnter();
               try
               {
                 Enforcer.RecheckLocks(mp, batch);
@@ -1514,6 +1544,10 @@ public static class Program
               catch (Exception __e)
               {
                 Diag.Log(__e);
+              }
+              finally
+              {
+                Enforcer.BgExit();
               }
             });
           }
@@ -1573,6 +1607,7 @@ public static class Program
               .ToHashSet(StringComparer.OrdinalIgnoreCase);
           scanTask = Task.Run(() =>
           {
+            Enforcer.BgEnter();
             try
             {
               Enforcer.ProcessLost(mp, keepAcl);
@@ -1580,6 +1615,10 @@ public static class Program
             catch (Exception __e)
             {
               Diag.Log(__e);
+            }
+            finally
+            {
+              Enforcer.BgExit();
             }
           });
         }

@@ -375,6 +375,8 @@ public class Config
   static void WriteSecureCore(string json)
   {
     LastWritten = json;
+    if (InService)
+      Trust.SaveGood(json); // קודם העותק המהימן (במפתח רישום מוגן), ואז הקובץ – ראו Trust.SaveGood
     Directory.CreateDirectory(Dir);
     var tmp = CfgPath + ".tmp";
     File.WriteAllText(tmp, json);
@@ -392,8 +394,6 @@ public class Config
       Diag.Log(__e);
     }
     File.Move(tmp, CfgPath, true);
-    if (InService)
-      Trust.SaveGood(json); // עותק מהימן במפתח רישום מוגן
   }
 
   public static void SecureFile(string p)

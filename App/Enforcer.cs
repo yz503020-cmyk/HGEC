@@ -241,7 +241,8 @@ public static class Enforcer
     string? file = null;
     try
     {
-      var dir = System.IO.Path.Combine(Config.Dir, "var");
+      // בשירות: תיקייה שרק המערכת כותבת אליה (יורשת את ההרשאות של תיקיית ההגדרות) – מנהל לא יכול להחליף את הסקריפט לפני שהוא רץ כ-SYSTEM
+      var dir = System.IO.Path.Combine(Config.Dir, InService ? "run" : "var");
       Directory.CreateDirectory(dir);
       file = System.IO.Path.Combine(dir, "ps-" + Guid.NewGuid().ToString("N") + ".ps1");
       File.WriteAllText(file, cmd, new UTF8Encoding(true));
@@ -623,7 +624,8 @@ public static class Enforcer
   {
     if (applyLockDepth++ > 0)
       return new ApplyLockRel(null);
-    var until = DateTime.UtcNow.AddMinutes(10);
+    var start = DateTime.UtcNow;
+    var until = start.AddMinutes(10);
     while (true)
     {
       try
@@ -633,6 +635,13 @@ public static class Enforcer
       }
       catch (IOException) when (DateTime.UtcNow < until)
       {
+        // בשירות: מי שמחזיק את הנעילה חייב להיות החלה אמיתית – של השירות, או של החלון (שמודיע עליה דרך ה-Pipe בקוד הכניסה).
+        // אם אחרי 15 שניות אין החלה כזו, מישהו אחר מחזיק את הקובץ (מנהל שמנסה לעכב את תחילת החסימה): ממשיכים בלי לחכות
+        if (InService && (DateTime.UtcNow - start).TotalSeconds > 15 && !Applying())
+        {
+          Alerts.Log("קובץ הנעילה של ההחלה תפוס על ידי תהליך אחר – ממשיכים בלי לחכות", false);
+          return new ApplyLockRel(null);
+        }
         Thread.Sleep(250); // החלה אחרת רצה כרגע: מחכים שתסתיים
       }
       catch (Exception __e)
@@ -1271,7 +1280,7 @@ public static class Enforcer
     }
   }
 
-  static void EnsureUiShortcut()
+  public static void EnsureUiShortcut()
   {
     foreach (var lnk in UiShortcuts())
     {
@@ -1394,11 +1403,16 @@ public static class Enforcer
           AddA(c, $"lsaright|{sid}|{r}");
   }
 
-  // נקרא מהשירות: זכות שהוחזרה בזמן החסימה (למשל דרך secpol.msc) מוסרת שוב. השינוי של מנהל ייכנס לתוקף רק בכניסה הבאה – והשירות מקדים אותו
+  // נקרא מהשירות: זכות שהוחזרה בזמן החסימה (למשל דרך secpol.msc) מוסרת שוב. השינוי של מנהל ייכנס לתוקף רק בכניסה הבאה – והשירות מקדים אותו.
+  // רק אחרי החלה אמיתית של ההקשחה (יש רשומות lsaright): סימון האפשרות בלי "החל שינויים" לא מסיר כלום – אחרת הזכויות היו מוסרות בלי רישום,
+  // ולא היו חוזרות בביטול. זכות שנוספה לחשבון אחר בזמן החסימה מוסרת ולא מוחזרת – כך חוזרים בדיוק למצב שלפני החסימה
   public static void StrongHeal(Config c)
   {
     if (!c.Master || !c.Adv.On || !c.AdvOpts.StrongAdmin || Applying())
       return;
+    lock (c.Applied)
+      if (!c.Applied.Any(x => x.StartsWith("lsaright|")))
+        return;
     var back = new List<string>();
     foreach (var r in StrongRights)
       foreach (var sid in (Lsa.Holders(r) ?? new()).Where(StrongTarget))
@@ -2384,6 +2398,17 @@ public static class Enforcer
     return false;
   }
 
+  // סינון מהיר בלי גישה לדיסק (למעקב אחרי קבצים חדשים ושינויי הרשאות): Windows (חוץ מ-Temp), Program Files וחלק מ-ProgramData
+  public static bool CheapSkip(string p)
+  {
+    if (Under(p, WinDir) && !Under(p, WinDir + @"\Temp"))
+      return true;
+    foreach (var s in SkipFull)
+      if (Under(p, s))
+        return true;
+    return false;
+  }
+
   public static bool InSkipped(string p)
   {
     if (Under(p, WinDir) && !Under(p, WinDir + @"\Temp"))
@@ -2481,6 +2506,48 @@ public static class Enforcer
   static Thread? logThread;
   static readonly ConcurrentDictionary<string, byte> known = new(StringComparer.OrdinalIgnoreCase); // קבצים שכבר נחסמו על ידי השירות (חוסך קריאת הרשאות בכל סריקה)
   static readonly int ParSvc = Math.Max(2, Environment.ProcessorCount / 2); // השירות רץ ברקע ולכן משתמש בפחות ליבות
+
+  // ---- עבודת רקע בעדיפות נמוכה (סריקות בשירות) ----
+  // מצב רקע של Windows: עדיפות נמוכה למעבד ולדיסק, כך שהסריקה (אחרי הפעלה, כל שעה, אחרי שינוי) לא מאטה את המחשב.
+  // רק בשירות, ורק בתהליכונים של הסריקה (לא בתשובות לשער ולא בפתיחה בקוד, שהמשתמש מחכה להן)
+  [DllImport("kernel32.dll")]
+  static extern IntPtr GetCurrentThread();
+
+  [DllImport("kernel32.dll")]
+  static extern bool SetThreadPriority(IntPtr h, int p);
+
+  [ThreadStatic]
+  static int bgDepth;
+
+  public static void BgEnter()
+  {
+    if (InService && bgDepth++ == 0)
+      SetThreadPriority(GetCurrentThread(), 0x00010000); // THREAD_MODE_BACKGROUND_BEGIN
+  }
+
+  public static void BgExit()
+  {
+    if (InService && --bgDepth == 0)
+      SetThreadPriority(GetCurrentThread(), 0x00020000); // THREAD_MODE_BACKGROUND_END
+  }
+
+  // כמו Parallel.ForEach, אבל כל תהליכון עובד במצב רקע (ויוצא ממנו בסוף, לפני שהוא חוזר למאגר)
+  static void ParBg<T>(IEnumerable<T> src, ParallelOptions po, Action<T> body) =>
+    Parallel.ForEach(
+      src,
+      po,
+      () =>
+      {
+        BgEnter();
+        return 0;
+      },
+      (x, _, l) =>
+      {
+        body(x);
+        return l;
+      },
+      _ => BgExit()
+    );
 
   // כתיבת היומן נעשית באצוות בתהליכון נפרד: הלולאה הראשית של השירות אף פעם לא ממתינה לנעילה
   static void EnqueueLog(string line)
@@ -2773,7 +2840,7 @@ public static class Enforcer
         ScanTotal = Math.Max(1, usn.Sum(u => u.Files.Count) + crawl.Sum(CountUnits));
       var po = new ParallelOptions { MaxDegreeOfParallelism = ParSvc, CancellationToken = ct };
       foreach (var u in usn)
-        Parallel.ForEach(
+        ParBg(
           u.Files,
           po,
           f =>
@@ -2784,7 +2851,7 @@ public static class Enforcer
               Interlocked.Increment(ref ScanDone);
           }
         );
-      Parallel.ForEach(crawl, po, d => ScanN(d, map, ct, 0));
+      ParBg(crawl, po, d => ScanN(d, map, ct, 0));
       if (track && !ct.IsCancellationRequested)
       {
         ScanDone = ScanTotal;
@@ -2813,7 +2880,7 @@ public static class Enforcer
       }
       var subs = SubDirs(dir);
       if (depth < 2 && subs.Count > 1)
-        Parallel.ForEach(
+        ParBg(
           subs,
           new ParallelOptions { MaxDegreeOfParallelism = ParSvc, CancellationToken = ct },
           d => ScanN(d, map, ct, depth + 1)
@@ -2935,7 +3002,7 @@ public static class Enforcer
       if (ct.IsCancellationRequested)
         return;
       int n = 0;
-      Parallel.ForEach(
+      ParBg(
         files,
         new ParallelOptions { MaxDegreeOfParallelism = ParSvc },
         f =>
@@ -3107,7 +3174,7 @@ public static class Enforcer
         .ToList();
       var hs = FileAttributes.Hidden | FileAttributes.System;
       if (todo.Count > 0)
-        Parallel.ForEach(
+        ParBg(
           todo,
           po,
           l =>
@@ -3231,7 +3298,7 @@ public static class Enforcer
       if (rel.Count > 0 || dirty)
       {
         var failed = new ConcurrentBag<string>();
-        Parallel.ForEach(
+        ParBg(
           rel,
           po,
           l =>
@@ -3260,7 +3327,7 @@ public static class Enforcer
           logged[l[..i]] = 0;
       }
       if (have != want && keep.Count > 0)
-        Parallel.ForEach(keep, po, l => SetOwner(l, Harden));
+        ParBg(keep, po, l => SetOwner(l, Harden));
       SyncHidden(map, keep, po);
       try
       {
@@ -3588,7 +3655,12 @@ public static class Enforcer
       wlanSeen.Clear();
       return;
     }
-    // כל 2 דקות מוסיפים את המסנן מחדש (מנהל יכול למחוק אותו ב-netsh). מחיקה והוספה – לא נוצר עותק כפול
+    // כל 2 דקות מוסיפים את המסנן מחדש (מנהל יכול למחוק אותו ב-netsh). מחיקה והוספה – לא נוצר עותק כפול.
+    // רק מסנן שההחלה רשמה (wlanfilter), עם רשימת הרשתות המותרות שנרשמה: סימון "חסימת רשת" בלי "החל שינויים" לא מוסיף מסנן
+    // (אחרת הוא לא היה נמחק בביטול, וה-Wi-Fi היה נשאר חסום)
+    List<string> applied;
+    lock (c.Applied)
+      applied = c.Applied.Where(x => x.StartsWith("wlanfilter|")).ToList();
     if ((DateTime.UtcNow - wlanRefresh).TotalMinutes >= 2)
     {
       wlanRefresh = DateTime.UtcNow;
@@ -3600,8 +3672,8 @@ public static class Enforcer
         .GetAllNetworkInterfaces()
         .Where(n => n.NetworkInterfaceType == NetworkInterfaceType.Wireless80211 && wlanSeen.TryAdd(n.Id, 0))
         .ToList();
-      if (wifiNew.Count > 0)
-        foreach (var a in WlanArgs(c.Net.White.Where(w => w.StartsWith("ssid:")).Select(w => w[5..]).ToList()))
+      if (wifiNew.Count > 0 && applied.Contains("wlanfilter|denyall"))
+        foreach (var a in WlanArgs(applied.Where(x => x.StartsWith("wlanfilter|allow|")).Select(x => x[17..]).ToList()))
         {
           Netsh(a.Replace("wlan add filter", "wlan delete filter")); // קודם מוחקים, כדי שלא ייווצר מסנן כפול (ביטול מוחק עותק אחד בלבד)
           Netsh(a);

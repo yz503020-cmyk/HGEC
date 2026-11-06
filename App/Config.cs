@@ -352,6 +352,15 @@ public class Config
         && Enforcer.WriteFileBackup(Trust.SigPath, Trust.Sign(Trust.Derive(Program.Code, AppCode), json))
       )
         return;
+      // ההקשחה החזקה הסירה ממנהלים את הרשאת השחזור, ולכן גם הדרך החלופית נכשלה: מחזירים את הזכויות עכשיו (אחרי קוד כניסה בלבד),
+      // והן ייכנסו לתוקף אחרי יציאה וכניסה מחדש למשתמש. בלי זה לא הייתה דרך לבטל חסימות כשהשירות לא עובד
+      if (Program.Code != null && !Enforcer.HasRestorePriv())
+      {
+        Enforcer.RestoreStrongRights(this);
+        throw new IOException(
+          "שירות ההגנה אינו פעיל, וההקשחה החזקה מונעת שמירה בלעדיו. זכויות המנהל הוחזרו: צא מהמשתמש (Sign out), היכנס שוב ונסה שוב"
+        );
+      }
       throw new IOException("שירות ההגנה אינו פעיל, ולכן לא ניתן לשמור. המתן רגע ונסה שוב, או הפעל מחדש את המחשב");
     }
   }

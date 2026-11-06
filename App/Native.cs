@@ -282,6 +282,126 @@ static class Native
     }
   }
 
+  // ---- זיהוי קובץ/תיקייה לפי מזהה NTFS (נשאר זהה גם אחרי שינוי שם או העברה באותו כונן) ----
+  [DllImport("kernel32.dll", SetLastError = true)]
+  static extern bool GetFileInformationByHandle(nint h, byte[] info);
+
+  [StructLayout(LayoutKind.Explicit, Size = 24)]
+  struct FileIdDesc
+  {
+    [FieldOffset(0)]
+    public int Size;
+
+    [FieldOffset(4)]
+    public int Type; // FileIdType
+
+    [FieldOffset(8)]
+    public long Id;
+  }
+
+  [DllImport("kernel32.dll", SetLastError = true)]
+  static extern nint OpenFileById(nint hint, ref FileIdDesc id, uint access, uint share, nint sec, uint flags);
+
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  static extern uint GetFinalPathNameByHandleW(nint h, StringBuilder buf, uint len, uint flags);
+
+  const uint ReadAttr = 0x80; // FILE_READ_ATTRIBUTES: לא נחסם על ידי כלל הדחייה שלנו
+  const uint IdFlags = 0x02000000 | 0x00200000; // BACKUP_SEMANTICS (תיקיות) + OPEN_REPARSE_POINT
+
+  static (uint Serial, long Index)? Ident(nint h)
+  {
+    var b = new byte[52]; // BY_HANDLE_FILE_INFORMATION
+    if (!GetFileInformationByHandle(h, b))
+      return null;
+    var serial = BitConverter.ToUInt32(b, 28);
+    var idx = ((long)BitConverter.ToUInt32(b, 44) << 32) | BitConverter.ToUInt32(b, 48);
+    return (serial, idx);
+  }
+
+  // "מספר סידורי של הכונן:מזהה הקובץ" (הקסדצימלי), או null
+  public static string? FileId(string path)
+  {
+    try
+    {
+      var h = CreateFileW(path, ReadAttr, 7, 0, 3, IdFlags, 0);
+      if (h == 0 || h == -1)
+        return null;
+      try
+      {
+        return Ident(h) is { } t ? $"{t.Serial:X8}:{t.Index:X16}" : null;
+      }
+      finally
+      {
+        CloseHandle(h);
+      }
+    }
+    catch
+    {
+      return null;
+    }
+  }
+
+  // הנתיב הנוכחי של קובץ לפי המזהה. Present=false: הכונן לא מחובר עכשיו (אפשר לנסות שוב מאוחר יותר);
+  // Present=true ו-Path=null: הכונן מחובר והקובץ לא נמצא (נמחק)
+  public static (string? Path, bool Present) PathById(string id)
+  {
+    try
+    {
+      var q = id.Split(':');
+      if (q.Length != 2)
+        return (null, true);
+      var serial = Convert.ToUInt32(q[0], 16);
+      var idx = Convert.ToInt64(q[1], 16);
+      foreach (var d in DriveInfo.GetDrives())
+      {
+        try
+        {
+          if (!d.IsReady || (d.DriveType != DriveType.Fixed && d.DriveType != DriveType.Removable))
+            continue;
+          var root = CreateFileW(d.RootDirectory.FullName, ReadAttr, 7, 0, 3, IdFlags, 0);
+          if (root == 0 || root == -1)
+            continue;
+          try
+          {
+            if (Ident(root) is not { } rt || rt.Serial != serial)
+              continue;
+            var desc = new FileIdDesc { Size = 24, Type = 0, Id = idx };
+            var h = OpenFileById(root, ref desc, ReadAttr, 7, 0, IdFlags);
+            if (h == 0 || h == -1)
+              return (null, true);
+            try
+            {
+              var sb = new StringBuilder(1024);
+              var n = GetFinalPathNameByHandleW(h, sb, (uint)sb.Capacity, 0);
+              if (n == 0 || n >= sb.Capacity)
+                return (null, false); // לא הצלחנו לקרוא את הנתיב: לא מוותרים
+              var p = sb.ToString();
+              if (p.StartsWith(@"\\?\UNC\", StringComparison.Ordinal))
+                p = @"\\" + p[8..];
+              else if (p.StartsWith(@"\\?\", StringComparison.Ordinal))
+                p = p[4..];
+              return (p, true);
+            }
+            finally
+            {
+              CloseHandle(h);
+            }
+          }
+          finally
+          {
+            CloseHandle(root);
+          }
+        }
+        catch { }
+      }
+      return (null, false);
+    }
+    catch
+    {
+      return (null, false);
+    }
+  }
+
   [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
   static extern int CM_Locate_DevNodeW(out uint dev, string id, int flags);
 

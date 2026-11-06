@@ -798,6 +798,7 @@ public static class Enforcer
       if (!c.Master)
       {
         FinishRevert(c);
+        SafeBootSet(false); // החסימות כבויות: השירות לא צריך לעלות ב-Safe Mode (נרשם שוב בהחלה הבאה, אם האפשרות מסומנת)
         c.State = 0;
         c.Save(true);
         return;
@@ -941,6 +942,7 @@ public static class Enforcer
       // המסנן נוסף תמיד – גם כשאין כרגע מתאם Wi-Fi – כדי שמתאם Wi-Fi ב-USB שיחובר אחר כך לא יעקוף את החסימה (וגם NetAdapterHeal מוסיף אותו שוב כשמתאם כזה מופיע)
       wlanArgs.AddRange(WlanArgs(ssidWhite));
       AddA(c, "wlanfilter|denyall");
+      AddA(c, "netapplied"); // סימון: חסימת הרשת הוחלה (השירות חוסם מתאמים חדשים רק אחרי "החל שינויים")
       foreach (var ssid in ssidWhite)
         AddA(c, "wlanfilter|allow|" + ssid);
     }
@@ -969,9 +971,11 @@ public static class Enforcer
         fwCmds.Add("Set-NetFirewallProfile -Profile Domain,Private,Public -DefaultOutboundAction Block");
       }
       AddA(c, "fwrules");
+      AddA(c, FwCfg(c));
     }
     if (c.Usb.On)
     {
+      AddA(c, "usbapplied"); // סימון: חסימת ה-USB הוחלה (השירות חוסם כוננים חדשים רק אחרי "החל שינויים")
       // רשימה לבנה לפי מזהה מופע (כולל מספר סידורי): כונן אחר מאותו דגם לא יאושר. ערכים ישנים (שם ידידותי) עדיין נתמכים
       var allow = new List<string>();
       foreach (var l in Lines(usbT!.Result))
@@ -1030,6 +1034,9 @@ public static class Enforcer
           "{36fc9e60-c465-11cf-8056-444553540000}", // USB (רכזות והתקנים מורכבים)
           "{4d36e96c-e325-11ce-bfc1-08002be10318}", // Media (כרטיסי קול / אוזניות)
           "{c166523c-fe0c-4a94-a586-f1a80cfbbf3e}", // AudioEndpoint
+          "{4d36e979-e325-11ce-bfc1-08002be10318}", // Printer (מדפסת USB חדשה)
+          "{1ed2bbf9-11f0-4084-b21f-ad83a8e6dcdc}", // PrintQueue
+          // מצלמות, סורקים, Bluetooth וטלפונים (WPD) נשארים חסומים בכוונה: דרכם אפשר להכניס תמונות וקבצים למחשב
         }
       )
         SetReg(c, "HKLM", DEVREST + @"\AllowDeviceClasses", (ci++).ToString(), cls, RegistryValueKind.String);
@@ -1456,6 +1463,25 @@ public static class Enforcer
     }
   }
 
+  // נקרא מהחלון (מנהל מורם, אחרי קוד כניסה) כשהשירות לא עובד והשמירה נכשלה כי ההקשחה החזקה הסירה את הרשאת השחזור:
+  // מחזירים עכשיו את הזכויות שנרשמו (ייכנסו לתוקף בכניסה הבאה למשתמש). כשהשירות יחזור לעבוד והחסימה עדיין פעילה – הוא יסיר אותן שוב
+  public static int RestoreStrongRights(Config c)
+  {
+    List<string> l;
+    lock (c.Applied)
+      l = c.Applied.Where(x => x.StartsWith("lsaright|")).ToList();
+    int n = 0;
+    foreach (var e in l)
+    {
+      var q = e.Split('|');
+      if (q.Length >= 3 && StrongTarget(q[1]) && StrongRights.Contains(q[2]) && Lsa.Change(q[1], q[2], true))
+        n++;
+    }
+    return n;
+  }
+
+  public static bool HasLsaPending() => File.Exists(LsaPendFile);
+
   // נקרא מהשירות: זכויות שלא הוחזרו בביטול. רק זכויות וחשבונות שההקשחה עצמה מסירה (הקובץ בתיקייה שמנהלים יכולים לכתוב אליה – לא נותנים ממנו זכויות אחרות),
   // ולא בזמן שההקשחה החזקה פעילה
   public static void ProcessLsaPending(Config c, bool blocking)
@@ -1733,11 +1759,13 @@ public static class Enforcer
       if (prevHid.TryRemove(p, out var old))
       {
         AddA(c, old);
+        AddFid(c, p);
         return;
       }
       var a = File.GetAttributes(p);
       File.SetAttributes(p, a | FileAttributes.Hidden | FileAttributes.System);
       AddA(c, $"hid|{p}|{(int)a}");
+      AddFid(c, p);
     }
     catch (Exception __e)
     {
@@ -2014,6 +2042,32 @@ public static class Enforcer
     }
   }
 
+  // האם לתהליך הנוכחי יש הרשאת שחזור (SeRestore). אין – למשל כי ההקשחה החזקה הסירה אותה ממנהלים (גם אם כבר הוחזרה, היא נכנסת לתוקף רק בכניסה הבאה)
+  internal static bool HasRestorePriv()
+  {
+    try
+    {
+      using var me = Process.GetCurrentProcess();
+      if (!OpenProcessToken(me.Handle, 0x20 | 0x8, out var tok))
+        return false;
+      try
+      {
+        if (!LookupPrivilegeValueW(null, "SeRestorePrivilege", out var luid))
+          return false;
+        var tp = new TokPriv { Count = 1, Luid = luid, Attr = 2 };
+        return AdjustTokenPrivileges(tok, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero) && Marshal.GetLastWin32Error() == 0; // 1300 = ההרשאה לא קיימת
+      }
+      finally
+      {
+        CloseHandle(tok);
+      }
+    }
+    catch
+    {
+      return false;
+    }
+  }
+
   // כתיבת קובץ בעזרת הרשאת השחזור (SeRestore) – גם כשההרשאות של הקובץ לא מאפשרות כתיבה רגילה. משמש את החלון (מנהל מורם) כשהשירות לא עובד,
   // כדי שביטול החסימות/הסרה יישמרו בקובץ ההגדרות. אחרת השירות, כשהיה חוזר לעבוד, היה מחיל שוב חלק מהחסימות לפי ההגדרות הישנות
   internal static bool WriteFileBackup(string path, string text)
@@ -2202,7 +2256,20 @@ public static class Enforcer
     {
       bool dir = Directory.Exists(p);
       if (!dir && !File.Exists(p))
+      {
+        // החלה מחדש בזמן חסימה, והפריט שנחסם קודם כבר לא בנתיב הזה (שם התיקייה שונה / הועבר): נשאר חסום במקומו החדש,
+        // והרישום (כולל המזהה) עובר הלאה – כך שהביטול ימצא אותו. בלי זה ההחלה מחדש הייתה משחררת אותו
+        if (prevAcl.TryRemove(p, out _))
+        {
+          AddA(c, "acl|" + p + (Harden ? "|h2" : ""));
+          if (fids.TryGetValue(p, out var fid))
+            AddA(c, $"fid|{fid}|{p}");
+          if (prevHid.TryRemove(p, out var oldHid))
+            AddA(c, oldHid);
+          Interlocked.Increment(ref Blocked);
+        }
         return;
+      }
       if ((r.Hidden && r.Mode == Mode.Full) || (r.Mode == Mode.Code && c.Paths.Contains(r)))
         Hide(c, p);
       if (dir)
@@ -2211,9 +2278,17 @@ public static class Enforcer
         AclOn(new DirectoryInfo(p), true);
         DenySubs(subs);
       }
-      else if (!prevAcl.TryRemove(p, out _))
-        AclOn(new FileInfo(p), false);
+      else
+      {
+        // כבר נעול מההחלה הקודמת – רק אם זה אותו קובץ (ולא קובץ חדש באותו שם, אחרי שהמקורי הועבר: המקורי ישוחרר ב-FinishRevert לפי המזהה)
+        bool same = prevAcl.ContainsKey(p) && (!fids.TryGetValue(p, out var oid) || Native.FileId(p) == oid);
+        if (same)
+          prevAcl.TryRemove(p, out _);
+        else
+          AclOn(new FileInfo(p), false);
+      }
       AddA(c, "acl|" + p + (Harden ? "|h2" : ""));
+      AddFid(c, p);
       Interlocked.Increment(ref Blocked);
     }
     catch (Exception x)
@@ -2241,6 +2316,18 @@ public static class Enforcer
   static bool InstallerSid(string? sid) =>
     sid != null && (sid == "S-1-5-18" || sid == "S-1-5-19" || sid == "S-1-5-20" || sid.StartsWith("S-1-5-80-") || (sid == "S-1-5-32-544" && UacOn.Value));
 
+  // לפי הנתיב: קובץ בבעלות קבוצת המנהלים נחשב "של התקנה" רק ב-ProgramData, ב-Windows ובתיקייה הזמנית (משאבים וחילוץ של תוכנות התקנה). בכל מקום אחר (תיקיות המשתמש, כונן D וכו')
+  // זה בדרך כלל קובץ שמנהל העתיק בחלון מורם (העתקה כמנהל יוצרת קובץ בבעלות קבוצת המנהלים) – ולכן נחסם, אחרת זו הייתה עקיפה קלה.
+  // תוכנות שהותקנו מחוץ ל-Program Files (משחקים ב-D:\Games וכד') עדיין מדולגות לפי קובצי ה-dll שלהן (IsProgramPath)
+  static bool InstallerSid(string? sid, string path) =>
+    InstallerSid(sid)
+    && (
+      sid != "S-1-5-32-544"
+      || path.StartsWith(PData + "\\", StringComparison.OrdinalIgnoreCase)
+      || path.StartsWith(WinDir + "\\", StringComparison.OrdinalIgnoreCase)
+      || path.Contains(@"\AppData\Local\Temp\", StringComparison.OrdinalIgnoreCase) // התקנה שרצה כמנהל מחלצת קבצים לתיקייה הזמנית
+    );
+
   static readonly Lazy<bool> UacOn = new(() =>
   {
     try
@@ -2258,7 +2345,7 @@ public static class Enforcer
   {
     try
     {
-      return InstallerSid(new FileInfo(path).GetAccessControl(AccessControlSections.Owner).GetOwner(typeof(SecurityIdentifier))?.Value);
+      return InstallerSid(new FileInfo(path).GetAccessControl(AccessControlSections.Owner).GetOwner(typeof(SecurityIdentifier))?.Value, path);
     }
     catch
     {
@@ -2743,8 +2830,9 @@ public static class Enforcer
         return true;
       var s = fi.GetAccessControl();
       // קובץ שהבעלים שלו הוא המערכת / מנהלים / TrustedInstaller – נוצר על ידי תוכנת התקנה או שירות (משאבים של תוכנות ב-ProgramData, קבצים שמתקין דרייבר מחלץ ל-Windows\Temp).
-      // לא נועלים אותו, כדי לא לשבור תוכנות והתקנות. משתמש רגיל לא יכול ליצור קובץ בבעלות כזו (העתקה יוצרת קובץ בבעלותו), ולכן זה לא פותח עקיפה
-      if (InstallerSid(s.GetOwner(typeof(SecurityIdentifier))?.Value))
+      // לא נועלים אותו, כדי לא לשבור תוכנות והתקנות. משתמש רגיל לא יכול ליצור קובץ בבעלות כזו (העתקה יוצרת קובץ בבעלותו).
+      // בבעלות קבוצת המנהלים – רק ב-ProgramData (העתקה בחלון מורם מחוץ לשם נחסמת)
+      if (InstallerSid(s.GetOwner(typeof(SecurityIdentifier))?.Value, p))
         return true;
       if (
         s.GetAccessRules(true, false, typeof(SecurityIdentifier))
@@ -3546,13 +3634,15 @@ public static class Enforcer
     }
   }
 
-  static List<string> NetAppsRules(Config c, List<string> names)
+  // white/list: המצב והרשימה שהוחלו בפועל (רשומת fwcfg). null = לפי ההגדרות הנוכחיות (בזמן ההחלה)
+  static List<string> NetAppsRules(Config c, List<string> names, bool? white = null, List<string>? list = null)
   {
     var res = new List<string>();
-    var apps = c.NetApps.White.Where(w => !string.IsNullOrWhiteSpace(w)).ToList();
-    if (c.NetAppsWhite && !string.IsNullOrWhiteSpace(c.AlertUrl))
+    var isWhite = white ?? c.NetAppsWhite;
+    var apps = (list ?? c.NetApps.White).Where(w => !string.IsNullOrWhiteSpace(w)).ToList();
+    if (isWhite && !string.IsNullOrWhiteSpace(c.AlertUrl))
       apps.Add(GateExe); // ברשימה לבנה השירות עצמו חייב להיות מותר, כדי שההתראות (Webhook) יישלחו
-    if (c.NetAppsWhite) // עדכוני אבטחה של Windows ושל Windows Defender, בדיקת תעודות וסנכרון שעון ממשיכים לעבוד גם ברשימה לבנה
+    if (isWhite) // עדכוני אבטחה של Windows ושל Windows Defender, בדיקת תעודות וסנכרון שעון ממשיכים לעבוד גם ברשימה לבנה
       apps.AddRange(new[] { "svc:wuauserv", "svc:UsoSvc", "svc:DoSvc", "svc:CryptSvc", "svc:W32Time", "svc:WinDefend" });
     foreach (var a in apps.Distinct(StringComparer.OrdinalIgnoreCase))
     {
@@ -3576,12 +3666,12 @@ public static class Enforcer
         target = $"-Program '{Q(a)}'";
         label = System.IO.Path.GetFileName(a);
       }
-      foreach (var dr in c.NetAppsWhite ? new[] { "Outbound" } : new[] { "Outbound", "Inbound" })
+      foreach (var dr in isWhite ? new[] { "Outbound" } : new[] { "Outbound", "Inbound" })
       {
-        var nm = $"DeviceGuard {(c.NetAppsWhite ? "Allow" : "Block")} {dr} {label}".Replace("|", "_");
+        var nm = $"DeviceGuard {(isWhite ? "Allow" : "Block")} {dr} {label}".Replace("|", "_");
         names.Add(nm);
         res.Add(
-          $"New-NetFirewallRule -DisplayName '{Q(nm)}' -Group 'DeviceGuardNet' -Direction {dr} {target} -Action {(c.NetAppsWhite ? "Allow" : "Block")} -Profile Any | Out-Null"
+          $"New-NetFirewallRule -DisplayName '{Q(nm)}' -Group 'DeviceGuardNet' -Direction {dr} {target} -Action {(isWhite ? "Allow" : "Block")} -Profile Any | Out-Null"
         );
       }
     }
@@ -3590,10 +3680,10 @@ public static class Enforcer
 
   const string FWPOL = @"SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\";
 
-  static bool NetOk(Config c)
+  static bool NetOk(Config c, bool white, List<string> list)
   {
     var names = new List<string>();
-    NetAppsRules(c, names);
+    NetAppsRules(c, names, white, list);
     var have = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     using (var k = Registry.LocalMachine.OpenSubKey(FWPOL + "FirewallRules"))
       if (k != null)
@@ -3616,7 +3706,7 @@ public static class Enforcer
       using var pk = Registry.LocalMachine.OpenSubKey(FWPOL + pf);
       if (pk?.GetValue("EnableFirewall") is int en && en == 0)
         return false;
-      if (c.NetAppsWhite && !(pk?.GetValue("DefaultOutboundAction") is int oa && oa == 1))
+      if (white && !(pk?.GetValue("DefaultOutboundAction") is int oa && oa == 1))
         return false;
     }
     return true;
@@ -3625,16 +3715,49 @@ public static class Enforcer
   static int healBusy;
   static DateTime healBackoff = DateTime.MinValue;
 
-  // נקרא מהשירות כל כמה שניות: אם מישהו מחק את כללי החומה או שינה את ברירת המחדל – יוצר אותם מחדש
+  // המצב והרשימה שהוחלו בפועל: fwcfg|1/0|רשימה (Base64 של JSON). null = חסימת רשת לפי תוכנה לא הוחלה.
+  // רשומת fwrules בלי fwcfg (החלה מגרסה קודמת): לפי ההגדרות הנוכחיות, כמו קודם
+  static (bool White, List<string> List)? FwApplied(Config c)
+  {
+    List<string> ap;
+    lock (c.Applied)
+      ap = c.Applied.Where(x => x == "fwrules" || x.StartsWith("fwcfg|")).ToList();
+    var cfg = ap.FirstOrDefault(x => x.StartsWith("fwcfg|"));
+    if (cfg != null)
+    {
+      var q = cfg.Split('|', 3);
+      try
+      {
+        var l = q.Length > 2 ? System.Text.Json.JsonSerializer.Deserialize<List<string>>(Encoding.UTF8.GetString(Convert.FromBase64String(q[2]))) : null;
+        return (q.Length > 1 && q[1] == "1", l ?? new List<string>());
+      }
+      catch (Exception __e)
+      {
+        Diag.Log(__e);
+      }
+    }
+    return ap.Contains("fwrules") ? (c.NetAppsWhite, c.NetApps.White.ToList()) : null;
+  }
+
+  static string FwCfg(Config c) =>
+    "fwcfg|" + (c.NetAppsWhite ? "1" : "0") + "|" + Convert.ToBase64String(Encoding.UTF8.GetBytes(System.Text.Json.JsonSerializer.Serialize(c.NetApps.White)));
+
+  // נקרא מהשירות כל כמה שניות: אם מישהו מחק את כללי החומה או שינה את ברירת המחדל – יוצר אותם מחדש.
+  // משחזרים רק את מה שההחלה רשמה (מצב ורשימה): סימון "חסימת רשת לפי תוכנה" או שינוי הרשימה בלי "החל שינויים" לא נוגע בחומת האש
+  // (אחרת השינוי לא היה נרשם, לא היה מבוטל בביטול החסימה, והאינטרנט היה עלול להישאר חסום לכל התוכנות)
   public static void NetHeal(Config c)
   {
-    if (!c.Master || !c.NetApps.On || DateTime.UtcNow < healBackoff || Applying())
+    if (!c.Master || DateTime.UtcNow < healBackoff || Applying())
       return;
+    var fw = FwApplied(c);
+    if (fw == null)
+      return;
+    var (white, list) = fw.Value;
     if (Interlocked.Exchange(ref healBusy, 1) == 1)
       return;
     try
     {
-      if (NetOk(c))
+      if (NetOk(c, white, list))
         return;
       Alerts.Log("כללי חומת האש שונו או נמחקו – משחזר");
       var cmds = new List<string>
@@ -3642,11 +3765,11 @@ public static class Enforcer
         "Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True",
         "Remove-NetFirewallRule -Group 'DeviceGuardNet' -ErrorAction SilentlyContinue",
       };
-      cmds.AddRange(NetAppsRules(c, new List<string>()));
-      if (c.NetAppsWhite)
+      cmds.AddRange(NetAppsRules(c, new List<string>(), white, list));
+      if (white)
         cmds.Add("Set-NetFirewallProfile -Profile Domain,Private,Public -DefaultOutboundAction Block");
       PSAll(cmds);
-      if (!NetOk(c))
+      if (!NetOk(c, white, list))
         healBackoff = DateTime.UtcNow.AddMinutes(10);
     }
     catch
@@ -3711,6 +3834,10 @@ public static class Enforcer
     {
       Diag.Log(__e);
     }
+    // מתאמים שאינם Wi-Fi: רק אחרי שחסימת הרשת הוחלה בפועל. סימון "חסימת רשת" בלי "החל שינויים" לא מנתק את הרשת הקווית
+    // (רשומה מגרסה קודמת: wlanfilter|denyall נרשם בכל החלה של חסימת רשת)
+    if (!applied.Contains("wlanfilter|denyall") && !AppliedHas(c, "netapplied"))
+      return;
     try
     {
       var wl = c.Net.White.Where(w => !w.StartsWith("ssid:")).ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -3821,10 +3948,11 @@ public static class Enforcer
         applied = c.Applied.Any(x => x == "acl|" + p || x.StartsWith("acl|" + p + "|", StringComparison.Ordinal) || x == "acl|" + r.Path || x.StartsWith("acl|" + r.Path + "|", StringComparison.Ordinal));
       if (!applied)
         return false; // לא נחסם בהחלה (למשל לא היה קיים) – לא נועלים בלי רישום, אחרת לא היה משתחרר בביטול
-      if (Directory.Exists(r.Path))
-        return !HasDeny(r.Path, false);
-      if (File.Exists(r.Path))
-        return !HasOurDeny(new FileInfo(r.Path).GetAccessControl());
+      var cur = CurPath(c, r.Path);
+      if (Directory.Exists(cur))
+        return !HasDeny(cur, false);
+      if (File.Exists(cur))
+        return !HasOurDeny(new FileInfo(cur).GetAccessControl());
       return false;
     }
     catch
@@ -3940,9 +4068,23 @@ public static class Enforcer
   static string UsbHealFile => System.IO.Path.Combine(Config.Dir, "var", "usbheal.txt");
   static int usbHealBusy;
 
+  static bool AppliedHas(Config c, string e)
+  {
+    lock (c.Applied)
+      return c.Applied.Contains(e);
+  }
+
+  // רק אחרי שחסימת ה-USB הוחלה בפועל: סימון USB בלי "החל שינויים" לא משבית כוננים שמחברים.
+  // (רשומה מגרסה קודמת: מדיניות DenyRemovableDevices נרשמת בכל החלה של חסימת USB)
+  static bool UsbApplied(Config c)
+  {
+    lock (c.Applied)
+      return c.Applied.Contains("usbapplied") || c.Applied.Any(x => x.StartsWith("reg|") && x.Contains(@"DeviceInstall\Restrictions|DenyRemovableDevices|"));
+  }
+
   public static void UsbDiskHeal(Config c)
   {
-    if (!c.Master || !c.Usb.On || Applying())
+    if (!c.Master || !c.Usb.On || !UsbApplied(c) || Applying())
       return;
     if (Interlocked.Exchange(ref usbHealBusy, 1) == 1)
       return;
@@ -4278,10 +4420,29 @@ public static class Enforcer
       l.IconLocation = GateExe + ",0";
       l.Save();
       AddA(c, "lnk|" + lnk);
+      AddFid(c, lnk);
     }
     catch (Exception __e)
     {
       Diag.Log(__e);
+    }
+  }
+
+  // הנתיב הנוכחי של פריט שנחסם: אם לא קיים בנתיב המקורי (שם התיקייה או תיקייה מעליה שונה) – לפי המזהה שנרשם בהחלה
+  static string CurPath(Config? c, string path)
+  {
+    try
+    {
+      if (c == null || File.Exists(path) || Directory.Exists(path))
+        return path;
+      string? id;
+      lock (c.Applied)
+        id = c.Applied.Where(x => x.StartsWith("fid|")).Select(x => x.Split('|', 3)).FirstOrDefault(q => q.Length == 3 && q[2].TrimEnd('\\').Equals(path.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))?[1];
+      return id != null && Native.PathById(id).Path is { } np ? np : path;
+    }
+    catch
+    {
+      return path;
     }
   }
 
@@ -4294,10 +4455,11 @@ public static class Enforcer
     }
     try
     {
-      if (Directory.Exists(r.Path))
-        UnwalkDir(r.Path);
+      var path = CurPath(c, r.Path);
+      if (Directory.Exists(path))
+        UnwalkDir(path);
       else
-        AclOff(new FileInfo(r.Path), false);
+        AclOff(new FileInfo(path), false);
     }
     catch (Exception __e)
     {
@@ -4314,14 +4476,15 @@ public static class Enforcer
     }
     try
     {
-      if (Directory.Exists(r.Path))
+      var path = CurPath(c, r.Path);
+      if (Directory.Exists(path))
       {
-        var subs = ListDirs(r.Path);
-        AclOn(new DirectoryInfo(r.Path), true);
+        var subs = ListDirs(path);
+        AclOn(new DirectoryInfo(path), true);
         DenySubs(subs);
       }
-      else if (File.Exists(r.Path))
-        AclOn(new FileInfo(r.Path), false);
+      else if (File.Exists(path))
+        AclOn(new FileInfo(path), false);
     }
     catch (Exception __e)
     {
@@ -4449,7 +4612,6 @@ public static class Enforcer
     }
     Sc("failure DeviceGuard reset= 0 actions= restart/1000/restart/1000/restart/1000");
     Sc("failureflag DeviceGuard 1");
-    SafeBootSet(true);
     Sc("start DeviceGuard");
     for (int i = 0; i < 20 && !Config.Up(); i++)
       Thread.Sleep(500);
@@ -4575,6 +4737,7 @@ public static class Enforcer
       l.IconLocation = Directory.Exists(path) ? Environment.SystemDirectory + @"\shell32.dll,3" : path + ",0";
       l.Save();
       AddA(c, "lnk|" + lnk);
+      AddFid(c, lnk);
     }
     catch (Exception __e)
     {
@@ -4583,19 +4746,151 @@ public static class Enforcer
   }
 
   // ---------- ביטול ----------
+  // מזהה NTFS של כל נתיב שנחסם/הוסתר (רשומת fid|מזהה|נתיב). תיקייה חסומה שהשם שלה (או של תיקייה מעליה) שונה בזמן החסימה,
+  // או שהועברה באותו כונן, נמצאת בביטול לפי המזהה – ולא נשארת נעולה ומוסתרת לתמיד
+  static readonly ConcurrentDictionary<string, string> fids = new(StringComparer.OrdinalIgnoreCase);
+
+  static void AddFid(Config c, string p)
+  {
+    var id = Native.FileId(p);
+    if (id == null)
+      return;
+    var e = $"fid|{id}|{p}";
+    lock (c.Applied)
+      if (!c.Applied.Contains(e))
+        c.Applied.Add(e);
+  }
+
+  static void LoadFids(IEnumerable<string> all)
+  {
+    fids.Clear();
+    foreach (var e in all)
+      if (e.StartsWith("fid|"))
+      {
+        var q = e.Split('|', 3);
+        if (q.Length == 3)
+          fids[q[2]] = q[1];
+      }
+  }
+
+  // התוצאה: 0 = שוחרר, 1 = לא נמצא כרגע (כונן לא מחובר / לא ניתן לבדוק) – לנסות שוב מאוחר יותר, 2 = הפריט כבר לא קיים
+  static int RevertFileCore(string e, string? id)
+  {
+    var p = e.Split('|');
+    var path = p[1];
+    bool exists = File.Exists(path) || Directory.Exists(path);
+    // יש מזהה: בודקים שזה אותו פריט (אולי הפריט המקורי הועבר ובנתיב הישן נוצר פריט אחר באותו שם)
+    if (id != null ? Native.FileId(path) != id : !exists)
+    {
+      if (id != null)
+      {
+        var (np, present) = Native.PathById(id);
+        if (np == null)
+          return present ? 2 : 1;
+        if (!np.Equals(path, StringComparison.OrdinalIgnoreCase))
+          Alerts.Log($"פריט חסום הועבר או ששמו שונה בזמן החסימה – שוחרר במיקומו החדש: {np}", false);
+        path = np;
+      }
+      else
+      {
+        // אין מזהה (רשומה מגרסה קודמת): אם הכונן לא מחובר – מנסים שוב כשיחובר; אחרת אין דרך למצוא את הפריט
+        var root = System.IO.Path.GetPathRoot(path);
+        return string.IsNullOrEmpty(root) || Directory.Exists(root) ? 2 : 1;
+      }
+    }
+    switch (p[0])
+    {
+      case "acl":
+        if (Directory.Exists(path))
+          UnwalkDir(path);
+        else
+          AclOff(new FileInfo(path), false);
+        break;
+      case "hid":
+        File.SetAttributes(path, (FileAttributes)int.Parse(p[2]));
+        break;
+      case "lnk":
+        if (path.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase))
+          File.Delete(path);
+        break;
+    }
+    return 0;
+  }
+
   static void RevertFile(string e)
   {
     var p = e.Split('|');
-    if (p[0] == "acl")
+    fids.TryGetValue(p[1], out var id);
+    if (RevertFileCore(e, id) == 1)
+      AddPathPending(e, id);
+  }
+
+  // ---- שחרורים שממתינים לכונן שלא מחובר כרגע (pathpending.txt: רשומה<TAB>מזהה) ----
+  static string PathPendFile => System.IO.Path.Combine(Config.Dir, "var", "pathpending.txt");
+  static readonly object PathPendLock = new();
+
+  static void AddPathPending(string e, string? id)
+  {
+    lock (PathPendLock)
+      try
+      {
+        Directory.CreateDirectory(System.IO.Path.GetDirectoryName(PathPendFile)!);
+        File.AppendAllLines(PathPendFile, new[] { e + "\t" + (id ?? "") });
+      }
+      catch (Exception __e)
+      {
+        Diag.Log(__e);
+      }
+  }
+
+  // נקרא מהשירות (וגם לפני הסרה). פריט שנחסם שוב בינתיים (מופיע במה שהוחל עכשיו) – לא משוחרר
+  public static int ProcessPathPending(Config c)
+  {
+    lock (PathPendLock)
     {
-      bool dir = Directory.Exists(p[1]);
-      if (dir)
-        UnwalkDir(p[1]);
-      else
-        AclOff(new FileInfo(p[1]), false);
+      try
+      {
+        if (!File.Exists(PathPendFile))
+          return 0;
+        var lines = File.ReadAllLines(PathPendFile).Where(l => l.Length > 0).Distinct().ToList();
+        List<string> cur;
+        lock (c.Applied)
+          cur = c.Applied.ToList();
+        var keep = new List<string>();
+        int done = 0;
+        foreach (var l in lines)
+        {
+          var t = l.Split('\t', 2);
+          var e = t[0];
+          var id = t.Length > 1 && t[1].Length > 0 ? t[1] : null;
+          if (cur.Contains(e) || (id != null && cur.Any(x => x.StartsWith("fid|" + id + "|", StringComparison.Ordinal))))
+            continue; // נחסם מחדש בהחלה מאוחרת יותר – הביטול הבא יטפל בו
+          try
+          {
+            var r = RevertFileCore(e, id);
+            if (r == 1)
+              keep.Add(l);
+            else if (r == 0)
+              done++;
+          }
+          catch (Exception __e)
+          {
+            Diag.Log(__e);
+            keep.Add(l);
+          }
+        }
+        if (keep.Count == 0)
+          File.Delete(PathPendFile);
+        else if (keep.Count != lines.Count)
+          File.WriteAllLines(PathPendFile, keep);
+        return done;
+      }
+      catch (Exception __e)
+      {
+        Diag.Log(__e);
+        return 0;
+      }
     }
-    else
-      File.SetAttributes(p[1], (FileAttributes)int.Parse(p[2]));
   }
 
   // משחרר חסימות שהיו בהחלה הקודמת ולא נדרשו מחדש
@@ -4686,6 +4981,7 @@ public static class Enforcer
     List<string> all;
     lock (c.Applied)
       all = c.Applied.ToList();
+    LoadFids(all);
     if (soft && c.Master)
     { // חסימות קבצים והתקני USB שכבר קיימות נשארות כמו שהן; FinishRevert ישחרר רק את מה שכבר לא נדרש
       var rest = new List<string>();
@@ -4781,7 +5077,7 @@ public static class Enforcer
             break;
           } // רשומה ישנה (גרסאות קודמות)
           case "lnk":
-            File.Delete(p[1]);
+            RevertFile(e); // קיצור הדרך נמצא גם אם שם התיקייה שמעליו שונה
             break;
           case "task":
             Schtasks("/End /TN DeviceGuardWatch");

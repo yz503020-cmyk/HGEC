@@ -126,6 +126,18 @@ public partial class MainWin
     {
       sp.Children.Add(new TextBlock { Text = "אימות הקוד" });
       sp.Children.Add(b);
+      // המלצה בלבד (לא חובה): קוד קצר שכולו ספרות קל לפענח למי שיש לו הרשאות מנהל
+      sp.Children.Add(
+        new TextBlock
+        {
+          Text = "מומלץ: קוד של 10 תווים ומעלה, עם אותיות ולא רק ספרות – קשה יותר לפענח.",
+          Foreground = Brushes.Gray,
+          FontSize = 12,
+          TextWrapping = TextWrapping.Wrap,
+          Width = 240,
+          Margin = new Thickness(0, 0, 0, 8),
+        }
+      );
     }
     string? res = null;
     var ok = new Button
@@ -947,7 +959,7 @@ public partial class MainWin
   {
     var cb = new CheckBox
     {
-      Content = "אל תחסום קבצים בתיקיית AppData של המשתמשים (מומלץ: מונע שבירת תוכנות)",
+      Content = "אל תחסום קבצים קיימים ב-AppData (מומלץ: מונע שבירת תוכנות). קבצים חדשים שמוכנסים לשם – ננעלים",
       IsChecked = C.SkipAppData,
       Margin = new Thickness(0, 0, 0, 8),
     };

@@ -161,7 +161,8 @@ static class UserSession
   }
 
   // true אם הופעל בהצלחה בחוג המשתמש. sessionId = -1: הסשן הפעיל בקונסול; אחרת הסשן שצוין (למשל סשן של RDP)
-  public static bool Launch(string exe, string args, int sessionId = -1)
+  // hidden = בלי חלון (נשלח לתוכנה כבקשה; תוכנה יכולה להתעלם)
+  public static bool Launch(string exe, string args, int sessionId = -1, bool hidden = false)
   {
     EnableTcb();
     var session = sessionId >= 0 ? (uint)sessionId : WTSGetActiveConsoleSessionId();
@@ -181,6 +182,11 @@ static class UserSession
         try
         {
           var si = new STARTUPINFO { cb = Marshal.SizeOf<STARTUPINFO>(), lpDesktop = "winsta0\\default" };
+          if (hidden)
+          {
+            si.dwFlags = 1; // STARTF_USESHOWWINDOW
+            si.wShowWindow = 0; // SW_HIDE
+          }
           var cmd = new StringBuilder($"\"{exe}\" {args}");
           var ok = CreateProcessAsUser(
             dupToken,

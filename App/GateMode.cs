@@ -177,6 +177,9 @@ static class GateMode
   public static int RunGate(string[] a)
   {
     var id = a[1];
+    // מזהה חוק תקין: אותיות, ספרות, מקף וקו תחתון בלבד. מזהה עם "|" (הפעלה ידנית של השער) היה משנה את הפקודה שנשלחת לשירות
+    if (id.Length == 0 || id.Length > 64 || !id.All(ch => char.IsAsciiLetterOrDigit(ch) || ch == '-' || ch == '_'))
+      return Blocked;
     var cl = Environment.CommandLine;
     var marker = "--gate " + id;
     var mi = cl.IndexOf(marker, StringComparison.Ordinal);

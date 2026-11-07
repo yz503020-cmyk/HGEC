@@ -37,6 +37,9 @@ public static class Enforcer
     + "  if ($usb -and -not $sys) { $_.InstanceId + '|' + $_.FriendlyName + '|' + $p }\n"
     + "}";
 
+  // הערכה בשכבות של מדיניות התקנת התקנים (AllowDenyLayered): Windows 11 (גרסה 22000 ואילך). ב-Windows 10 התמיכה תלויה בעדכונים – לא סומכים עליה
+  static bool LayeredOk => Environment.OSVersion.Version.Build >= 22000;
+
   static bool SystemOnUsb()
   {
     try
@@ -1407,7 +1410,19 @@ public static class Enforcer
         }
         SetReg(c, "HKLM", RSD, "Deny_All", 1);
       } // חוסם גם אמצעי אחסון שכבר הותקנו
-      SetReg(c, "HKLM", DEVREST, "DenyRemovableDevices", 1); // חסימה ברמת המדיניות: חלה גם על התקנים עתידיים
+      // חסימה ברמת המדיניות: חלה גם על התקנים עתידיים.
+      // "חסימת התקנים נשלפים" בטוחה רק כש-Windows מעריך את המדיניות בשכבות (AllowDenyLayered, נתמך בוודאות ב-Windows 11).
+      // בלי זה החסימה גוברת על ההיתר לפי סוג התקן – ומקלדת/עכבר חדשים (או ביציאה אחרת) לא היו מותקנים.
+      // לכן ב-Windows 10 חוסמים במקומה רק לפי סוג החיבור של ההתקן: אחסון USB, מצלמות/סורקים (PTP) וטלפונים (MTP). מקלדות ועכברים לא נפגעים
+      if (LayeredOk)
+        SetReg(c, "HKLM", DEVREST, "DenyRemovableDevices", 1);
+      else
+      {
+        SetReg(c, "HKLM", DEVREST, "DenyDeviceIDs", 1);
+        int dd = 1;
+        foreach (var id in new[] { @"USB\Class_08", @"USB\Class_06", @"USB\MS_COMP_MTP" })
+          SetReg(c, "HKLM", DEVREST + @"\DenyDeviceIDs", (dd++).ToString(), id, RegistryValueKind.String);
+      }
       // הערכה בשכבות: היתר לפי סוג התקן גובר על "חסימת התקנים נשלפים", כך שמקלדת, עכבר, אוזניות ורמקולים חדשים עדיין מותקנים.
       // (כונן ה-USB עצמו הוא מסוג "כונן דיסק" ולכן נשאר חסום, גם כשההתקן האב שלו מסוג USB מותר)
       SetReg(c, "HKLM", DEVREST, "AllowDenyLayered", 1);
@@ -1531,18 +1546,7 @@ public static class Enforcer
         SetReg(c, "HKLM", pp, "SaferFlags", 0);
       }
       // תיקיות שמשתמש רגיל יכול לכתוב אליהן בתוך Windows: חוסמים הרצה מהן (כלל מפורש גובר על הכלל הכללי של Windows)
-      foreach (
-        var wd in new[]
-        {
-          @"\Temp",
-          @"\Tasks",
-          @"\tracing",
-          @"\Registration\CRMLog",
-          @"\System32\Tasks",
-          @"\System32\spool\drivers\color",
-          @"\System32\spool\PRINTERS",
-        }
-      )
+      foreach (var wd in WinUserWritable)
       {
         var dp = SAFER + @"\0\Paths\{" + Guid.NewGuid() + "}";
         SetReg(c, "HKLM", dp, "ItemData", WinDir + wd, RegistryValueKind.String);
@@ -1601,6 +1605,131 @@ public static class Enforcer
       Diag.Log(__e);
     }
     return res;
+  }
+
+  // תיקיות שמשתמש רגיל יכול לכתוב אליהן בתוך Windows (יחסית לתיקיית Windows): אסורות להרצה בחסימת תוכנות ניידות
+  static readonly string[] WinUserWritable =
+  {
+    @"\Temp",
+    @"\Tasks",
+    @"\tracing",
+    @"\Registration\CRMLog",
+    @"\System32\Tasks",
+    @"\System32\spool\drivers\color",
+    @"\System32\spool\PRINTERS",
+  };
+
+  // ---- rundll32 / regsvr32 בחסימת תוכנות ניידות ----
+  // Windows מריץ את הכלים האלה מתיקיית המערכת (מותרת), והם טוענים קובץ DLL מכל מקום – כך אפשר היה להריץ קוד מתיקיית ההורדות למרות החסימה.
+  // מחזיר את קובץ ה-DLL שאינו בתיקייה מותרת (null = הכול מותר). מותר: Windows (חוץ מהתיקיות שמשתמש יכול לכתוב אליהן), Program Files,
+  // תיקיית DeviceGuard, והתיקייה של תוכנה ברשימה הלבנה. שם בלי נתיב מותר רק אם הוא קיים בתיקיות המערכת (אחרת הוא נטען מהתיקייה הנוכחית)
+  public static string? BadDllArg(string name, string cmdLine, Config c)
+  {
+    var tail = cmdLine.TrimStart();
+    if (tail.StartsWith('"'))
+    {
+      var e = tail.IndexOf('"', 1);
+      tail = e < 0 ? "" : tail[(e + 1)..];
+    }
+    else
+    {
+      var sp = tail.IndexOfAny(new[] { ' ', '\t' });
+      tail = sp < 0 ? "" : tail[(sp + 1)..];
+    }
+    tail = tail.Trim();
+    var dlls = new List<string>();
+    if (name.Equals("rundll32", StringComparison.OrdinalIgnoreCase))
+    {
+      if (tail.Length == 0)
+        return null;
+      string d;
+      if (tail.StartsWith('"'))
+      {
+        var e = tail.IndexOf('"', 1);
+        d = e < 0 ? tail[1..] : tail[1..e];
+      }
+      else
+      {
+        // "קובץ,פונקציה": עד הפסיק (נתיב בלי מרכאות יכול להכיל רווחים). אם לפני הפסיק יש רווח והנתיב לא קיים – עד הרווח
+        var comma = tail.IndexOf(',');
+        var ws = tail.IndexOfAny(new[] { ' ', '\t' });
+        var a = comma >= 0 ? tail[..comma] : tail;
+        var b = ws >= 0 ? tail[..ws] : tail;
+        d = a.IndexOfAny(new[] { ' ', '\t' }) < 0 || File.Exists(a) ? a : b;
+      }
+      dlls.Add(d.Trim());
+    }
+    else
+    {
+      // regsvr32 [/s] [/u] [/i[:...]] [/n] קובץ [קובץ...]
+      var tok = new StringBuilder();
+      bool inQ = false;
+      void Flush()
+      {
+        if (tok.Length == 0)
+          return;
+        var t = tok.ToString();
+        tok.Clear();
+        if (!(t.StartsWith('/') || t.StartsWith('-')))
+          dlls.Add(t);
+      }
+      foreach (var ch in tail)
+      {
+        if (ch == '"')
+          inQ = !inQ;
+        else if (!inQ && (ch == ' ' || ch == '\t'))
+          Flush();
+        else
+          tok.Append(ch);
+      }
+      Flush();
+    }
+    foreach (var d in dlls)
+    {
+      if (d.Length == 0)
+        continue;
+      if (!DllAllowed(d, c))
+        return d;
+    }
+    return null;
+  }
+
+  static bool DllAllowed(string d, Config c)
+  {
+    try
+    {
+      if (d.IndexOfAny(new[] { '\\', '/', ':' }) < 0)
+      {
+        // שם בלי נתיב: Windows מחפש קודם בתיקיות המערכת. אם הוא לא שם – הוא ייטען מהתיקייה הנוכחית / מה-PATH (מקום שהמשתמש קובע)
+        var f = System.IO.Path.HasExtension(d) ? d : d + ".dll";
+        foreach (var sd in new[] { Environment.SystemDirectory, Environment.GetFolderPath(Environment.SpecialFolder.SystemX86), WinDir })
+          if (!string.IsNullOrEmpty(sd) && File.Exists(System.IO.Path.Combine(sd, f)))
+            return true;
+        return false;
+      }
+      if (!System.IO.Path.IsPathFullyQualified(d))
+        return false; // נתיב יחסי (תיקייה\קובץ, C:קובץ): תלוי בתיקייה הנוכחית
+      var p = System.IO.Path.GetFullPath(d).TrimEnd('\\');
+      if (Under(p, WinDir))
+        return !WinUserWritable.Any(w => Under(p, WinDir + w));
+      foreach (var r in new[] { PF, PF86, CdT })
+        if (!string.IsNullOrEmpty(r) && Under(p, r))
+          return true;
+      foreach (var w in c.Portable.White)
+      {
+        if (string.IsNullOrWhiteSpace(w))
+          continue;
+        var wt = w.Trim().TrimEnd('\\');
+        var dir = Directory.Exists(wt) ? wt : System.IO.Path.GetDirectoryName(wt);
+        if (!string.IsNullOrEmpty(dir) && Under(p, dir.TrimEnd('\\')))
+          return true;
+      }
+      return false;
+    }
+    catch
+    {
+      return false;
+    }
   }
 
   // ---------- Software Restriction Policies ב-Windows 11 ----------
@@ -3064,7 +3193,8 @@ public static class Enforcer
     return false;
   }
 
-  public static bool InSkipped(string p)
+  // fresh = קובץ חדש שנוצר/הועבר עכשיו (המעקב אחרי קבצים חדשים), ולא סריקה של קבצים קיימים
+  public static bool InSkipped(string p, bool fresh = false)
   {
     if (Under(p, WinDir) && !Under(p, WinDir + @"\Temp"))
       return true;
@@ -3084,7 +3214,12 @@ public static class Enforcer
     if (SkipAppData && p.StartsWith(UsersDir + "\\", StringComparison.OrdinalIgnoreCase))
     {
       var parts = p[(UsersDir.Length + 1)..].Split('\\');
-      if (parts.Length >= 2 && parts[1].Equals("AppData", StringComparison.OrdinalIgnoreCase) && !ArchiveTemp(parts))
+      if (
+        parts.Length >= 2
+        && parts[1].Equals("AppData", StringComparison.OrdinalIgnoreCase)
+        && !ArchiveTemp(parts)
+        && !(fresh && AppDataLockable(parts))
+      )
         return true;
     }
     foreach (var e in Exclude)
@@ -3093,6 +3228,57 @@ public static class Enforcer
     if (SkipProgramDirs && IsProgramPath(p))
       return true;
     return false;
+  }
+
+  // AppData: קבצים שמוכנסים לשם בזמן החסימה (העתקה, העברה, הורדה, חילוץ) ננעלים – כדי שאי אפשר יהיה "להחביא" שם תמונות/שירים/סרטים.
+  // הסריקה של קבצים קיימים עדיין מדלגת על AppData (תמונות ואייקונים של תוכנות לא ננעלים). גם קבצים חדשים לא ננעלים בנתוני Windows
+  // ואפליקציות Store, בנתוני דפדפנים, ובתיקייה של תוכנה (יש בה קובצי exe/dll) – כדי לא לשבור תוכנות. parts = הנתיב שאחרי C:\Users
+  static readonly string[] AppDataKeep = { "Microsoft", "Packages", "Google", "BraveSoftware", "Mozilla", "Opera Software", "Vivaldi", "Chromium" };
+
+  static bool AppDataLockable(string[] parts)
+  {
+    // parts: משתמש, AppData, Local/Roaming/LocalLow, ...תיקיות, שם הקובץ. קובץ ישירות בתיקייה הזו (בלי תיקיית תוכנה) – ננעל
+    if (parts.Length < 5)
+      return true;
+    if (AppDataKeep.Any(x => x.Equals(parts[3], StringComparison.OrdinalIgnoreCase)))
+      return false;
+    // תיקיית התוכנה: AppData\Local\<שם>. ב-Programs וב-Temp – תיקיית המשנה (אחרת כל Programs / Temp היו נחשבים תיקיית תוכנה אחת)
+    int n = 4;
+    if (parts[3].Equals("Programs", StringComparison.OrdinalIgnoreCase) || parts[3].Equals("Temp", StringComparison.OrdinalIgnoreCase))
+    {
+      if (parts.Length < 6)
+        return true;
+      n = 5;
+    }
+    var app = System.IO.Path.Combine(UsersDir, string.Join("\\", parts[..n]));
+    return !Cached("a|" + app, () => HasBin(app, 3));
+  }
+
+  // יש בתיקייה (או בתיקיות המשנה שלה, עד עומק מוגבל) קובץ תוכנה. שגיאה בקריאה – נחשב תיקיית תוכנה (לא נועלים כשלא בטוחים)
+  static bool HasBin(string d, int depth)
+  {
+    try
+    {
+      foreach (var f in Directory.EnumerateFiles(d))
+      {
+        var e = System.IO.Path.GetExtension(f);
+        if (e.Equals(".exe", StringComparison.OrdinalIgnoreCase) || e.Equals(".dll", StringComparison.OrdinalIgnoreCase))
+          return true;
+      }
+      if (depth > 0)
+        foreach (var s in Directory.EnumerateDirectories(d))
+        {
+          if ((File.GetAttributes(s) & FileAttributes.ReparsePoint) != 0)
+            continue;
+          if (HasBin(s, depth - 1))
+            return true;
+        }
+      return false;
+    }
+    catch
+    {
+      return true;
+    }
   }
 
   // כוננים שאינם NTFS/ReFS (FAT, exFAT) לא תומכים בהרשאות, ולכן אי אפשר לחסום בהם קבצים
@@ -3281,6 +3467,14 @@ public static class Enforcer
         && (x.FileSystemRights & FileSystemRights.Delete) != 0
       );
 
+  // עטיפות אלבום ש-Windows Media Player יוצר מוסתרות כקובצי מערכת מלכתחילה (Folder.jpg, AlbumArtSmall.jpg, AlbumArt_{...}_Large.jpg).
+  // כשאין רישום של המצב המקורי, לא מניחים שהן הוסתרו על ידינו – אחרת הן היו נחשפות אחרי השחרור
+  static bool WinHiddenArt(string p)
+  {
+    var n = System.IO.Path.GetFileName(p);
+    return n.Equals("Folder.jpg", StringComparison.OrdinalIgnoreCase) || n.StartsWith("AlbumArt", StringComparison.OrdinalIgnoreCase);
+  }
+
   // שחרור כל הקבצים שנחסמו ברקע. היומן מועבר הצידה לפני הקריאה (ולא נמחק אחריה), כך ששורות שהשירות מוסיף בינתיים נשמרות ביומן חדש ומשוחררות על ידו.
   // קבצים שלא שוחררו (כונן מנותק, שגיאה) נשארים ביומן ומשוחררים כשאפשר
   static void ReleaseWatchLogAll()
@@ -3366,13 +3560,13 @@ public static class Enforcer
       known.Clear();
   }
 
-  public static bool BlockNewFile(Rule r, string p)
+  public static bool BlockNewFile(Rule r, string p, bool fresh = false)
   {
     try
     {
       if (known.ContainsKey(p))
         return true;
-      if (RemovableExcluded(p) || InSkipped(p) || !AclOk(p))
+      if (RemovableExcluded(p) || InSkipped(p, fresh) || !AclOk(p))
         return true;
       var fi = new FileInfo(p);
       if (!fi.Exists || Protected(p))
@@ -3394,7 +3588,7 @@ public static class Enforcer
         {
           var cur = File.GetAttributes(p);
           var hs = FileAttributes.Hidden | FileAttributes.System;
-          EnqueueLog($"{p}|{(int)((cur & hs) == hs ? cur & ~hs : cur)}"); // מוסתר+מערכת = הוסתר על ידינו
+          EnqueueLog($"{p}|{(int)((cur & hs) == hs && !WinHiddenArt(p) ? cur & ~hs : cur)}"); // מוסתר+מערכת = הוסתר על ידינו (חוץ מעטיפות אלבום של Windows)
         }
         known[p] = 0;
         return true;
@@ -3691,8 +3885,8 @@ public static class Enforcer
             AclOff(fi, false);
             var a = File.GetAttributes(f);
             var hs = FileAttributes.Hidden | FileAttributes.System;
-            if ((a & hs) == hs)
-              File.SetAttributes(f, a & ~hs); // מוסתר+מערכת = הוסתר על ידינו
+            if ((a & hs) == hs && !WinHiddenArt(f))
+              File.SetAttributes(f, a & ~hs); // מוסתר+מערכת = הוסתר על ידינו (חוץ מעטיפות אלבום של Windows)
             Interlocked.Increment(ref n);
           }
           catch (Exception __e)
@@ -3960,7 +4154,7 @@ public static class Enforcer
               rel.Add(l);
             continue;
           } // כונן שאינו זמין כרגע (נשלף / נעול) – שומרים ביומן כדי שהקובץ ישוחרר בהמשך; קובץ שנמחק מוסר מהיומן
-          if (inMap && !InSkipped(p) && !RemovableExcluded(p) && !InstallerOwned(p))
+          if (inMap && !InSkipped(p, true) && !RemovableExcluded(p) && !InstallerOwned(p)) // true: קובץ ב-AppData שננעל כשהוכנס לשם – נשאר נעול
           {
             keep.Add(l);
             known[p] = 0;
@@ -4162,6 +4356,63 @@ public static class Enforcer
     catch (Exception __e)
     {
       Diag.Log(__e);
+    }
+  }
+
+  // מטמון התמונות הממוזערות שייך לכל משתמש בנפרד, והניקוי שבחלון (למעלה) רץ בחשבון המנהל – ולכן ניקה רק את המטמון של המנהל.
+  // כאן (בשירות, אחרי הסריקה) ניקוי הדיסק רץ בחשבון של המשתמש שמחובר עכשיו למחשב, בסשן שלו ובלי חלון.
+  // מספר פרופיל ניקוי נפרד (778, בחלון 777), כדי ששני הניקויים לא יפריעו זה לזה. כמו בחלון: רק מטמון התמונות הממוזערות מסומן, ושאר הסימונים מוחזרים
+  public static void ClearUserThumbs()
+  {
+    if (!InService)
+      return;
+    const string VCS = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches";
+    const string VC = VCS + @"\Thumbnail Cache";
+    var saved = new Dictionary<string, object>();
+    try
+    {
+      using (var all = Registry.LocalMachine.OpenSubKey(VCS))
+        if (all != null)
+          foreach (var n in all.GetSubKeyNames())
+            try
+            {
+              using var sk = Registry.LocalMachine.OpenSubKey(VCS + "\\" + n, true);
+              if (sk?.GetValue("StateFlags0778") is object v)
+              {
+                saved[n] = v;
+                sk.DeleteValue("StateFlags0778", false);
+              }
+            }
+            catch (Exception __e)
+            {
+              Diag.Log(__e);
+            }
+      using (var k = Registry.LocalMachine.OpenSubKey(VC, true))
+        k?.SetValue("StateFlags0778", 2, RegistryValueKind.DWord);
+      var exe = System.IO.Path.Combine(Environment.SystemDirectory, "cleanmgr.exe");
+      if (File.Exists(exe) && UserSession.Launch(exe, "/sagerun:778", -1, true))
+        Thread.Sleep(60_000); // ניקוי הדיסק קורא את הסימונים כשהוא עולה; מחכים לפני שמחזירים אותם
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
+    }
+    finally
+    {
+      try
+      {
+        using (var k = Registry.LocalMachine.OpenSubKey(VC, true))
+          k?.DeleteValue("StateFlags0778", false);
+        foreach (var kv in saved)
+        {
+          using var sk = Registry.LocalMachine.OpenSubKey(VCS + "\\" + kv.Key, true);
+          sk?.SetValue("StateFlags0778", kv.Value, RegistryValueKind.DWord);
+        }
+      }
+      catch (Exception __e)
+      {
+        Diag.Log(__e);
+      }
     }
   }
 
@@ -4481,7 +4732,7 @@ public static class Enforcer
         }
         bool was = logged.ContainsKey(p);
         known.TryRemove(p, out _);
-        BlockNewFile(r, p);
+        BlockNewFile(r, p, was); // was: קובץ שננעל על ידינו (גם ב-AppData) – נועלים שוב
         if (was)
           n++;
       }
@@ -5125,10 +5376,29 @@ public static class Enforcer
 
   static void RelockExt(Config c, Rule r)
   {
+    List<string> files;
     lock (ExtLock)
     {
-      Parallel.ForEach(ExtFiles(c, r), new ParallelOptions { MaxDegreeOfParallelism = Par }, l => SetLock(l, true));
+      files = ExtFiles(c, r);
+      Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = Par }, l => SetLock(l, true));
       Mark(r.Id, false);
+    }
+    // מרוץ: ביטול החסימה רץ בדיוק בזמן הנעילה מחדש (חלון "פתיחה בקוד" נסגר ברגע שהחסימה הסתיימה). הביטול כבר שחרר ומחק את היומן,
+    // ואז הנעילה כאן נעלה שוב קבצים שאינם רשומים – והם היו נשארים נעולים. מחכים שהביטול יסתיים, ואם החסימה כבר לא פעילה – משחררים אותם
+    if (!InService || files.Count == 0)
+      return;
+    try
+    {
+      for (int i = 0; i < 2400 && Applying(); i++)
+        Thread.Sleep(250);
+      var now = Config.TryLoad();
+      var nr = now?.Find(r.Id);
+      if (now != null && (nr == null || !nr.On || !IsExt(now, nr) || !Program.Blocking(now)))
+        Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = Par }, l => SetLock(l, false));
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
     }
   }
 

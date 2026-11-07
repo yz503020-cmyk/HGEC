@@ -154,6 +154,24 @@ public static class Program
       || string.Equals(full, System.IO.Path.GetFullPath(Enforcer.LightGateExe), StringComparison.OrdinalIgnoreCase);
   }
 
+  // הלקוח הוא חשבון מערכת (SYSTEM / LocalService / NetworkService) או תהליך בסשן 0 (שירות). משתמש רגיל לא יכול להריץ תהליך כזה
+  static bool ClientSys(int clientPid, string sid)
+  {
+    if (Native.IsServiceSid(sid))
+      return true;
+    if (clientPid <= 0)
+      return false;
+    try
+    {
+      using var pr = Process.GetProcessById(clientPid);
+      return pr.SessionId == 0;
+    }
+    catch
+    {
+      return false;
+    }
+  }
+
   static bool IsAuthAny(int pid) => authPid.TryGetValue(pid, out var a) && Native.SameStart(pid, a.Start);
 
   // מסמן תהליך כ"נשאל" פעם אחת (לפי זמן ההתחלה, כך שמספר תהליך שנעשה בו שימוש חוזר לא יידלג)
@@ -458,6 +476,11 @@ public static class Program
     var c = cur;
     if (!Blocking(c))
       return;
+    if (c.Portable.On && (n.Equals("rundll32", StringComparison.OrdinalIgnoreCase) || n.Equals("regsvr32", StringComparison.OrdinalIgnoreCase)))
+    {
+      DllHost(c, n, pid, ppid);
+      return; // כלי מערכת קריטיים: לא נחסמים ב-IFEO ולא נסגרים לפי השם
+    }
     if (killSet.Count == 0 && codeKillMap.Count == 0)
       return;
     if (!killSet.Contains(n) && !codeKillMap.ContainsKey(n))
@@ -525,6 +548,66 @@ public static class Program
         }
       });
     }
+  }
+
+  // ---------- rundll32 / regsvr32 שמריצים DLL מתיקייה אסורה (חסימת תוכנות ניידות) ----------
+  static readonly ConcurrentDictionary<int, DateTime> dllSeen = new(); // תהליכים שכבר נבדקו (לפי זמן ההתחלה)
+
+  static void DllHost(Config c, string n, int pid, int ppid)
+  {
+    DateTime st;
+    try
+    {
+      using var pr = Process.GetProcessById(pid);
+      st = pr.StartTime;
+    }
+    catch
+    {
+      return;
+    }
+    if (dllSeen.TryGetValue(pid, out var old) && old == st)
+      return;
+    dllSeen[pid] = st;
+    Task.Run(() =>
+    {
+      try
+      {
+        var pp = ppid > 0 ? ppid : Native.ParentOf(pid);
+        if (pp > 0 && internalPids.ContainsKey(pp))
+          return; // הפעלה פנימית של DeviceGuard
+        if (Native.IsServiceSid(Native.ProcSid(pid)) || !OwnerApplies(c, pid))
+          return; // Windows עצמו (SYSTEM / שירות), או משתמש שהחסימה לא חלה עליו
+        var cl = CommandLine(pid);
+        if (cl == null)
+          return;
+        var bad = Enforcer.BadDllArg(n, cl, c);
+        if (bad == null || !Native.SameStart(pid, st))
+          return;
+        KillPid(pid);
+        Alerts.Log($"נסגר {n} שהריץ קובץ מתיקייה אסורה (חסימת תוכנות ניידות): {bad}", false);
+      }
+      catch (Exception __e)
+      {
+        Diag.Log(__e);
+      }
+    });
+  }
+
+  static string? CommandLine(int pid)
+  {
+    try
+    {
+      using var s = new ManagementObjectSearcher("SELECT CommandLine FROM Win32_Process WHERE ProcessId = " + pid);
+      using var res = s.Get();
+      foreach (ManagementObject o in res)
+        using (o)
+          return o["CommandLine"] as string;
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
+    }
+    return null;
   }
 
   static void Reload(Config c)
@@ -704,7 +787,9 @@ public static class Program
           // שם החוק והנתיב החסום נמסרים רק לשער (השער הקל / המלא) ולחלון המורם – לא לכל תוכנה שמתחברת
           if (!admin && !FromGate(clientPid))
             return "DENY";
-          return RuleInfo(p[1], p.Length > 2 && p[2].Length > 0 ? string.Join("|", p.Skip(2)) : sid); // בלי SID – משתמשים בזהות של הלקוח
+          // החוק חל לפי הזהות האמיתית של הלקוח (מהזדהות ה-Pipe), ולא לפי ה-SID שהשער שולח (לא סומכים על הלקוח).
+          // אם הזיהוי נכשל – כאילו זה המשתמש המוגבל (החוק חל), ולא להפך
+          return RuleInfo(p[1], sid.Length > 0 ? sid : cur.OwnerSid ?? "");
         case "VERIFY":
         {
           var c = cur;
@@ -753,7 +838,7 @@ public static class Program
           if (clientPid > 0 && Native.ParentOf(clientPid) != pp)
             return "NO"; // ההורה שהלקוח מצהיר עליו חייב להיות ההורה האמיתי שלו
           bool yes = internalPids.ContainsKey(pp) || IsAuth(pp, p[1]);
-          if (!yes && p.Length > 3 && p[3] == "SYS")
+          if (!yes && p.Length > 3 && p[3] == "SYS" && ClientSys(clientPid, sid)) // "SYS" מתקבל רק מתהליך שבאמת רץ כמערכת / בסשן 0
           {
             var r = cur.Find(p[1]);
             yes = r != null && r.Mode == Mode.Code && ruleAuth.TryGetValue(p[1], out var t) && (DateTime.UtcNow - t).TotalMinutes < 15;
@@ -1208,6 +1293,7 @@ public static class Program
     var lastStrong = DateTime.MinValue;
     string? lastSig = null;
     bool pendingDone = false;
+    bool thumbWant = false; // אחרי סריקה מלאה שהתחילה בגלל שינוי בחסימה: ניקוי התמונות הממוזערות של המשתמש המחובר
     Task scanTask = Task.CompletedTask;
     CancellationTokenSource? scanCts = null;
     // cancel = לעצור סריקה מלאה שרצה (בשינוי הגדרות). בחיבור כונן משחררים קבצים בלי לעצור את הסריקה
@@ -1434,6 +1520,7 @@ public static class Program
               lastSig = sig;
               StartScan(curMap, true);
               lastScan = DateTime.UtcNow;
+              thumbWant = curMap.Count > 0;
             }
           }
         }
@@ -1487,7 +1574,7 @@ public static class Program
                     q.Enqueue(it);
                     continue;
                   }
-                  if (Blocking(cur) && curMap.TryGetValue(ExtOf(it.P), out var rule) && !Enforcer.BlockNewFile(rule, it.P) && it.T < 5)
+                  if (Blocking(cur) && curMap.TryGetValue(ExtOf(it.P), out var rule) && !Enforcer.BlockNewFile(rule, it.P, true) && it.T < 5)
                     q.Enqueue((it.P, it.T + 1, DateTime.UtcNow.AddSeconds(3)));
                 }
               }
@@ -1516,6 +1603,11 @@ public static class Program
               StartScan(curMap, false);
               lastScan = now;
             }
+          }
+          if (thumbWant && scanTask.IsCompleted && Enforcer.ScanFinished && (c.Images.On || c.Movies.On))
+          {
+            thumbWant = false;
+            _ = Task.Run(Enforcer.ClearUserThumbs);
           }
           bool quiet = !Enforcer.Applying() && Interlocked.CompareExchange(ref applyBusy, 0, 0) == 0 && (now - stamp).TotalSeconds > 5;
           if (quiet && (now - lastIfeo).TotalSeconds >= 5)
@@ -1596,6 +1688,7 @@ public static class Program
         {
           while (q.TryDequeue(out _)) { }
           secPend.Clear();
+          thumbWant = false;
         }
         // הגדרות השירות ברישום – תמיד (גם כשהחסימות כבויות); מפתחות Safe Mode – רק כשהמתג הראשי פעיל. מיד אחרי שינוי ברישום
         if ((now - lastSvc).TotalSeconds >= 30)
@@ -1678,6 +1771,9 @@ public static class Program
           foreach (var k in renameSeen.Keys.ToArray())
             if (!Native.Alive(k))
               renameSeen.TryRemove(k, out _);
+          foreach (var kv in dllSeen.ToArray())
+            if (!Native.SameStart(kv.Key, kv.Value))
+              dllSeen.TryRemove(kv.Key, out _);
           foreach (var k in internalPids.Keys.ToArray())
             if (!Native.Alive(k))
               internalPids.TryRemove(k, out _);

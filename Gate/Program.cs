@@ -223,9 +223,13 @@ static unsafe class Program
     var r = Pipe("RULE|" + id + "|" + sidStr, 3000);
     if (r == null)
       return sys ? Blocked : Delegate(); // שירות לא זמין: השער המלא מציג הודעה
+    if (r == "NONE")
+      return Run(orig, null, true); // החוק כבר לא קיים
     var p = r.Split('|', 7);
-    if (p.Length < 7 || p[0] != "OK" || p[4] != "1")
-      return Run(orig, null, true); // החוק לא קיים / לא חל כרגע
+    if (p.Length < 7 || p[0] != "OK")
+      return sys ? Blocked : Delegate(); // תשובה לא צפויה (שגיאה בשירות): לא פותחים בלי קוד. השער המלא מציג הודעה
+    if (p[4] != "1")
+      return Run(orig, null, true); // החוק לא חל כרגע
     if (Pipe($"ISAUTH|{id}|{ParentPid()}" + (sys ? "|SYS" : ""), 2000) == "OK")
       return Run(orig, id, true);
     return sys ? Blocked : Delegate();

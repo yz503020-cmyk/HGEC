@@ -32,7 +32,8 @@ public partial class MainWin : Window
   DispatcherTimer? tmr,
     syncTmr;
   bool busy,
-    wasTemp;
+    wasTemp,
+    shortDefaultNoted; // כבר הוצגה ההמלצה להחליף קוד ברירת מחדל קצר
   DateTime lastStamp;
 
   public MainWin(Config c)
@@ -97,6 +98,11 @@ public partial class MainWin : Window
       {
         Say(C.DefaultCode == null ? "לא הוגדר קוד ברירת מחדל (חלון 1)" : "קוד שגוי");
         return;
+      }
+      if (k.Length < MinCode && !shortDefaultNoted)
+      {
+        shortDefaultNoted = true; // פעם אחת בכל פתיחה של החלון
+        Say($"קוד ברירת המחדל קצר מ-{MinCode} תווים, ולכן קל יחסית לפענח אותו. מומלץ להחליף אותו בהגדרות כלליות.");
       }
       IsEnabled = false;
       busy = true;

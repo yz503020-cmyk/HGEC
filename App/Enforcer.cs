@@ -496,16 +496,36 @@ public static class Enforcer
     return new RootLease(null, false);
   }
 
-  // MultiString נשמר כמחרוזת אחת שהפריטים שלה מופרדים בתו 0
+  // MultiString נשמר כמחרוזת אחת שהפריטים שלה מופרדים בתו 0. QWord ו-Binary – כדי שערך קודם מהסוגים האלה יוחזר בביטול (קודם הוא נמחק)
   static string Enc(object v, RegistryValueKind k) =>
-    k == RegistryValueKind.DWord ? Convert.ToInt32(v).ToString()
+    k == RegistryValueKind.DWord ? Convert.ToInt32(v).ToString(System.Globalization.CultureInfo.InvariantCulture)
+    : k == RegistryValueKind.QWord ? Convert.ToInt64(v).ToString(System.Globalization.CultureInfo.InvariantCulture)
+    : k == RegistryValueKind.Binary ? Convert.ToBase64String((byte[])v)
     : k == RegistryValueKind.MultiString ? Convert.ToBase64String(Encoding.UTF8.GetBytes(string.Join("\0", (string[])v)))
     : Convert.ToBase64String(Encoding.UTF8.GetBytes(v?.ToString() ?? ""));
 
   static object Dec(string s, RegistryValueKind k) =>
-    k == RegistryValueKind.DWord ? int.Parse(s)
+    k == RegistryValueKind.DWord ? (int)ParseNum(s)
+    : k == RegistryValueKind.QWord ? ParseNum(s)
+    : k == RegistryValueKind.Binary ? Convert.FromBase64String(s)
     : k == RegistryValueKind.MultiString ? DecMulti(s)
     : Encoding.UTF8.GetString(Convert.FromBase64String(s));
+
+  // מספר שנשמר בפורמט קבוע (Invariant). רשומות מגרסאות קודמות נשמרו לפי הגדרות האזור של Windows – גם הן מתקבלות
+  static long ParseNum(string s) =>
+    long.TryParse(s, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var v) ? v : long.Parse(s);
+
+  // בדיקה עצמית (לבדיקות האוטומטיות): ערך שנשמר כ"ערך קודם" חוזר בדיוק כפי שהיה
+  public static bool EncRoundTrip(object v, RegistryValueKind k)
+  {
+    var d = Dec(Enc(v, k), k);
+    return d switch
+    {
+      byte[] b => v is byte[] vb && b.AsSpan().SequenceEqual(vb),
+      string[] a => v is string[] va && a.SequenceEqual(va),
+      _ => Equals(d, v),
+    };
+  }
 
   static string[] DecMulti(string s)
   {
@@ -549,6 +569,8 @@ public static class Enforcer
       var ok = k.GetValueKind(name);
       if (
         ok == RegistryValueKind.DWord
+        || ok == RegistryValueKind.QWord
+        || ok == RegistryValueKind.Binary
         || ok == RegistryValueKind.String
         || ok == RegistryValueKind.ExpandString
         || ok == RegistryValueKind.MultiString
@@ -642,6 +664,36 @@ public static class Enforcer
       }
   }
 
+  // הקובץ של הביטולים הממתינים נמצא בתיקייה var, שמנהלים יכולים לכתוב אליה – והשירות מבצע אותו כ-SYSTEM.
+  // לכן מתקבלות רק רשומות של מפתחות שהתוכנה עצמה כותבת אליהם (מדיניות, הגדרות הסייר, שירותי USB/WSL).
+  // רשומה אחרת (למשל למפתחות המוגנים של DeviceGuard – השעה האמינה, ההגדרות המהימנות, השירות) נזרקת בלי לבצע אותה
+  static readonly string[] RegPendRoots = { @"SOFTWARE\Policies", @"Software\Microsoft\Windows\CurrentVersion\Policies", ADV };
+  static readonly string[] RegPendKeys =
+  {
+    USBSTOR,
+    UASPSTOR,
+    @"SYSTEM\CurrentControlSet\Services\LxssManager",
+    @"SYSTEM\CurrentControlSet\Services\WslService",
+  };
+
+  public static bool RegPendAllowed(string hive, string path)
+  {
+    if (!(hive == "HKLM" || hive == "HKCU" || hive.StartsWith("HKU:S-1-", StringComparison.Ordinal)))
+      return false;
+    var p = path.Trim('\\');
+    if (p.Length == 0 || p.Contains(@"\\"))
+      return false;
+    if (RegPendRoots.Any(r => p.Equals(r, StringComparison.OrdinalIgnoreCase) || p.StartsWith(r + "\\", StringComparison.OrdinalIgnoreCase)))
+      return true;
+    return hive == "HKLM" && RegPendKeys.Any(k => p.Equals(k, StringComparison.OrdinalIgnoreCase));
+  }
+
+  static bool RegPendLineOk(string l)
+  {
+    var q = l.Split('|');
+    return q.Length >= 3 && (q[0] == "reg" || q[0] == "regkey") && RegPendAllowed(q[1], q[2]);
+  }
+
   // מבטל רשומות ממתינות של משתמשים שההיבה שלהם טעונה עכשיו. מחזיר כמה בוטלו
   public static int ProcessRegPending()
   {
@@ -651,7 +703,10 @@ public static class Enforcer
       {
         if (!File.Exists(RegPendFile))
           return 0;
-        var all = File.ReadAllLines(RegPendFile).Where(l => l.Length > 0).ToList();
+        var raw = File.ReadAllLines(RegPendFile).Where(l => l.Length > 0).ToList();
+        var all = raw.Where(RegPendLineOk).ToList();
+        if (all.Count != raw.Count)
+          Alerts.Log("נמצאו בקובץ הביטולים הממתינים רשומות שהתוכנה לא כתבה – נזרקו בלי לבצע אותן");
         var keep = new List<string>();
         int done = 0;
         // אותו סדר כמו בביטול: ערכים בסדר הפוך, ואחר כך מפתחות מהעמוק לרדוד
@@ -685,7 +740,7 @@ public static class Enforcer
         }
         if (keep.Count == 0)
           File.Delete(RegPendFile);
-        else if (keep.Count != all.Count)
+        else if (keep.Count != raw.Count)
           File.WriteAllLines(RegPendFile, keep);
         return done;
       }
@@ -1258,6 +1313,21 @@ public static class Enforcer
   // חסימת USB לחשבון אחד בלבד. עם רשימה לבנה של כוננים אי אפשר (Windows מאפשר כונן מסוים רק ברמת המחשב) – ואז החסימה חלה על כל המחשב, כמו קודם
   public static bool UsbUser(Config c) => ScopeHive(c) != "HKLM" && !c.Usb.White.Any(w => !w.StartsWith("usbparent:"));
 
+  // חסימת רשת לחשבון אחד בלבד: כלל חסימה יוצא בחומת האש של Windows, שחל רק על התעבורה של החשבון שנבחר (לפי ה-SID).
+  // מתאמי הרשת וה-Wi-Fi לא מושבתים, ושאר החשבונות (גם המנהל) מתחברים כרגיל. עם רשימה לבנה של מתאמים / רשתות Wi-Fi
+  // אי אפשר לבטא את זה בחומת האש – ואז החסימה חלה על כל המחשב, כמו קודם
+  public static bool NetUser(Config c) => ScopeHive(c) != "HKLM" && SidOk(c.OwnerSid) && c.Net.White.Count == 0;
+
+  const string NetUserGroup = "DeviceGuardNetUser";
+  const string NetUserRule = "DeviceGuard Block User Outbound";
+
+  // SID תקין בלבד (נכנס לפקודת PowerShell)
+  public static bool SidOk(string? sid) =>
+    sid != null && sid.Length < 200 && sid.StartsWith("S-1-", StringComparison.Ordinal) && sid.Skip(4).All(ch => char.IsAsciiDigit(ch) || ch == '-');
+
+  static string NetUserCmd(string sid) =>
+    $"New-NetFirewallRule -DisplayName '{NetUserRule}' -Group '{NetUserGroup}' -Direction Outbound -Action Block -LocalUser 'D:(A;;CC;;;{sid})' -Profile Any | Out-Null";
+
   // סיכום קצר של מה שעומד להיות מוחל (לחלון האישור)
   public static string Describe(Config c)
   {
@@ -1313,7 +1383,8 @@ public static class Enforcer
     SafeBootSet(c.AdvOpts.SafeBoot);
     var uh = UserHive(c);
     // שאילתות PowerShell רצות במקביל. חסימת סיומות (תמונות/שירים/סרטים) נעשית ברקע בשירות, ולכן ההחלה חוזרת מיד
-    Task<string>? netT = c.Net.On
+    var netUser = c.Net.On && NetUser(c); // חסימת רשת לחשבון אחד (חומת האש), בלי השבתת מתאמים
+    Task<string>? netT = c.Net.On && !netUser
       ? Task.Run(() =>
         PS(
           "Get-NetAdapter | % { $w = ($_.PhysicalMediaType -like '*802.11*' -or $_.InterfaceDescription -match 'Wireless|Wi-Fi'); $(if ($w) { 'W' } else { 'E' }) + '|' + $_.Status + '|' + $_.PnPDeviceID + '|' + $_.Name }"
@@ -1321,7 +1392,7 @@ public static class Enforcer
       )
       : null;
     Task<string>? usbT = c.Usb.On && !UsbUser(c) ? Task.Run(() => PS(UsbQuery)) : null;
-    Task<string>? fwT = c.NetApps.On
+    Task<string>? fwT = c.NetApps.On || netUser
       ? Task.Run(() => PS("Get-NetFirewallProfile | % { [string]$_.Name + '|' + [string]$_.DefaultOutboundAction + '|' + [string]$_.Enabled }"))
       : null;
     var netCmds = new List<string>();
@@ -1330,7 +1401,7 @@ public static class Enforcer
     var wlanArgs = new List<string>();
 
     // 1) פעולות PowerShell / netsh
-    if (c.Net.On)
+    if (c.Net.On && !netUser)
     {
       var ssidWhite = c.Net.White.Where(w => w.StartsWith("ssid:")).Select(w => w[5..]).ToList();
       var adapterWhite = c.Net.White.Where(w => !w.StartsWith("ssid:")).ToList();
@@ -1363,18 +1434,32 @@ public static class Enforcer
       foreach (var ssid in ssidWhite)
         AddA(c, "wlanfilter|allow|" + ssid);
     }
-    // חסימת חיבור לרשת לפי תוכנה (חומת האש של Windows)
-    if (c.NetApps.On)
+    // חומת האש של Windows חייבת לפעול: לחסימת רשת לפי תוכנה, ולחסימת רשת של חשבון אחד
+    var fwl = fwT != null ? Lines(fwT.Result) : Array.Empty<string>();
+    if (fwT != null)
     {
-      var fwl = Lines(fwT!.Result);
       // חומת אש שהייתה כבויה לפני ההחלה (למשל בגלל חומת אש אחרת) חוזרת להיות כבויה בביטול
       foreach (var l in fwl)
       {
         var q = l.Split('|');
-        if (q.Length >= 3 && q[2].Equals("False", StringComparison.OrdinalIgnoreCase) && !c.Applied.Contains("fwenabled|" + q[0] + "|False"))
+        bool has;
+        lock (c.Applied)
+          has = c.Applied.Contains("fwenabled|" + q[0] + "|False");
+        if (q.Length >= 3 && q[2].Equals("False", StringComparison.OrdinalIgnoreCase) && !has)
           AddA(c, "fwenabled|" + q[0] + "|False");
       }
       fwCmds.Add("Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True");
+    }
+    // חסימת רשת לחשבון אחד: כלל חסימה יוצא בחומת האש, שחל רק על התעבורה של החשבון שנבחר. שאר החשבונות (גם המנהל) לא מושפעים
+    if (netUser)
+    {
+      AddA(c, "netuser|" + c.OwnerSid);
+      fwCmds.Add($"Remove-NetFirewallRule -Group '{NetUserGroup}' -ErrorAction SilentlyContinue");
+      fwCmds.Add(NetUserCmd(c.OwnerSid!));
+    }
+    // חסימת חיבור לרשת לפי תוכנה (חומת האש של Windows)
+    if (c.NetApps.On)
+    {
       fwCmds.AddRange(NetAppsRules(c, new List<string>()));
       if (c.NetAppsWhite)
       {
@@ -1906,22 +1991,30 @@ public static class Enforcer
       // הערך הקודם נשמר ומוחזר בביטול (כמו כל מדיניות רישום). שירות שכבר רץ נעצר רק בהפעלה מחדש – wsl.exe נחסם מיד בכל מקרה
       foreach (var e in new[] { "wsl.exe", "WindowsSandbox.exe", "vmconnect.exe" })
         Ifeo(c, e, c.Adv);
-      foreach (var svc in new[] { "LxssManager", "WslService" })
+      if (sh != "HKLM")
       {
-        try
-        {
-          var sk = @"SYSTEM\CurrentControlSet\Services\" + svc;
-          bool has;
-          using (var k = Registry.LocalMachine.OpenSubKey(sk))
-            has = k?.GetValue("Start") is int;
-          if (has)
-            SetReg(c, "HKLM", sk, "Start", 4);
-        }
-        catch (Exception __e)
-        {
-          Diag.Log(__e);
-        }
+        // רק החשבון שנבחר: שירותי WSL ממשיכים לפעול (שאר החשבונות משתמשים בהם). אצל החשבון הזה נסגרים: wsl.exe (השער למעלה),
+        // wslg.exe, ה-bash של WSL (רק מתיקיית המערכת – Git Bash ודומיו לא נפגעים) ותוכנות ההפעלה של ההפצות מהחנות (Ubuntu וכו')
+        AddA(c, "kill|wslg|" + c.Adv.Id);
+        AddA(c, "wslbash|" + c.Adv.Id);
       }
+      else
+        foreach (var svc in new[] { "LxssManager", "WslService" })
+        {
+          try
+          {
+            var sk = @"SYSTEM\CurrentControlSet\Services\" + svc;
+            bool has;
+            using (var k = Registry.LocalMachine.OpenSubKey(sk))
+              has = k?.GetValue("Start") is int;
+            if (has)
+              SetReg(c, "HKLM", sk, "Start", 4);
+          }
+          catch (Exception __e)
+          {
+            Diag.Log(__e);
+          }
+        }
     }
     if (a.NoTaskMgr)
       SetReg(c, uh, SYSPOL, "DisableTaskMgr", 1);
@@ -1930,7 +2023,12 @@ public static class Enforcer
     if (a.NoStore)
       SetReg(c, sh, @"SOFTWARE\Policies\Microsoft\WindowsStore", "RemoveWindowsStore", 1);
     if (a.NoWinget)
-      SetReg(c, "HKLM", @"SOFTWARE\Policies\Microsoft\Windows\AppInstaller", "EnableAppInstaller", 0);
+    {
+      if (sh == "HKLM")
+        SetReg(c, "HKLM", @"SOFTWARE\Policies\Microsoft\Windows\AppInstaller", "EnableAppInstaller", 0);
+      else
+        AddA(c, "kill|winget|" + c.Adv.Id); // המדיניות קיימת רק לכל המחשב: אצל החשבון שנבחר winget נסגר כשהוא מופעל
+    }
     if (a.Browsers)
     { // מונע עקיפת סינון: DNS מוצפן בדפדפן וגלישה פרטית
       SetReg(c, sh, @"SOFTWARE\Policies\Google\Chrome", "IncognitoModeAvailability", 1);
@@ -1962,9 +2060,11 @@ public static class Enforcer
         var fi = new FileInfo(HostsPath);
         if (fi.Exists)
         {
-          AddA(c, "hostslock"); // לפני השינוי (יומן ההחלה)
+          // רק החשבון שנבחר: הדחייה רק לחשבון הזה, ושאר החשבונות (גם המנהל) יכולים לערוך את הקובץ
+          var hs = sh == "HKLM" ? null : c.OwnerSid;
+          AddA(c, hs == null ? "hostslock" : "hostslock|" + hs); // לפני השינוי (יומן ההחלה)
           var sec = fi.GetAccessControl();
-          sec.AddAccessRule(HostsDeny);
+          sec.AddAccessRule(HostsDenyFor(hs));
           fi.SetAccessControl(sec);
         }
       }
@@ -2100,12 +2200,23 @@ public static class Enforcer
   }
 
   static string HostsPath => System.IO.Path.Combine(Environment.SystemDirectory, @"drivers\etc\hosts");
-  static FileSystemAccessRule HostsDeny =>
+  const FileSystemRights HostsDenyMask = FileSystemRights.WriteData | FileSystemRights.AppendData | FileSystemRights.Delete;
+
+  // נעילת hosts: לכל המשתמשים (sid = null → Everyone), או רק לחשבון שנבחר. כלל דחייה לחשבון חל גם כשהוא מנהל (ה-SID שלו בטוקן)
+  static FileSystemAccessRule HostsDenyFor(string? sid) =>
     new(
-      new SecurityIdentifier(WellKnownSidType.WorldSid, null),
-      FileSystemRights.WriteData | FileSystemRights.AppendData | FileSystemRights.Delete,
+      sid == null || !SidOk(sid) ? new SecurityIdentifier(WellKnownSidType.WorldSid, null) : new SecurityIdentifier(sid),
+      HostsDenyMask,
       AccessControlType.Deny
     );
+
+  static bool HasHostsDeny(FileSystemSecurity sec, string? sid)
+  {
+    var who = sid == null || !SidOk(sid) ? "S-1-1-0" : sid;
+    return sec.GetAccessRules(true, false, typeof(SecurityIdentifier))
+      .Cast<FileSystemAccessRule>()
+      .Any(x => x.AccessControlType == AccessControlType.Deny && x.IdentityReference.Value == who && (x.FileSystemRights & FileSystemRights.WriteData) != 0);
+  }
 
   // ---------- הגנה על נתיבי מערכת ותוכנה עצמה ----------
   static string UsersDir => System.IO.Path.Combine(Environment.GetEnvironmentVariable("SystemDrive") ?? "C:", "Users");
@@ -2381,6 +2492,11 @@ public static class Enforcer
       && string.Equals(dir, CdT, StringComparison.OrdinalIgnoreCase);
   }
 
+  // לביטול: ערך שנראה כמו שער של DeviceGuard בכל צורה שהייתה אי פעם (גם מגרסאות ישנות). בספק – נחשב שלנו ונמחק,
+  // כדי שתוכנה לא תישאר חסומה מאחורי שער אחרי הביטול
+  static bool LooksOurGate(string d) =>
+    IsOurGate(d) || d.Contains("--gate", StringComparison.Ordinal) || d.Contains(CdT, StringComparison.OrdinalIgnoreCase);
+
   // IFEO על הקבצים של DeviceGuard עצמו (Debugger, GlobalFlag, מסנני נתיב...) היה מאפשר לחטוף את השער – כל תוכנה חסומה הייתה רצה דרך כלי אחר –
   // או למנוע מהשירות לעלות. השירות מוחק כל הגדרה כזו מיד (RegWatch). DeviceGuard עצמו אף פעם לא כותב לשם (IsCritical)
   public static void GuardOwnIfeo(bool removing)
@@ -2459,11 +2575,22 @@ public static class Enforcer
     }
     try
     {
+      PSAll(new List<string> { $"Remove-NetFirewallRule -Group '{NetUserGroup}' -ErrorAction SilentlyContinue" });
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
+    }
+    try
+    {
+      // כל כלל דחייה שלנו על hosts – לכל המשתמשים או לחשבון מסוים
       var fi = new FileInfo(HostsPath);
       if (fi.Exists)
       {
         var sec = fi.GetAccessControl();
-        sec.RemoveAccessRule(HostsDeny);
+        foreach (var x in sec.GetAccessRules(true, false, typeof(SecurityIdentifier)).Cast<FileSystemAccessRule>().ToList())
+          if (x.AccessControlType == AccessControlType.Deny && (x.FileSystemRights & ~FileSystemRights.Synchronize) == HostsDenyMask && x.InheritanceFlags == InheritanceFlags.None)
+            sec.RemoveAccessRuleSpecific(x);
         fi.SetAccessControl(sec);
       }
     }
@@ -4741,6 +4868,79 @@ public static class Enforcer
     }
   }
 
+  // ---- חסימת הרשת של חשבון אחד: שחזור כלל חומת האש שנמחק / הושבת / שונה, או חומת אש שכובתה ----
+  static DateTime nuBackoff = DateTime.MinValue;
+  static int nuBusy;
+
+  static bool NetUserOk(string sid)
+  {
+    using (var k = Registry.LocalMachine.OpenSubKey(FWPOL + "FirewallRules"))
+    {
+      bool found = false;
+      if (k != null)
+        foreach (var n in k.GetValueNames())
+          if (
+            k.GetValue(n) is string v
+            && string.Equals(FwField(v, "EmbedCtxt"), NetUserGroup, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(FwField(v, "Active"), "TRUE", StringComparison.OrdinalIgnoreCase)
+            && string.Equals(FwField(v, "Action"), "Block", StringComparison.OrdinalIgnoreCase)
+            && string.Equals(FwField(v, "Dir"), "Out", StringComparison.OrdinalIgnoreCase)
+            && v.Contains(sid, StringComparison.OrdinalIgnoreCase)
+          )
+          {
+            found = true;
+            break;
+          }
+      if (!found)
+        return false;
+    }
+    foreach (var pf in new[] { "DomainProfile", "StandardProfile", "PublicProfile" })
+    {
+      using var pk = Registry.LocalMachine.OpenSubKey(FWPOL + pf);
+      if (pk?.GetValue("EnableFirewall") is int en && en == 0)
+        return false;
+    }
+    return true;
+  }
+
+  // נקרא מהשירות (עם בדיקת חומת האש): רק אחרי שחסימת הרשת של החשבון הוחלה בפועל (רשומת netuser)
+  public static void NetUserHeal(Config c)
+  {
+    if (!c.Master || !c.Net.On || DateTime.UtcNow < nuBackoff || Applying())
+      return;
+    string? sid;
+    lock (c.Applied)
+      sid = c.Applied.FirstOrDefault(x => x.StartsWith("netuser|"))?[8..];
+    if (!SidOk(sid))
+      return;
+    if (Interlocked.Exchange(ref nuBusy, 1) == 1)
+      return;
+    try
+    {
+      if (NetUserOk(sid!))
+        return;
+      Alerts.Log("חסימת הרשת של החשבון שנבחר הוסרה או שונתה בחומת האש – משחזר");
+      PSAll(
+        new List<string>
+        {
+          "Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True",
+          $"Remove-NetFirewallRule -Group '{NetUserGroup}' -ErrorAction SilentlyContinue",
+          NetUserCmd(sid!),
+        }
+      );
+      if (!NetUserOk(sid!))
+        nuBackoff = DateTime.UtcNow.AddMinutes(10); // לא הצליח: לא מנסים (ולא מתריעים) שוב כל כמה שניות
+    }
+    catch
+    {
+      nuBackoff = DateTime.UtcNow.AddMinutes(10);
+    }
+    finally
+    {
+      Interlocked.Exchange(ref nuBusy, 0);
+    }
+  }
+
   // ---- רשימה לבנה בחומת האש: כללי "אפשר" יוצאים שכבר קיימים במחשב ----
   // ברירת מחדל "חסום" לא מבטלת כללי היתר קיימים: אפליקציות מהחנות (דואר, Xbox, החנות עצמה...) ותוכנות שהוסיפו לעצמן כלל היתר היו ממשיכות להתחבר.
   // בזמן הרשימה הלבנה הכללים האלה מושבתים: נרשמים בקובץ לפני ההשבתה, וחוזרים לפעול בביטול (גם אם ההשבתה נקטעה באמצע).
@@ -5059,25 +5259,19 @@ public static class Enforcer
   {
     try
     {
-      bool want;
+      string? want;
       lock (c.Applied)
-        want = c.Applied.Contains("hostslock");
-      if (!want)
+        want = c.Applied.FirstOrDefault(x => x == "hostslock" || x.StartsWith("hostslock|"));
+      if (want == null)
         return;
+      var who = want.Length > 10 ? want[10..] : null; // "hostslock|SID"
       var fi = new FileInfo(HostsPath);
       if (!fi.Exists)
         return;
       var sec = fi.GetAccessControl();
-      bool has = sec.GetAccessRules(true, false, typeof(SecurityIdentifier))
-        .Cast<FileSystemAccessRule>()
-        .Any(x =>
-          x.AccessControlType == AccessControlType.Deny
-          && x.IdentityReference.Value == "S-1-1-0"
-          && (x.FileSystemRights & FileSystemRights.WriteData) != 0
-        );
-      if (has)
+      if (HasHostsDeny(sec, who))
         return;
-      sec.AddAccessRule(HostsDeny);
+      sec.AddAccessRule(HostsDenyFor(who));
       fi.SetAccessControl(sec);
       Alerts.Log("הנעילה של קובץ hosts הוסרה – שוחזרה");
     }
@@ -5271,14 +5465,16 @@ public static class Enforcer
           .Where(p => p.Length >= 3)
           .Select(p => (Key: p[0] + "|" + string.Join("|", p[1..^1]), Tries: int.TryParse(p[^1], out var t) ? t : 0))
           .ToList();
+        bool netWide = AppliedHas(c, "netapplied") || AppliedHas(c, "wlanfilter|denyall");
         bool Hold(string key)
         {
           if (!blocking || !c.Master)
             return false;
+          // רק כשחסימת רשת לכל המחשב הוחלה בפועל. חסימת רשת של חשבון אחד (חומת האש) לא משביתה מתאמים: מה שהושבת קודם חוזר לפעול
           if (key.StartsWith("net|"))
-            return c.Net.On && !c.Net.White.Contains(key[4..]);
+            return c.Net.On && netWide && !c.Net.White.Contains(key[4..]);
           if (key.StartsWith("pnp|"))
-            return c.Net.On; // מתאם רשת לפי מזהה: בזמן חסימת רשת לא מחזירים
+            return c.Net.On && netWide; // מתאם רשת לפי מזהה: בזמן חסימת רשת לא מחזירים
           return c.Usb.On && !UsbUser(c) && !c.Usb.White.Contains(key[4..]); // חסימה של חשבון אחד לא משביתה התקנים
         }
         // אחרי יום של ניסיונות (288) ממשיכים, אבל פעם בשעה (כל 12 סבבים) – לא מוותרים: התקן שנשאר מושבת לא היה חוזר לעבוד אף פעם
@@ -5405,7 +5601,7 @@ public static class Enforcer
     return k?.GetValue(name) is int v ? v : null;
   }
 
-  static bool FwRulesLeft()
+  static bool FwRulesLeft(string group = "DeviceGuardNet")
   {
     using var k = Registry.LocalMachine.OpenSubKey(FWPOL + "FirewallRules");
     if (k == null)
@@ -5414,8 +5610,8 @@ public static class Enforcer
       if (
         k.GetValue(n) is string v
         && (
-          v.Contains("|EmbedCtxt=DeviceGuardNet|", StringComparison.OrdinalIgnoreCase)
-          || v.EndsWith("|EmbedCtxt=DeviceGuardNet", StringComparison.OrdinalIgnoreCase)
+          v.Contains("|EmbedCtxt=" + group + "|", StringComparison.OrdinalIgnoreCase)
+          || v.EndsWith("|EmbedCtxt=" + group, StringComparison.OrdinalIgnoreCase)
         )
       )
         return true;
@@ -5496,13 +5692,19 @@ public static class Enforcer
         var fi = new FileInfo(HostsPath);
         if (!fi.Exists)
           return true;
+        var who = p.Length > 1 ? p[1] : null;
         var sec = fi.GetAccessControl();
-        if (!sec.GetAccessRules(true, false, typeof(SecurityIdentifier)).Cast<FileSystemAccessRule>().Any(x => x.AccessControlType == AccessControlType.Deny && x.IdentityReference.Value == "S-1-1-0" && (x.FileSystemRights & FileSystemRights.WriteData) != 0))
+        if (!HasHostsDeny(sec, who))
           return true;
-        sec.RemoveAccessRule(HostsDeny);
+        sec.RemoveAccessRule(HostsDenyFor(who));
         fi.SetAccessControl(sec);
         return true;
       }
+      case "netuser":
+        if (!FwRulesLeft(NetUserGroup))
+          return true;
+        PS($"Remove-NetFirewallRule -Group '{NetUserGroup}' -ErrorAction SilentlyContinue");
+        return !FwRulesLeft(NetUserGroup);
     }
     return true;
   }
@@ -5524,13 +5726,15 @@ public static class Enforcer
           return File.ReadAllLines(NetPendFile).Where(l => l.Length > 0).Select(l => l.Split('\t')[0]).ToList();
         lastNetPend = DateTime.UtcNow;
         bool fwOwned,
-          wlanOwned,
-          hostsOwned;
+          netUserOwned,
+          wlanOwned;
+        HashSet<string> hostsHeld;
         lock (c.Applied)
         {
           fwOwned = blocking && c.Master && c.Applied.Any(x => x == "fwrules" || x.StartsWith("fwcfg|"));
+          netUserOwned = blocking && c.Master && c.Applied.Any(x => x.StartsWith("netuser|"));
           wlanOwned = blocking && c.Master && c.Applied.Contains("wlanfilter|denyall");
-          hostsOwned = blocking && c.Master && c.Applied.Contains("hostslock");
+          hostsHeld = blocking && c.Master ? c.Applied.Where(x => x == "hostslock" || x.StartsWith("hostslock|")).ToHashSet() : new HashSet<string>();
         }
         var keep = new List<string>();
         var now = DateTime.UtcNow.Ticks;
@@ -5541,8 +5745,10 @@ public static class Enforcer
           long at = t.Length > 1 && long.TryParse(t[1], out var v) ? v : 0;
           if (
             (e.StartsWith("fw") && fwOwned)
+            || (e.StartsWith("fwenabled|") && netUserOwned) // חומת האש נדרשת גם לחסימת הרשת של חשבון אחד
+            || (e.StartsWith("netuser|") && netUserOwned)
             || (e.StartsWith("wlanfilter|") && wlanOwned)
-            || (e == "hostslock" && hostsOwned)
+            || hostsHeld.Contains(e)
             || (e.StartsWith("ruleoff|") && blocking && c.Master && FwOffHeld(e[8..])) // הושבת שוב ברשימה לבנה שהוחלה מחדש
           )
             continue; // החסימה הנוכחית מחזיקה אותו (ותבטל אותו בביטול הבא)
@@ -6277,6 +6483,12 @@ public static class Enforcer
         List<string> cur;
         lock (c.Applied)
           cur = c.Applied.ToList();
+        // נתיבים שחסומים עכשיו (לפי הנתיב בלבד, בלי סימון החיזוק): הקובץ הזה נמצא בתיקייה var שמנהלים יכולים לכתוב אליה,
+        // ושורה מזויפת לפריט חסום (למשל בלי "|h2") לא תשחרר אותו
+        var curPaths = new HashSet<string>(
+          cur.Where(x => x.StartsWith("acl|") || x.StartsWith("hid|") || x.StartsWith("lnk|")).Select(x => x.Split('|')[1].TrimEnd('\\')),
+          StringComparer.OrdinalIgnoreCase
+        );
         var keep = new List<string>();
         int done = 0;
         foreach (var l in lines)
@@ -6284,7 +6496,16 @@ public static class Enforcer
           var t = l.Split('\t', 2);
           var e = t[0];
           var id = t.Length > 1 && t[1].Length > 0 ? t[1] : null;
-          if (cur.Contains(e) || (id != null && cur.Any(x => x.StartsWith("fid|" + id + "|", StringComparison.Ordinal))))
+          var ep = e.Split('|');
+          if (ep.Length < 2 || !(ep[0] == "acl" || ep[0] == "hid" || ep[0] == "lnk"))
+            continue; // לא רשומה שהתוכנה כותבת לקובץ הזה
+          var epath = ep[1].TrimEnd('\\');
+          if (
+            cur.Contains(e)
+            || curPaths.Contains(epath)
+            || (InService && ep[0] == "acl" && logged.ContainsKey(epath)) // בשירות: קובץ שנעול עכשיו בחסימת סוגי קבצים – השחרור שלו שייך לביטול של החסימה הזו
+            || (id != null && cur.Any(x => x.StartsWith("fid|" + id + "|", StringComparison.Ordinal)))
+          )
             continue; // נחסם מחדש בהחלה מאוחרת יותר – הביטול הבא יטפל בו
           try
           {
@@ -6394,7 +6615,8 @@ public static class Enforcer
   // soft = קריאה מתוך Apply: מתאמי רשת שעתידים להישאר חסומים לא מופעלים ונחסמים מחדש
   public static void Revert(Config c, bool soft = false)
   {
-    var keepNet = soft && c.Master && c.Net.On;
+    // מתאמים ומסנן Wi-Fi נשארים רק אם ההחלה החדשה חוסמת את הרשת לכל המחשב. במעבר לחסימה של חשבון אחד (חומת האש) – הם חוזרים לפעול
+    var keepNet = soft && c.Master && c.Net.On && !NetUser(c);
     var keepAd = keepNet ? c.Net.White.Where(w => !w.StartsWith("ssid:")).ToHashSet() : null;
     var ps = new List<string>();
     var enDev = new List<string>(); // מתאמים/התקנים שאמורים לחזור לפעול: נבדק אחרי הביצוע, ומה שלא חזר נשמר לניסיון חוזר
@@ -6402,7 +6624,9 @@ public static class Enforcer
     // חומת אש, מסנן Wi-Fi ונעילת hosts: נבדקים שוב בשירות אחרי הביטול (netpending.txt). בהחלה מחדש – רק מה שלא יוחל שוב
     var netPend = new List<string>();
     bool keepFw = soft && c.Master && c.NetApps.On,
-      keepWlan = soft && c.Master && c.Net.On,
+      keepNetUser = soft && c.Master && c.Net.On && NetUser(c),
+      keepFwOn = keepFw || keepNetUser, // חומת האש עצמה נשארת פעילה גם בשביל חסימת הרשת של חשבון אחד
+      keepWlan = keepNet,
       keepHosts = soft && c.Master && c.Adv.On && c.AdvOpts.LockHosts;
     List<string> all;
     lock (c.Applied)
@@ -6453,7 +6677,9 @@ public static class Enforcer
               if (parent == null)
                 continue;
               using (var k = parent.OpenSubKey(p[1], true))
-                k?.DeleteValue("Debugger", false);
+                // רק השער שלנו. ערך של תוכנה אחרת שנכתב בזמן החסימה (למשל Process Explorer שהותקן בינתיים) נשאר
+                if (k?.GetValue("Debugger") is string dv && LooksOurGate(dv))
+                  k.DeleteValue("Debugger", false);
               using (var k2 = parent.OpenSubKey(p[1]))
               {
                 if (k2 != null && k2.ValueCount == 0 && k2.SubKeyCount == 0)
@@ -6500,9 +6726,14 @@ public static class Enforcer
             if (p.Length > 2)
             {
               ps.Add($"Set-NetFirewallProfile -Profile {p[1]} -Enabled {p[2]}");
-              if (!keepFw)
+              if (!keepFwOn)
                 netPend.Add(e);
             }
+            break;
+          case "netuser": // חסימת הרשת של חשבון אחד (כלל בחומת האש)
+            ps.Add($"Remove-NetFirewallRule -Group '{NetUserGroup}' -ErrorAction SilentlyContinue");
+            if (!keepNetUser)
+              netPend.Add(e);
             break;
           case "usbstor":
           {
@@ -6521,7 +6752,7 @@ public static class Enforcer
             if (p.Length >= 3 && !Lsa.Change(p[1], p[2], true))
               AddLsaPending(p[1] + "|" + p[2]);
             break;
-          case "hostslock":
+          case "hostslock": // hostslock (כל המשתמשים) או hostslock|SID (רק החשבון שנבחר)
           {
             if (!keepHosts)
               netPend.Add(e);
@@ -6529,7 +6760,7 @@ public static class Enforcer
             if (fi.Exists)
             {
               var sec = fi.GetAccessControl();
-              sec.RemoveAccessRule(HostsDeny);
+              sec.RemoveAccessRule(HostsDenyFor(p.Length > 1 ? p[1] : null));
               fi.SetAccessControl(sec);
             }
             break;

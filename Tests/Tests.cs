@@ -441,3 +441,58 @@ public class DenyRuleTests
     Assert.False(Enforcer.IsOurDeny(R("S-1-5-32-544", M)));
   }
 }
+
+// ---------- ביטולים ממתינים (קובץ שמנהלים יכולים לכתוב): רק מפתחות שהתוכנה עצמה כותבת ----------
+public class RegPendingTests
+{
+  [Fact]
+  public void OwnPolicyKeysAreAccepted()
+  {
+    Assert.True(Enforcer.RegPendAllowed("HKLM", @"SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers\0\Paths\{x}"));
+    Assert.True(Enforcer.RegPendAllowed("HKU:S-1-5-21-1-2-3-1001", @"Software\Microsoft\Windows\CurrentVersion\Policies\System"));
+    Assert.True(Enforcer.RegPendAllowed("HKLM", @"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced\Folder\Hidden\SHOWALL"));
+    Assert.True(Enforcer.RegPendAllowed("HKLM", @"SYSTEM\CurrentControlSet\Services\USBSTOR"));
+    Assert.True(Enforcer.RegPendAllowed("HKLM", @"SYSTEM\CurrentControlSet\Services\LxssManager"));
+  }
+
+  [Fact]
+  public void ProtectedAndForeignKeysAreRejected()
+  {
+    Assert.False(Enforcer.RegPendAllowed("HKLM", @"SOFTWARE\DeviceGuard\Clock"));
+    Assert.False(Enforcer.RegPendAllowed("HKLM", @"SOFTWARE\DeviceGuard\Trust"));
+    Assert.False(Enforcer.RegPendAllowed("HKLM", @"SYSTEM\CurrentControlSet\Services\DeviceGuard"));
+    Assert.False(Enforcer.RegPendAllowed("HKLM", @"SYSTEM\CurrentControlSet\Services\USBSTOR\Enum"));
+    Assert.False(Enforcer.RegPendAllowed("HKLM", @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\x.exe"));
+    Assert.False(Enforcer.RegPendAllowed("HKLM", @"SOFTWARE\PoliciesX"));
+    Assert.False(Enforcer.RegPendAllowed("HKU:S-1-5-21-1", @"SYSTEM\CurrentControlSet\Services\USBSTOR")); // שירות – רק ברמת המחשב
+    Assert.False(Enforcer.RegPendAllowed("HKCR", @"SOFTWARE\Policies\x"));
+    Assert.False(Enforcer.RegPendAllowed("HKLM", ""));
+  }
+}
+
+// ---------- ערך קודם ברישום חוזר בדיוק בביטול (כולל QWord ו-Binary) ----------
+public class RegValueTests
+{
+  [Fact]
+  public void AllKindsRoundTrip()
+  {
+    Assert.True(Enforcer.EncRoundTrip(0, Microsoft.Win32.RegistryValueKind.DWord));
+    Assert.True(Enforcer.EncRoundTrip(-1, Microsoft.Win32.RegistryValueKind.DWord));
+    Assert.True(Enforcer.EncRoundTrip(262144, Microsoft.Win32.RegistryValueKind.DWord));
+    Assert.True(Enforcer.EncRoundTrip(long.MaxValue, Microsoft.Win32.RegistryValueKind.QWord));
+    Assert.True(Enforcer.EncRoundTrip(-5L, Microsoft.Win32.RegistryValueKind.QWord));
+    Assert.True(Enforcer.EncRoundTrip(new byte[] { 0, 1, 255 }, Microsoft.Win32.RegistryValueKind.Binary));
+    Assert.True(Enforcer.EncRoundTrip("שלום|x", Microsoft.Win32.RegistryValueKind.String));
+    Assert.True(Enforcer.EncRoundTrip(new[] { "a", "ב" }, Microsoft.Win32.RegistryValueKind.MultiString));
+  }
+
+  [Fact]
+  public void SidValidation()
+  {
+    Assert.True(Enforcer.SidOk("S-1-5-21-1-2-3-1001"));
+    Assert.True(Enforcer.SidOk("S-1-12-1-11-22"));
+    Assert.False(Enforcer.SidOk(null));
+    Assert.False(Enforcer.SidOk("S-1-5-21-1');Remove-Item x"));
+    Assert.False(Enforcer.SidOk("Everyone"));
+  }
+}

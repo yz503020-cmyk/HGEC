@@ -97,7 +97,8 @@ static class GateMode
   {
     public bool Exists,
       HasOwn,
-      Applies;
+      Applies,
+      Bad; // השירות ענה תשובה לא צפויה (שגיאה) – לא ידוע אם החוק חל
     public int Mode;
     public string Name = "",
       Kind = "",
@@ -112,9 +113,11 @@ static class GateMode
     var r = Config.Pipe("RULE|" + id + "|" + MySid(), 3000);
     if (r == null)
       return null;
+    if (r == "NONE")
+      return new Info(); // החוק כבר לא קיים
     var p = r.Split('|', 7);
     if (p.Length < 7 || p[0] != "OK")
-      return new Info();
+      return new Info { Bad = true };
     return new Info
     {
       Exists = true,
@@ -198,6 +201,15 @@ static class GateMode
       {
         Init();
         Msg("שירות ההגנה אינו פעיל, ולכן לא ניתן להפעיל תוכנה חסומה. פתח את DeviceGuard ולחץ 'החל שינויים'.");
+      }
+      return Blocked;
+    }
+    if (info.Bad)
+    { // תשובה לא צפויה מהשירות: לא פותחים תוכנה חסומה בלי קוד (קודם היא נפתחה)
+      if (!sys)
+      {
+        Init();
+        Msg("לא ניתן היה לבדוק את החסימה מול שירות ההגנה. נסה שוב בעוד רגע.");
       }
       return Blocked;
     }

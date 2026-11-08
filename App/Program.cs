@@ -45,6 +45,9 @@ public static class Program
   static volatile Dictionary<string, Rule> curMap = new();
   static volatile HashSet<string> killSet = new(StringComparer.OrdinalIgnoreCase);
   static volatile Dictionary<string, string> codeKillMap = new(StringComparer.OrdinalIgnoreCase);
+  static volatile string? wslRule; // חסימת WSL לחשבון שנבחר בלבד: מזהה החוק (null = לא פעיל)
+  static readonly ConcurrentDictionary<int, bool> wslSeen = new(); // תהליכים שכבר נבדקו (bash של WSL / הפצת WSL)
+  static readonly ConcurrentDictionary<string, bool> wslDirs = new(StringComparer.OrdinalIgnoreCase);
   static readonly ConcurrentDictionary<string, DateTime> tokens = new(),
     lease = new(),
     ruleAuth = new();
@@ -267,6 +270,12 @@ public static class Program
         "icacls",
         $"\"{System.IO.Path.Combine(Config.Dir, "var")}\" /inheritance:r /grant *S-1-5-18:(OI)(CI)F /grant *S-1-5-32-544:(OI)(CI)F"
       );
+      // תיקיית החילוץ של השירות (קובצי DLL שהשירות טוען כ-SYSTEM): רק המערכת כותבת אליה. בירושה מ-var מנהלים יכלו לכתוב לשם
+      // ולשתול קובץ שירוץ כ-SYSTEM. נעילה כאן חלה גם על הקבצים שכבר חולצו (ההרשאות שבירושה מתעדכנות)
+      Enforcer.RunExe(
+        "icacls",
+        $"\"{System.IO.Path.Combine(Config.Dir, "var", "net")}\" /inheritance:r /grant *S-1-5-18:(OI)(CI)F /grant *S-1-5-32-544:(OI)(CI)RX"
+      );
       Config.SecureFile(Config.CfgPath);
       Config.SecureFile(Config.BakPath);
       Enforcer.CleanOldExes();
@@ -471,6 +480,52 @@ public static class Program
     return null;
   }
 
+  // bash.exe של WSL (בתיקיית המערכת בלבד – לא Git Bash / MSYS2 / Cygwin), או תוכנת הפעלה של הפצת WSL מהחנות
+  // (תיקיית אפליקציה ב-WindowsApps שיש בה את קובץ ההתקנה של ההפצה, למשל Ubuntu). כל תהליך נבדק פעם אחת
+  static bool WslLauncher(string n, int pid)
+  {
+    try
+    {
+      if (wslSeen.TryGetValue(pid, out var v))
+        return v;
+      var path = Native.ImagePath(pid);
+      if (path == null)
+        return false; // הנתיב עוד לא זמין: ננסה שוב בסבב הבא
+      bool res = false;
+      if (n.Equals("bash", StringComparison.OrdinalIgnoreCase))
+        res = string.Equals(path, System.IO.Path.Combine(Environment.SystemDirectory, "bash.exe"), StringComparison.OrdinalIgnoreCase);
+      else
+      {
+        var dir = System.IO.Path.GetDirectoryName(path);
+        var apps = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "WindowsApps") + "\\";
+        if (dir != null && dir.StartsWith(apps, StringComparison.OrdinalIgnoreCase))
+          res = wslDirs.GetOrAdd(
+            dir,
+            d =>
+            {
+              try
+              {
+                return File.Exists(System.IO.Path.Combine(d, "install.tar.gz")) || File.Exists(System.IO.Path.Combine(d, "install.tar"));
+              }
+              catch
+              {
+                return false;
+              }
+            }
+          );
+      }
+      if (wslSeen.Count > 20000)
+        wslSeen.Clear();
+      wslSeen[pid] = res;
+      return res;
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
+      return false;
+    }
+  }
+
   static void HandleProc(string n, int pid, int ppid = 0)
   {
     var c = cur;
@@ -486,14 +541,22 @@ public static class Program
       DllHost(c, n, pid, ppid);
       return; // כלי מערכת קריטיים: לא נחסמים ב-IFEO ולא נסגרים לפי השם
     }
-    if (killSet.Count == 0 && codeKillMap.Count == 0)
-      return;
-    if (!killSet.Contains(n) && !codeKillMap.ContainsKey(n))
+    // WSL אצל החשבון שנבחר בלבד: ה-bash של WSL ותוכנות ההפעלה של הפצות (לפי המיקום שלהן, לא לפי השם)
+    string? wslId = null;
+    var wsr = wslRule;
+    if (wsr != null && !killSet.Contains(n) && !codeKillMap.ContainsKey(n) && WslLauncher(n, pid))
+      wslId = wsr;
+    if (wslId == null)
     {
-      var real = RenamedIdentity(pid);
-      if (real == null)
+      if (killSet.Count == 0 && codeKillMap.Count == 0)
         return;
-      n = real;
+      if (!killSet.Contains(n) && !codeKillMap.ContainsKey(n))
+      {
+        var real = RenamedIdentity(pid);
+        if (real == null)
+          return;
+        n = real;
+      }
     }
     if (ppid <= 0)
       ppid = Native.ParentOf(pid);
@@ -501,7 +564,22 @@ public static class Program
       return; // כלי מערכת שהאפליקציה עצמה הפעילה (PowerShell, netsh, sc ...)
     if (Native.IsServiceSid(Native.ProcSid(pid)))
       return; // תהליך של Windows עצמו (SYSTEM / שירות), למשל משימה מתוזמנת של המערכת שמריצה PowerShell – כמו בשער
-    if (killSet.Contains(n))
+    bool full;
+    string? crid;
+    if (wslId != null)
+    {
+      var wrr = c.Find(wslId);
+      if (wrr == null)
+        return;
+      full = wrr.Mode == Mode.Full;
+      crid = full ? null : wslId;
+    }
+    else
+    {
+      full = killSet.Contains(n);
+      crid = !full && codeKillMap.TryGetValue(n, out var cr) ? cr : null;
+    }
+    if (full)
     {
       if (!OwnerApplies(c, pid) || IsAuthAny(pid))
         return;
@@ -525,7 +603,7 @@ public static class Program
       Alerts.Log("נסגרה תוכנה חסומה: " + n, false);
       return;
     }
-    if (codeKillMap.TryGetValue(n, out var rid) && !IsAuth(pid, rid) && TryPrompt(pid, rid))
+    if (crid is string rid && !IsAuth(pid, rid) && TryPrompt(pid, rid))
     {
       int sess = 0;
       try
@@ -621,6 +699,7 @@ public static class Program
     var ks = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     var ck = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
     var progs = new List<(string Name, string Path)>();
+    string? wr = null;
     void Names(Rule r, bool full)
     {
       var n = System.IO.Path.GetFileNameWithoutExtension(r.Path);
@@ -657,9 +736,35 @@ public static class Program
         else
           ck[n] = r.Id;
       }
+      // "רק החשבון שנבחר" בהגנה המתקדמת: תוכנות שנסגרות לפי שם (winget, wslg) – בלי IFEO ובלי מדיניות לכל המחשב,
+      // וה-bash של WSL ותוכנות ההפעלה של הפצות WSL (לפי המיקום, ראו WslLauncher). OwnerApplies מגביל את הסגירה לחשבון שנבחר
+      List<string> extra;
+      lock (c.Applied)
+        extra = c.Applied.Where(x => x.StartsWith("kill|") || x.StartsWith("wslbash|")).ToList();
+      foreach (var e in extra)
+      {
+        var q = e.Split('|');
+        if (q[0] == "wslbash")
+        {
+          if (q.Length >= 2 && c.Find(q[1]) != null)
+            wr = q[1];
+          continue;
+        }
+        if (q.Length < 3)
+          continue;
+        var n = q[1];
+        var r = c.Find(q[2]);
+        if (n.Length == 0 || r == null || Enforcer.IsCritical(n) || ks.Contains(n) || ck.ContainsKey(n))
+          continue;
+        if (r.Mode == Mode.Full)
+          ks.Add(n);
+        else
+          ck[n] = r.Id;
+      }
     }
     killSet = ks;
     codeKillMap = ck;
+    wslRule = wr;
     if (progs.Count == 0)
       sizeMap = new();
     else
@@ -958,6 +1063,8 @@ public static class Program
     {
       Enforcer.RunExe("sc.exe", "sdset DeviceGuard D:(A;;GA;;;SY)(A;;GA;;;BA)");
       Enforcer.RunExe("icacls", $"\"{Config.Dir}\" /grant *S-1-5-32-544:(OI)(CI)F");
+      if (full) // הסרה מלאה: גם תיקיית החילוץ (שנעולה בנפרד) – כדי שאפשר יהיה למחוק את התיקייה אחרי ההסרה
+        Enforcer.RunExe("icacls", $"\"{System.IO.Path.Combine(Config.Dir, "var", "net")}\" /grant *S-1-5-32-544:(OI)(CI)F");
       if (full)
         foreach (var m in new[] { "Minimal", "Network" })
         {
@@ -1635,6 +1742,7 @@ public static class Program
           {
             lastFw = now;
             Enforcer.NetHeal(c);
+            Enforcer.NetUserHeal(c); // חסימת הרשת של החשבון שנבחר (כלל בחומת האש)
           }
           if ((now - lastAd).TotalSeconds >= 5)
           {
@@ -1778,6 +1886,9 @@ public static class Program
           foreach (var k in renameSeen.Keys.ToArray())
             if (!Native.Alive(k))
               renameSeen.TryRemove(k, out _);
+          foreach (var k in wslSeen.Keys.ToArray())
+            if (!Native.Alive(k))
+              wslSeen.TryRemove(k, out _);
           foreach (var kv in dllSeen.ToArray())
             if (!Native.SameStart(kv.Key, kv.Value))
               dllSeen.TryRemove(kv.Key, out _);
@@ -1910,6 +2021,11 @@ public static class Program
           }
           MainWin.Say("קוד שגוי");
         }
+        // קוד קצר (מהתקנה ישנה): מנהל יכול לקרוא את הגיבוב שלו מקובץ ההגדרות ולפענח אותו במחשב אחר
+        if (Code != null && Code.Length < MainWin.MinCode)
+          MainWin.Say(
+            $"קוד הכניסה לתוכנה קצר מ-{MainWin.MinCode} תווים, ולכן קל יחסית לפענח אותו.\n\nמומלץ להחליף אותו: הגדרות כלליות ← 'שנה קוד כניסה לתוכנה'. כדאי לבדוק גם את קוד ברירת המחדל לחסימות."
+          );
       }
       Enforcer.TryStartService(); // אם השירות מותקן אך כבוי – מפעילים אותו, אחרת אי אפשר לשמור הגדרות
       if (Code != null && Config.Up() && !Config.Auth(Code))

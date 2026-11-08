@@ -630,3 +630,55 @@ public class WifiBssidTests
     Assert.DoesNotContain(white[2], a);
   }
 }
+
+// ---------- חסימת סוגי קבצים רק אחרי "החל שינויים" ----------
+public class AppliedExtTests
+{
+  [Fact]
+  public void MarkedWithoutApplyDoesNotLock()
+  {
+    var c = new Config();
+    c.Images.On = true; // סומן בחלון
+    c.Applied.Add("extgate|1"); // הייתה החלה – בלי חסימת תמונות
+    Assert.False(Enforcer.AppliedExtMap(c).ContainsKey("jpg"));
+  }
+
+  [Fact]
+  public void AppliedLocks()
+  {
+    var c = new Config();
+    c.Images.On = true;
+    c.Applied.Add("extgate|1");
+    c.Applied.Add("ext|" + c.Images.Id);
+    Assert.Same(c.Images, Enforcer.AppliedExtMap(c)["jpg"]);
+  }
+
+  [Fact]
+  public void UnmarkedAfterApplyReleases()
+  {
+    var c = new Config();
+    c.Images.On = false; // הסימון הוסר אחרי ההחלה
+    c.Applied.Add("extgate|1");
+    c.Applied.Add("ext|" + c.Images.Id);
+    Assert.Empty(Enforcer.AppliedExtMap(c));
+  }
+
+  [Fact]
+  public void OldVersionWithoutMarkKeepsLocking()
+  {
+    var c = new Config();
+    c.Images.On = true; // החלה מגרסה קודמת: אין רשומת extgate – ממשיכים לנעול לפי ההגדרות
+    Assert.True(Enforcer.AppliedExtMap(c).ContainsKey("jpg"));
+  }
+
+  [Fact]
+  public void UnappliedCustomExtDoesNotHideAppliedRule()
+  {
+    var c = new Config();
+    c.Images.On = true;
+    c.Exts.Add(new Rule { On = true, Path = "png" }); // סיומת נוספת שסומנה בלי החלה, וגם היא png
+    c.Applied.Add("extgate|1");
+    c.Applied.Add("ext|" + c.Images.Id);
+    Assert.Same(c.Images, Enforcer.AppliedExtMap(c)["png"]); // png נשאר נעול לפי חסימת התמונות שהוחלה
+  }
+}

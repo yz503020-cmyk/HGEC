@@ -1839,6 +1839,10 @@ public static class Enforcer
         if (r.Mode == Mode.Code)
           MakeLnk(c, r);
       }
+    // חוקי סוגי הקבצים שהוחלו: השירות נועל קבצים רק לפיהם (AppliedExtMap). חוק שסומן אחר כך בלי "החל שינויים" לא נועל
+    AddA(c, ExtGate);
+    foreach (var r in new[] { c.Movies, c.Songs, c.Images }.Concat(c.Exts).Where(r => r.On))
+      AddA(c, "ext|" + r.Id);
     foreach (var r in new[] { c.Movies, c.Songs, c.Images }.Concat(c.Exts).Where(r => r.On && r.Mode == Mode.Code))
       MakeExtLnk(c, r);
     if (c.Applied.Any(x => x.StartsWith("hid|")))
@@ -3704,25 +3708,44 @@ public static class Enforcer
 
   static readonly string[] DangerExt = Config.Danger.ToArray();
 
-  public static Dictionary<string, Rule> ExtMap(Config c)
+  // ok = סינון נוסף של החוקים (למשל רק חוקים שהוחלו). null = כל החוקים המסומנים
+  public static Dictionary<string, Rule> ExtMap(Config c, Func<Rule, bool>? ok = null)
   {
     var map = new Dictionary<string, Rule>();
     void M(Rule r, string[] x)
     {
-      if (r.On)
+      if (r.On && (ok == null || ok(r)))
         foreach (var y in x)
           map[y] = r;
     }
     M(c.Movies, Config.Vid);
     M(c.Songs, Config.Aud);
     M(c.Images, Config.Img);
-    foreach (var r in c.Exts.Where(r => r.On))
+    foreach (var r in c.Exts.Where(r => r.On && (ok == null || ok(r))))
     {
       var x = r.Path.TrimStart('.').ToLowerInvariant();
       if (x.Length > 0 && !Config.Danger.Contains(x))
         map[x] = r;
     }
     return map;
+  }
+
+  // ---- חסימת סוגי קבצים רק אחרי "החל שינויים" ----
+  // השירות נועל קבצים לפי חוקי סוגי הקבצים שהוחלו (רשומות ext|מזהה), ולא לפי כל חוק שסומן בחלון: סימון בלי "החל שינויים" לא נועל כלום.
+  // רשומת הסימון extgate: בלי רשומות ext|, למשל אחרי עדכון מגרסה קודמת לפני ההחלה הבאה, השירות נועל לפי ההגדרות כמו קודם –
+  // כדי שעדכון גרסה לא ישחרר את כל הקבצים הנעולים עד ההחלה הבאה
+  const string ExtGate = "extgate|1";
+
+  public static Dictionary<string, Rule> AppliedExtMap(Config c)
+  {
+    HashSet<string> ids;
+    lock (c.Applied)
+    {
+      if (!c.Applied.Contains(ExtGate))
+        return ExtMap(c);
+      ids = c.Applied.Where(x => x.StartsWith("ext|", StringComparison.Ordinal)).Select(x => x[4..]).ToHashSet(StringComparer.Ordinal);
+    }
+    return ExtMap(c, r => ids.Contains(r.Id));
   }
 
   static readonly object LogLock = new(),

@@ -16,4 +16,8 @@
     <DebugType>none</DebugType>
     <ApplicationManifest>app.manifest</ApplicationManifest>
   </PropertyGroup>
+  <ItemGroup>
+    <!-- בדיקת IFEO משותפת לשער המלא ולשער הקל (אותו קוד בדיוק) -->
+    <Compile Include="..\App\GateCheck.cs" Link="GateCheck.cs" />
+  </ItemGroup>
 </Project>

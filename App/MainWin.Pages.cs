@@ -209,7 +209,7 @@ public partial class MainWin
         + "קבצים שהוגדרו כמוסתרים מוסתרים בכל החשבונות, אבל נחסמים רק בחשבון שנבחר."
     );
     Theme.Tipped(code, "קוד ברירת המחדל משמש לפתיחת כל חסימה בקוד שלא הוגדר לה קוד נפרד.");
-    Theme.Tipped(appc, $"מחליף את הקוד שנדרש כדי לפתוח את DeviceGuard ולהסיר אותו. לפחות {MinCode} תווים; מומלץ גם אותיות.");
+    Theme.Tipped(appc, $"מחליף את הקוד שנדרש כדי לפתוח את {Config.AppName} ולהסיר אותו. לפחות {MinCode} תווים; מומלץ גם אותיות.");
     Theme.Tipped(exp, "שומר את ההגדרות לקובץ, לגיבוי או להעברה למחשב אחר.");
     Theme.Tipped(imp, "טוען הגדרות מקובץ שיוצא קודם. אחרי הטעינה לוחצים 'החל שינויים'.");
     Theme.Tipped(un2, "מכבה את כל החסימות ומסיר את שירות ההגנה מהמחשב, אחרי הקשת קוד הכניסה.");
@@ -406,7 +406,7 @@ public partial class MainWin
     );
     if (sel == null || sel.Count == 0)
       return;
-    var d = new SaveFileDialog { Filter = "DeviceGuard|*.dgcfg", FileName = "settings.dgcfg" };
+    var d = new SaveFileDialog { Filter = Config.AppName + "|*.dgcfg", FileName = "settings.dgcfg" };
     if (d.ShowDialog() != true)
       return;
     var node = System.Text.Json.Nodes.JsonNode.Parse(
@@ -418,7 +418,7 @@ public partial class MainWin
 
   void Import()
   {
-    var d = new OpenFileDialog { Filter = "DeviceGuard|*.dgcfg" };
+    var d = new OpenFileDialog { Filter = Config.AppName + "|*.dgcfg" };
     if (d.ShowDialog() != true)
       return;
     try
@@ -488,17 +488,24 @@ public partial class MainWin
       if (n.Length > 0)
         names.Add(n);
     }
-    foreach (
-      System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(
-        RunCmd("netsh", "wlan show profiles"),
-        @"All User Profile\s*:\s*(.+)"
+    // רשתות שמורות: שם הרשת (SSID) מתוך הפרופילים עצמם, והרשת שמחוברים אליה עכשיו – דרך WLAN API, שלא תלוי בשפת Windows
+    // (פלט netsh מתורגם: "All User Profile" לא מופיע ב-Windows בעברית, והרשתות השמורות לא הוצגו)
+    var saved = Wlan.SavedSsids();
+    foreach (var n in saved.Concat(Wlan.Connected().Values.Select(v => v.Ssid)))
+      if (n.Trim().Length > 0)
+        names.Add(n.Trim());
+    if (saved.Count == 0) // WLAN API לא זמין: כמו קודם, לפי פלט netsh באנגלית (שם הפרופיל – בדרך כלל זהה לשם הרשת)
+      foreach (
+        System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(
+          RunCmd("netsh", "wlan show profiles"),
+          @"All User Profile\s*:\s*(.+)"
+        )
       )
-    )
-    {
-      var n = m.Groups[1].Value.Trim();
-      if (n.Length > 0)
-        names.Add(n);
-    }
+      {
+        var n = m.Groups[1].Value.Trim();
+        if (n.Length > 0)
+          names.Add(n);
+      }
     return names.Select(n => ("רשת Wi-Fi: " + n, "ssid:" + n));
   }
 

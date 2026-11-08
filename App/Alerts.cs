@@ -81,7 +81,7 @@ static class Alerts
       try
       {
         using var h = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
-        await h.PostAsync(u, new StringContent("DeviceGuard (" + Environment.MachineName + "): " + msg, Encoding.UTF8));
+        await h.PostAsync(u, new StringContent(Config.AppName + " (" + Environment.MachineName + "): " + msg, Encoding.UTF8));
       }
       catch (Exception __e)
       {

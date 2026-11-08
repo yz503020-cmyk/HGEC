@@ -39,7 +39,7 @@ public partial class MainWin : Window
   public MainWin(Config c)
   {
     C = c;
-    Title = "DeviceGuard – מנהל חסימות";
+    Title = Config.AppName + " – מנהל חסימות";
     Width = 1050;
     Height = 720;
     FlowDirection = FlowDirection.RightToLeft;
@@ -293,7 +293,7 @@ public partial class MainWin : Window
     Enforcer.UiShortcutNote = false;
     Say(
       "החסימה חוסמת הרצת תוכנות מתיקיות המשתמש (כמו הורדות ושולחן העבודה), ולכן גם את DeviceGuard.exe שהורד לשם.\n"
-        + "מעכשיו פותחים את DeviceGuard מהקיצור \"DeviceGuard\" בשולחן העבודה או בתפריט התחל.\n"
+        + $"מעכשיו פותחים את {Config.AppName} מהקיצור \"{Config.AppName}\" בשולחן העבודה או בתפריט התחל.\n"
         + "לעדכון גרסה: קודם 'פתיחה זמנית (30 דק׳)', ואז מפעילים את הגרסה החדשה."
     );
   }

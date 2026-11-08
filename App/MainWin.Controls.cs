@@ -28,7 +28,7 @@ public partial class MainWin
   {
     var w = new Window
     {
-      Title = title ?? "DeviceGuard",
+      Title = title ?? Config.AppName,
       SizeToContent = SizeToContent.WidthAndHeight,
       WindowStartupLocation = WindowStartupLocation.CenterScreen,
       FlowDirection = FlowDirection.RightToLeft,
@@ -465,7 +465,7 @@ public partial class MainWin
     bool ok = false;
     var w = new Window
     {
-      Title = "DeviceGuard",
+      Title = Config.AppName,
       Topmost = true,
       WindowStartupLocation = WindowStartupLocation.CenterScreen,
       ResizeMode = ResizeMode.NoResize,

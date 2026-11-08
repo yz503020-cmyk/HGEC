@@ -518,3 +518,77 @@ public class NetUserTests
     Assert.Contains("Ethernet 2", a);
   }
 }
+
+// ---------- השער: הפעלה עם דגל דיבאג (עוקפת IFEO) רק כשהשער הופעל באמת על ידי IFEO של התוכנה ----------
+public class GateCheckTests
+{
+  [Fact]
+  public void DebuggerMatchesExactId()
+  {
+    var d = "\"C:\\ProgramData\\DeviceGuard\\DeviceGuardGate.exe\" --gate abc123";
+    Assert.True(GateCheck.DebuggerIs(d, "abc123"));
+    Assert.False(GateCheck.DebuggerIs(d, "abc")); // מזהה שמתחיל באותן אותיות – לא אותו חוק
+    Assert.False(GateCheck.DebuggerIs(d, "x"));
+    Assert.True(GateCheck.DebuggerIs(d + " ", "abc123"));
+  }
+
+  static readonly HashSet<string> Files = new(StringComparer.OrdinalIgnoreCase)
+  {
+    @"C:\Program Files\My App\app.exe",
+    @"C:\Windows\System32\notepad.exe",
+  };
+
+  static string? Img(string cmd) => GateCheck.ImageName(cmd, Files.Contains);
+
+  [Fact]
+  public void ImageFromQuotedPath()
+  {
+    Assert.Equal("app.exe", Img("\"C:\\Program Files\\My App\\app.exe\" --x \"C:\\a b\\notepad.exe\""));
+    Assert.Equal("notepad.exe", Img("\"C:\\Windows\\System32\\notepad.exe\""));
+  }
+
+  [Fact]
+  public void ImageFromBareName()
+  {
+    Assert.Equal("notepad.exe", Img("notepad"));
+    Assert.Equal("notepad.exe", Img("notepad.exe C:\\x\\calc.exe")); // ארגומנט לא משנה את התוכנה שמופעלת
+    Assert.Equal("calc.exe", Img("calc notepad.exe"));
+  }
+
+  [Fact]
+  public void ImageFromUnquotedPathWithSpaces()
+  {
+    // כמו Windows: הקידומת הקצרה ביותר שהיא קובץ קיים
+    Assert.Equal("app.exe", Img(@"C:\Program Files\My App\app.exe --flag"));
+    Assert.Equal("app.exe", Img(@"C:\Program Files\My App\app --flag"));
+  }
+
+  [Fact]
+  public void UnknownPathFallsBackToFirstWord()
+  {
+    Assert.Equal("b.exe", Img(@"C:\dir\b C:\r.exe")); // לא "r.exe": התוכנה שתופעל היא b
+    Assert.Null(Img("   "));
+  }
+
+  [Fact]
+  public void PlainStartOnlyOncePerId()
+  {
+    Environment.SetEnvironmentVariable("DG_GATE_PLAIN", null);
+    Assert.True(GateCheck.PlainStart("rule1"));
+    Assert.False(GateCheck.PlainStart("rule1")); // חזר לשער עם אותו מזהה – לא מפעילים שוב (לולאה)
+    Assert.True(GateCheck.PlainStart("rule2"));
+    Environment.SetEnvironmentVariable("DG_GATE_PLAIN", null);
+  }
+}
+
+// ---------- רכיבי מערכת שאסור לחסום ----------
+public class CriticalTests
+{
+  [Fact]
+  public void SystemUiProcessesAreCritical()
+  {
+    foreach (var n in new[] { "LockApp.exe", "TextInputHost.exe", "ShellHost.exe", "ApplicationFrameHost.exe", "WUDFHost.exe", "explorer.exe" })
+      Assert.True(Enforcer.IsCritical(n), n);
+    Assert.False(Enforcer.IsCritical("notepad.exe"));
+  }
+}

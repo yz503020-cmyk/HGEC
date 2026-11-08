@@ -288,6 +288,11 @@ public static class Enforcer
     "wermgr",
     "smartscreen",
     "sppsvc",
+    "lockapp", // מסך הנעילה
+    "textinputhost", // מקלדת המגע, לוח הסמלים וההקלדה בשפות
+    "shellhost", // מרכז הבקרה ושורת המשימות ב-Windows 11
+    "applicationframehost", // המסגרת של אפליקציות Windows (הגדרות, מחשבון...) – חסימה שלה סוגרת את כולן
+    "wudfhost", // מנהלי התקנים (טביעת אצבע, חיישנים, התקני USB)
     "DeviceGuard",
     "DeviceGuardWatch",
     "DeviceGuardGate",
@@ -1352,7 +1357,9 @@ public static class Enforcer
     return (q[1], w);
   }
 
-  // המתאמים שמותרים עכשיו לחשבון: מתאם מהרשימה הלבנה, וכרטיס Wi-Fi שמחובר כרגע לרשת מהרשימה הלבנה (לפי שם הרשת או שם הפרופיל)
+  // המתאמים שמותרים עכשיו לחשבון: מתאם מהרשימה הלבנה, וכרטיס Wi-Fi שמחובר כרגע לרשת מהרשימה הלבנה – לפי שם הרשת (SSID) בלבד.
+  // לא לפי שם הפרופיל: משתמש רגיל יכול לשמור פרופיל בשם של רשת מותרת שמתחבר בפועל לרשת אחרת (למשל נקודה חמה בטלפון).
+  // (כמו מסנן ה-Wi-Fi של חסימת הרשת לכל המחשב, שגם הוא לפי שם הרשת)
   public static List<string> NetUserAllowed(List<string> white)
   {
     var res = white.Where(w => !w.StartsWith("ssid:")).ToList();
@@ -1365,7 +1372,7 @@ public static class Enforcer
     try
     {
       foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
-        if (Guid.TryParse(ni.Id, out var g) && conn.TryGetValue(g, out var cn) && (ssids.Contains(cn.Ssid) || ssids.Contains(cn.Profile)))
+        if (Guid.TryParse(ni.Id, out var g) && conn.TryGetValue(g, out var cn) && ssids.Contains(cn.Ssid))
           res.Add(ni.Name);
     }
     catch (Exception __e)
@@ -1986,38 +1993,46 @@ public static class Enforcer
   }
 
   // DeviceGuard.exe עצמו בדרך כלל בתיקיית ההורדות / שולחן העבודה, ושם הוא נחסם (חסימת התקנות / תוכנות ניידות). היתר לקובץ הזה היה פרצה:
-  // משתמש שיכול לכתוב לתיקייה מחליף אותו בכל תוכנה אחרת באותו שם. במקום זה – קיצור "DeviceGuard" לעותק המוגן ב-ProgramData
+  // משתמש שיכול לכתוב לתיקייה מחליף אותו בכל תוכנה אחרת באותו שם. במקום זה – קיצור "אלף המגן" לעותק המוגן ב-ProgramData
   // (אותו קובץ בדיוק, ותיקייה שרק המערכת כותבת אליה). הקיצורים נשארים עד הסרת התוכנה
   public static bool UiShortcutNote; // החלון מודיע פעם אחת שמעכשיו פותחים מהקיצור
 
-  static IEnumerable<string> UiShortcuts()
+  // הקיצורים בשם המוצג ("אלף המגן"). old = הקיצורים בשם הקודם ("DeviceGuard") מגרסאות קודמות – מוחלפים בשם החדש ונמחקים בהסרה
+  static IEnumerable<string> UiShortcuts(bool old = false)
   {
     foreach (var f in new[] { Environment.SpecialFolder.CommonDesktopDirectory, Environment.SpecialFolder.CommonPrograms })
     {
       var d = Environment.GetFolderPath(f);
       if (!string.IsNullOrEmpty(d))
-        yield return System.IO.Path.Combine(d, "DeviceGuard.lnk");
+        yield return System.IO.Path.Combine(d, (old ? "DeviceGuard" : Config.AppName) + ".lnk");
     }
   }
 
   public static void EnsureUiShortcut()
   {
-    foreach (var lnk in UiShortcuts())
+    foreach (var (lnk, oldLnk) in UiShortcuts().Zip(UiShortcuts(true)))
     {
       try
       {
-        if (File.Exists(lnk) && LnkIsOurs(lnk))
-          continue;
         if (File.Exists(lnk))
-          continue; // קיצור של מישהו אחר באותו שם – לא נוגעים
-        dynamic sh = Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell")!)!;
-        dynamic l = sh.CreateShortcut(lnk);
-        l.TargetPath = GateExe;
-        l.Arguments = "";
-        l.IconLocation = GateExe + ",0";
-        l.Description = "DeviceGuard";
-        l.Save();
-        UiShortcutNote = true;
+        {
+          if (!LnkIsOurs(lnk))
+            continue; // קיצור של מישהו אחר באותו שם – לא נוגעים (וגם הקיצור הישן, אם יש, נשאר)
+        }
+        else
+        {
+          dynamic sh = Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell")!)!;
+          dynamic l = sh.CreateShortcut(lnk);
+          l.TargetPath = GateExe;
+          l.Arguments = "";
+          l.IconLocation = GateExe + ",0";
+          l.Description = Config.AppName;
+          l.Save();
+          UiShortcutNote = true;
+        }
+        // הקיצור בשם החדש קיים: הקיצור הישן שלנו ("DeviceGuard") מיותר. קיצור של מישהו אחר בשם הזה לא נמחק
+        if (File.Exists(lnk) && File.Exists(oldLnk) && LnkIsOurs(oldLnk))
+          File.Delete(oldLnk);
       }
       catch (Exception __e)
       {
@@ -2028,7 +2043,7 @@ public static class Enforcer
 
   static void RemoveUiShortcuts()
   {
-    foreach (var lnk in UiShortcuts())
+    foreach (var lnk in UiShortcuts().Concat(UiShortcuts(true)))
       try
       {
         if (File.Exists(lnk) && LnkIsOurs(lnk))
@@ -2588,7 +2603,7 @@ public static class Enforcer
           if (names.Contains(n, StringComparer.OrdinalIgnoreCase))
           {
             ifeo.DeleteSubKeyTree(n, false);
-            Alerts.Log("זוהתה הגדרת IFEO על קובץ של DeviceGuard (" + n + ") – נמחקה");
+            Alerts.Log($"זוהתה הגדרת IFEO על קובץ של {Config.AppName} (" + n + ") – נמחקה");
           }
       }
       catch (Exception __e)
@@ -4591,6 +4606,26 @@ public static class Enforcer
     }
   }
 
+  // תיקיית מטמון של אפליקציה שמותר לנקות: היא ותיקיית האפליקציה אינן קיצור (reparse point), והנתיב האמיתי שלה נשאר בתוך תיקיית Packages של המשתמש
+  static bool CacheDirSafe(string packages, string pkg, string dir)
+  {
+    try
+    {
+      if (!Directory.Exists(dir))
+        return false;
+      foreach (var x in new[] { pkg, dir })
+        if ((File.GetAttributes(x) & FileAttributes.ReparsePoint) != 0)
+          return false;
+      var real = Native.FinalPath(dir);
+      var root = Native.FinalPath(packages) ?? packages;
+      return real != null && Under(real.TrimEnd('\\'), root.TrimEnd('\\')) && !real.TrimEnd('\\').Equals(root.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase);
+    }
+    catch
+    {
+      return false; // בספק – לא מוחקים
+    }
+  }
+
   // אחרי שהסריקה נעלה תמונות/סרטים: עותקים שמורים שלהם במטמון של אפליקציית התמונות/הסרטים ובמטמון התמונות הממוזערות היו עדיין מוצגים.
   // אפליקציה שפתוחה עכשיו לא נסגרת (עבודה שלא נשמרה הייתה הולכת לאיבוד) – המטמון שלה ינוקה בפעם הבאה
   public static void ClearViewerCaches(Config c)
@@ -4634,7 +4669,13 @@ public static class Enforcer
         foreach (var pat in pkgs)
         foreach (var pkg in Directory.GetDirectories(pk, pat))
         foreach (var sub in new[] { "TempState", "LocalCache" })
-          ClearDir(System.IO.Path.Combine(pkg, sub), exts);
+        {
+          // תיקיית המטמון (או תיקיית האפליקציה) שהוחלפה בקיצור לתיקייה אחרת (junction / symlink – משתמש רגיל יכול ליצור כזה בפרופיל שלו):
+          // לא נכנסים. אחרת המחיקה (בחלון המורם) הייתה עוברת לתיקייה שהקיצור מפנה אליה – למשל תיקיית התמונות של המשפחה – ומוחקת שם לצמיתות
+          var d = System.IO.Path.Combine(pkg, sub);
+          if (CacheDirSafe(pk, pkg, d))
+            ClearDir(d, exts);
+        }
       }
     }
     catch (Exception __e)
@@ -6412,7 +6453,7 @@ public static class Enforcer
   // קיצור קיים שמפנה לשער שלנו (נשאר מהחלה קודמת שלא הצליחה למחוק אותו) – נדרס, כדי שלא יישאר יתום
   static string? FreeLnk(string baseNoExt)
   {
-    foreach (var cand in new[] { baseNoExt + ".lnk", baseNoExt + " (DeviceGuard).lnk", baseNoExt + " (DeviceGuard 2).lnk" })
+    foreach (var cand in new[] { baseNoExt + ".lnk", baseNoExt + $" ({Config.AppName}).lnk", baseNoExt + $" ({Config.AppName} 2).lnk" })
       if (!File.Exists(cand) || LnkIsOurs(cand))
         return cand;
     return null;
@@ -7098,6 +7139,96 @@ static class Wlan
 
   [DllImport("wlanapi.dll")]
   static extern void WlanFreeMemory(IntPtr p);
+
+  [DllImport("wlanapi.dll")]
+  static extern uint WlanGetProfileList(IntPtr h, ref Guid g, IntPtr res, out IntPtr list);
+
+  [DllImport("wlanapi.dll", CharSet = CharSet.Unicode)]
+  static extern uint WlanGetProfile(IntPtr h, ref Guid g, string name, IntPtr res, out IntPtr xml, IntPtr flags, IntPtr access);
+
+  // שמות הרשתות (SSID) של רשתות ה-Wi-Fi ששמורות במחשב, מתוך הפרופילים עצמם – לא מפלט netsh (שמתורגם לשפת Windows, ובעברית לא זוהה),
+  // ולא שם הפרופיל (שיכול להיות שונה משם הרשת). רשימה ריקה = אין Wi-Fi / לא ניתן לקרוא
+  public static List<string> SavedSsids()
+  {
+    var res = new List<string>();
+    var h = IntPtr.Zero;
+    try
+    {
+      if (WlanOpenHandle(2, IntPtr.Zero, out _, out h) != 0)
+        return res;
+      if (WlanEnumInterfaces(h, IntPtr.Zero, out var list) != 0)
+        return res;
+      try
+      {
+        int n = Marshal.ReadInt32(list, 0);
+        for (int i = 0; i < n && i < 64; i++)
+        {
+          var g = Marshal.PtrToStructure<Guid>(list + 8 + i * 532);
+          if (WlanGetProfileList(h, ref g, IntPtr.Zero, out var pl) != 0)
+            continue;
+          try
+          {
+            // WLAN_PROFILE_INFO_LIST: מספר (4), אינדקס (4), ואז פריטים של 516 בתים: שם הפרופיל (512), דגלים (4)
+            int pn = Marshal.ReadInt32(pl, 0);
+            for (int j = 0; j < pn && j < 1000; j++)
+            {
+              var name = (Marshal.PtrToStringUni(pl + 8 + j * 516, 256) ?? "").Split('\0')[0];
+              if (name.Length == 0 || WlanGetProfile(h, ref g, name, IntPtr.Zero, out var xp, IntPtr.Zero, IntPtr.Zero) != 0)
+                continue;
+              try
+              {
+                if (SsidOfProfile(Marshal.PtrToStringUni(xp) ?? "") is string ssid && ssid.Length > 0 && !res.Contains(ssid))
+                  res.Add(ssid);
+              }
+              finally
+              {
+                WlanFreeMemory(xp);
+              }
+            }
+          }
+          finally
+          {
+            WlanFreeMemory(pl);
+          }
+        }
+      }
+      finally
+      {
+        WlanFreeMemory(list);
+      }
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
+    }
+    finally
+    {
+      if (h != IntPtr.Zero)
+        WlanCloseHandle(h, IntPtr.Zero);
+    }
+    return res;
+  }
+
+  // שם הרשת מתוך XML של פרופיל Wi-Fi: SSIDConfig/SSID/name, או hex (כשאין name) – כמו שהבתים מפוענחים ב-Connected
+  public static string? SsidOfProfile(string xml)
+  {
+    try
+    {
+      var doc = System.Xml.Linq.XDocument.Parse(xml);
+      var ssid = doc.Descendants().FirstOrDefault(e => e.Name.LocalName == "SSID" && e.Parent?.Name.LocalName == "SSIDConfig");
+      if (ssid == null)
+        return null;
+      var name = ssid.Elements().FirstOrDefault(e => e.Name.LocalName == "name")?.Value;
+      if (!string.IsNullOrEmpty(name))
+        return name;
+      var hex = ssid.Elements().FirstOrDefault(e => e.Name.LocalName == "hex")?.Value;
+      return string.IsNullOrEmpty(hex) ? null : Encoding.UTF8.GetString(Convert.FromHexString(hex));
+    }
+    catch
+    {
+      return null;
+    }
+  }
 
   // מזהה הכרטיס -> שם הרשת (SSID) ושם הפרופיל. כרטיס שלא מחובר לא מופיע. אין Wi-Fi במחשב – רשימה ריקה
   public static Dictionary<Guid, (string Ssid, string Profile)> Connected()

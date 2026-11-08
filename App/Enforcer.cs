@@ -896,6 +896,28 @@ public static class Enforcer
     return res.OrderBy(x => x).ToList();
   }
 
+  // נקרא מהשירות (SYSTEM) רגע לפני שהוא מסיר את עצמו בהסרת התוכנה: קבצים/תיקיות שהחלון לא הצליח לשחרר – למשל כשההקשחה החזקה
+  // הסירה ממנהלים את הרשאת השחזור (היא חוזרת רק אחרי יציאה וכניסה מחדש). לשירות יש תמיד את ההרשאה הזו, ואחרי ההסרה אין מי שינסה שוב
+  public static void ReleaseLeftovers(Config c)
+  {
+    try
+    {
+      ReleaseWatchLogAll();
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
+    }
+    try
+    {
+      ProcessPathPending(c);
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
+    }
+  }
+
   // ניסיון חוזר לשחרר (אחרי שהמשתמש חיבר את הכונן)
   public static void RetryReleases(Config c)
   {
@@ -1689,8 +1711,15 @@ public static class Enforcer
         int ai = 1;
         foreach (var id in allow)
           SetReg(c, "HKLM", DEVREST + @"\AllowInstanceIDs", (ai++).ToString(), id, RegistryValueKind.String);
-        // כוננים שכבר חוברו בעבר למחשב (ולכן כבר "מותקנים") אינם מושפעים מחסימת התקנה רגילה: חוסמים אותם במפורש, כולל מה שכבר מותקן
+        // כוננים שכבר חוברו בעבר למחשב (ולכן כבר "מותקנים") אינם מושפעים מחסימת התקנה רגילה: חוסמים אותם במפורש, כולל מה שכבר מותקן.
+        // הדיסק ש-Windows רץ ממנו (Windows שמותקן על דיסק USB) לעולם לא נכנס לרשימה – חסימה שלו הייתה מונעת מהמחשב לעלות
         var deny = KnownUsbStor().Where(id => !allow.Contains(id, StringComparer.OrdinalIgnoreCase)).ToList();
+        if (SystemOnUsb())
+        {
+          var sysDisk = SystemDiskPath();
+          // לא הצלחנו לזהות את דיסק המערכת: לא חוסמים כוננים מוכרים בכלל (עדיף לחסום פחות מאשר לחסום את Windows עצמו)
+          deny = sysDisk == null ? new List<string>() : deny.Where(id => !sysDisk.Contains(id.Replace('\\', '#'), StringComparison.OrdinalIgnoreCase)).ToList();
+        }
         if (deny.Count > 0)
         {
           SetReg(c, "HKLM", DEVREST, "DenyInstanceIDs", 1);
@@ -1855,6 +1884,15 @@ public static class Enforcer
       Diag.Log(__e);
     }
     return res;
+  }
+
+  // הנתיב הפנימי של הדיסק ש-Windows מותקן עליו (כולל מזהה ההתקן, עם # במקום \), באותיות גדולות. null = לא ניתן לזהות
+  static string? SystemDiskPath()
+  {
+    var p = PS(
+      "try { [string](Get-Partition -DriveLetter $env:SystemDrive.Substring(0,1) -ErrorAction Stop | Get-Disk -ErrorAction Stop).Path } catch {}"
+    ).Trim();
+    return p.Length > 0 ? p.ToUpperInvariant() : null;
   }
 
   // תיקיות שמשתמש רגיל יכול לכתוב אליהן בתוך Windows (יחסית לתיקיית Windows): אסורות להרצה בחסימת תוכנות ניידות
@@ -4621,9 +4659,13 @@ public static class Enforcer
     {
       if (!Directory.Exists(d))
         return;
+      // הנתיב האמיתי של תיקיית המטמון: כל קובץ נמחק רק אם הנתיב האמיתי שלו (בזמן המחיקה עצמה) בתוכה
+      var root = Native.FinalPath(d)?.TrimEnd('\\');
+      if (string.IsNullOrEmpty(root))
+        return;
       foreach (
         var f in Directory.EnumerateFiles(
-          d,
+          root,
           "*",
           new EnumerationOptions
           {
@@ -4638,8 +4680,7 @@ public static class Enforcer
           continue;
         try
         {
-          File.SetAttributes(f, FileAttributes.Normal);
-          File.Delete(f);
+          DeleteInside(f, root);
         }
         catch (Exception __e)
         {
@@ -4651,6 +4692,41 @@ public static class Enforcer
     {
       Diag.Log(__e);
     }
+  }
+
+  [DllImport("kernel32.dll", SetLastError = true)]
+  static extern bool SetFileInformationByHandle(SafeHandle h, int cls, byte[] info, uint size);
+
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  static extern uint GetFinalPathNameByHandleW(SafeHandle h, StringBuilder buf, uint len, uint flags);
+
+  // מחיקה דרך ידית פתוחה: פותחים את הקובץ (בלי לעקוב אחרי קיצור), בודקים את הנתיב האמיתי של הידית, ומוחקים דרך אותה ידית.
+  // מחיקה לפי שם הייתה עוברת דרך תיקיית משנה שהוחלפה בקיצור (junction) ברגע שבין הבדיקה למחיקה – ומוחקת קובץ באותו שם במקום אחר.
+  // כך נמחק בדיוק הקובץ שנבדק, ורק אם הוא באמת בתוך תיקיית המטמון
+  static void DeleteInside(string f, string root)
+  {
+    // DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT
+    using var h = CreateFileW(f, 0x00010000 | 0x80 | 0x100, 7, IntPtr.Zero, 3, 0x00200000, IntPtr.Zero);
+    if (h.IsInvalid)
+      return;
+    var sb = new StringBuilder(1024);
+    var n = GetFinalPathNameByHandleW(h, sb, (uint)sb.Capacity, 0);
+    if (n == 0 || n >= sb.Capacity)
+      return;
+    var p = sb.ToString();
+    if (p.StartsWith(@"\\?\UNC\", StringComparison.Ordinal))
+      p = @"\\" + p[8..];
+    else if (p.StartsWith(@"\\?\", StringComparison.Ordinal))
+      p = p[4..];
+    p = p.TrimEnd('\\');
+    if (!Under(p, root) || p.Equals(root, StringComparison.OrdinalIgnoreCase))
+      return; // הקובץ שנפתח בפועל אינו בתוך תיקיית המטמון: לא מוחקים
+    // מאפיין "קריאה בלבד" מונע מחיקה: מאפסים אותו דרך אותה ידית (FILE_BASIC_INFO – זמנים 0 = בלי שינוי, מאפיין NORMAL)
+    var basic = new byte[40];
+    BitConverter.GetBytes(0x80).CopyTo(basic, 32);
+    SetFileInformationByHandle(h, 0, basic, (uint)basic.Length);
+    // FileDispositionInfo: הקובץ נמחק כשהידית נסגרת
+    SetFileInformationByHandle(h, 4, new byte[] { 1 }, 1);
   }
 
   // תיקיית מטמון של אפליקציה שמותר לנקות: היא ותיקיית האפליקציה אינן קיצור (reparse point), והנתיב האמיתי שלה נשאר בתוך תיקיית Packages של המשתמש

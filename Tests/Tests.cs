@@ -1,5 +1,7 @@
 using System.IO;
+using System.Security.AccessControl;
 using System.Security.Cryptography;
+using System.Security.Principal;
 using DG;
 using Xunit;
 
@@ -378,5 +380,64 @@ public class SkippedPathTests : IDisposable
     Enforcer.SkipProgramDirs = true;
     // מדלגים רק כשה-dll הותקן על ידי המערכת/מנהל, ולא כשמשתמש רגיל שם אותו בעצמו
     Assert.Equal(Enforcer.PrivOwned(Path.Combine(d, "x.dll")), Enforcer.InSkipped(Path.Combine(d, "a.jpg")));
+  }
+}
+
+// ---------- רשימה לבנה בחומת האש: אילו כללי היתר קיימים מושבתים ----------
+public class FirewallLeakTests
+{
+  static readonly string[] SysPkg = { "S-1-15-2-1" };
+
+  static bool Leak(string v) => Enforcer.FwLeakRule(v, SysPkg, @"C:\Windows");
+
+  [Fact]
+  public void StoreAppsAndProgramsAreDisabled()
+  {
+    Assert.True(Leak("v2.31|Action=Allow|Active=TRUE|Dir=Out|AppPkgId=S-1-15-2-99|Name=Mail|EmbedCtxt=@{microsoft.windowscommunicationsapps}|"));
+    Assert.True(Leak(@"v2.31|Action=Allow|Active=TRUE|Dir=Out|App=C:\Program Files\X\x.exe|Name=x|"));
+    Assert.True(Leak("v2.31|Action=Allow|Active=TRUE|Dir=Out|Protocol=6|RPort=443|Name=Any443|")); // כלל לכל התוכנות שאינו של Windows
+  }
+
+  [Fact]
+  public void WindowsItselfIsKept()
+  {
+    Assert.False(Leak("v2.31|Action=Allow|Active=TRUE|Dir=Out|AppPkgId=S-1-15-2-1|Name=x|")); // אפליקציית מערכת
+    Assert.False(Leak(@"v2.31|Action=Allow|Active=TRUE|Dir=Out|App=%SystemRoot%\system32\svchost.exe|Svc=dnscache|Name=CoreNet-DNS|EmbedCtxt=@FirewallAPI.dll,-25000|"));
+    Assert.False(Leak(@"v2.31|Action=Allow|Active=TRUE|Dir=Out|App=C:\Windows\System32\x.exe|Name=x|"));
+    Assert.False(Leak("v2.31|Action=Allow|Active=TRUE|Dir=Out|App=System|Name=x|"));
+    Assert.False(Leak("v2.31|Action=Allow|Active=TRUE|Dir=Out|Protocol=6|Name=x|EmbedCtxt=@FirewallAPI.dll,-28502|"));
+  }
+
+  [Fact]
+  public void OursInactiveInboundAndBlockAreKept()
+  {
+    Assert.False(Leak(@"v2.31|Action=Allow|Active=TRUE|Dir=Out|App=C:\Program Files\X\x.exe|Name=DeviceGuard Allow|EmbedCtxt=DeviceGuardNet|"));
+    Assert.False(Leak(@"v2.31|Action=Allow|Active=FALSE|Dir=Out|App=C:\Program Files\X\x.exe|Name=x|"));
+    Assert.False(Leak(@"v2.31|Action=Allow|Active=TRUE|Dir=In|App=C:\Program Files\X\x.exe|Name=x|"));
+    Assert.False(Leak(@"v2.31|Action=Block|Active=TRUE|Dir=Out|App=C:\Program Files\X\x.exe|Name=x|"));
+  }
+}
+
+// ---------- כלל הדחייה של נעילת קבצים: לכל המשתמשים או לחשבון אחד ----------
+public class DenyRuleTests
+{
+  const FileSystemRights M = FileSystemRights.ReadData | FileSystemRights.ExecuteFile | FileSystemRights.Delete;
+
+  static FileSystemAccessRule R(string sid, FileSystemRights r, AccessControlType t = AccessControlType.Deny) => new(new SecurityIdentifier(sid), r, t);
+
+  [Fact]
+  public void OursForEveryoneOrOneAccount()
+  {
+    Assert.True(Enforcer.IsOurDeny(R("S-1-1-0", M)));
+    Assert.True(Enforcer.IsOurDeny(R("S-1-5-21-1-2-3-1001", M)));
+  }
+
+  [Fact]
+  public void OtherRulesAreNotOurs()
+  {
+    Assert.False(Enforcer.IsOurDeny(R("S-1-5-21-1-2-3-1001", FileSystemRights.Write)));
+    Assert.False(Enforcer.IsOurDeny(R("S-1-5-21-1-2-3-1001", M | FileSystemRights.Write)));
+    Assert.False(Enforcer.IsOurDeny(R("S-1-5-21-1-2-3-1001", M, AccessControlType.Allow)));
+    Assert.False(Enforcer.IsOurDeny(R("S-1-5-32-544", M)));
   }
 }

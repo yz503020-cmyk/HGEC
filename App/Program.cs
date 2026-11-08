@@ -476,8 +476,13 @@ public static class Program
     var c = cur;
     if (!Blocking(c))
       return;
-    if (c.Portable.On && (n.Equals("rundll32", StringComparison.OrdinalIgnoreCase) || n.Equals("regsvr32", StringComparison.OrdinalIgnoreCase)))
+    if (
+      c.Portable.On
+      && (n.Equals("rundll32", StringComparison.OrdinalIgnoreCase) || n.Equals("regsvr32", StringComparison.OrdinalIgnoreCase))
+    )
     {
+      if (!Enforcer.PortableApplied(c))
+        return; // סומן בלי "החל שינויים": לא סוגרים כלום (וכלי מערכת אלה לא נחסמים לפי שם בכל מקרה)
       DllHost(c, n, pid, ppid);
       return; // כלי מערכת קריטיים: לא נחסמים ב-IFEO ולא נסגרים לפי השם
     }
@@ -947,6 +952,8 @@ public static class Program
   static void SelfRemove(bool full)
   {
     Alerts.Log(full ? "התוכנה הוסרה" : "השירות מתעדכן");
+    if (full)
+      Enforcer.FlushDevPending(); // התקני USB / מתאמי רשת שעדיין מושבתים (למשל לא היו מחוברים בביטול): חוזרים לפעול לפני שהשירות נעלם
     try
     {
       Enforcer.RunExe("sc.exe", "sdset DeviceGuard D:(A;;GA;;;SY)(A;;GA;;;BA)");

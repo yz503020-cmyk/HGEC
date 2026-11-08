@@ -592,3 +592,41 @@ public class CriticalTests
     Assert.False(Enforcer.IsCritical("notepad.exe"));
   }
 }
+
+// ---------- רשימה לבנה של Wi-Fi לפי כתובת הנתב (BSSID) ----------
+public class WifiBssidTests
+{
+  [Fact]
+  public void MacIsNormalized()
+  {
+    Assert.Equal("aa:bb:cc:0d:0e:0f", Enforcer.NormMac("AA-BB-CC-0D-0E-0F"));
+    Assert.Equal("aa:bb:cc:0d:0e:0f", Enforcer.NormMac("aa:bb:cc:0d:0e:0f"));
+    Assert.Null(Enforcer.NormMac("aa:bb:cc"));
+    Assert.Null(Enforcer.NormMac("zz:bb:cc:dd:ee:ff"));
+    Assert.Null(Enforcer.NormMac(null));
+  }
+
+  [Fact]
+  public void EntryRoundTrip()
+  {
+    var e = Enforcer.BssidEntry("AA:BB:CC:DD:EE:FF", "Home|5G"); // שם רשת עם "|" נשמר שלם
+    Assert.True(Enforcer.ParseBssid(e, out var mac, out var ssid));
+    Assert.Equal("aa:bb:cc:dd:ee:ff", mac);
+    Assert.Equal("Home|5G", ssid);
+    Assert.False(Enforcer.ParseBssid("ssid:Home", out _, out _)); // רשומה ישנה לפי שם בלבד – לא נתב
+    Assert.False(Enforcer.ParseBssid("bssid:xx|Home", out _, out _));
+  }
+
+  [Fact]
+  public void WifiEntriesAreNotAdapterNames()
+  {
+    var white = new List<string> { "Ethernet 2", "ssid:Home", Enforcer.BssidEntry("aa:bb:cc:dd:ee:ff", "Home") };
+    Assert.True(Enforcer.IsWifiEntry(white[1]));
+    Assert.True(Enforcer.IsWifiEntry(white[2]));
+    Assert.False(Enforcer.IsWifiEntry(white[0]));
+    var a = Enforcer.NetUserAllowed(white);
+    Assert.Contains("Ethernet 2", a);
+    Assert.DoesNotContain("ssid:Home", a);
+    Assert.DoesNotContain(white[2], a);
+  }
+}

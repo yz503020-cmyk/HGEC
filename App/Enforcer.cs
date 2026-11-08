@@ -1357,14 +1357,55 @@ public static class Enforcer
     return (q[1], w);
   }
 
-  // המתאמים שמותרים עכשיו לחשבון: מתאם מהרשימה הלבנה, וכרטיס Wi-Fi שמחובר כרגע לרשת מהרשימה הלבנה – לפי שם הרשת (SSID) בלבד.
-  // לא לפי שם הפרופיל: משתמש רגיל יכול לשמור פרופיל בשם של רשת מותרת שמתחבר בפועל לרשת אחרת (למשל נקודה חמה בטלפון).
-  // (כמו מסנן ה-Wi-Fi של חסימת הרשת לכל המחשב, שגם הוא לפי שם הרשת)
+  // ---- רשימה לבנה של Wi-Fi לפי הזהות הפנימית של הרשת: כתובת הנתב (BSSID) ----
+  // שם רשת אפשר לשנות בקלות (נקודה חמה בטלפון באותו שם), ולכן רשת מותרת נשמרת לפי כתובת הנתב שלה: bssid:aa:bb:cc:dd:ee:ff|שם.
+  // כל נתב / מגדיל טווח / תדר (2.4 / 5GHz) הוא כתובת נפרדת, ומותר רק מה שנבחר בדיוק. רשומה ישנה לפי שם בלבד (ssid:שם) לא מאשרת שום רשת –
+  // צריך לבחור את הנתב מחדש ברשימה הלבנה
+  public static bool IsWifiEntry(string w) => w.StartsWith("ssid:", StringComparison.Ordinal) || w.StartsWith("bssid:", StringComparison.Ordinal);
+
+  // כתובת נתב בפורמט אחיד: אותיות קטנות עם נקודתיים (aa:bb:cc:dd:ee:ff). null = לא תקינה
+  public static string? NormMac(string? m)
+  {
+    if (m == null)
+      return null;
+    var h = new string(m.Where(Uri.IsHexDigit).ToArray()).ToLowerInvariant();
+    if (h.Length != 12 || m.Any(ch => !Uri.IsHexDigit(ch) && ch != ':' && ch != '-'))
+      return null;
+    return string.Join(":", Enumerable.Range(0, 6).Select(i => h.Substring(i * 2, 2)));
+  }
+
+  public static string BssidEntry(string mac, string ssid) => "bssid:" + NormMac(mac) + "|" + ssid;
+
+  public static bool ParseBssid(string w, out string mac, out string ssid)
+  {
+    mac = ssid = "";
+    if (!w.StartsWith("bssid:", StringComparison.Ordinal) || w.Length < 6 + 17 + 1 || w[6 + 17] != '|')
+      return false;
+    var m = NormMac(w.Substring(6, 17));
+    if (m == null)
+      return false;
+    mac = m;
+    ssid = w[(6 + 17 + 1)..];
+    return true;
+  }
+
+  // הנתבים המותרים מתוך רשימה (רשימה לבנה או רשומות שהוחלו): מפתח = כתובת|שם
+  static HashSet<string> AllowedBss(IEnumerable<string> white)
+  {
+    var set = new HashSet<string>(StringComparer.Ordinal);
+    foreach (var w in white)
+      if (ParseBssid(w, out var m, out var s))
+        set.Add(m + "|" + s);
+    return set;
+  }
+
+  // המתאמים שמותרים עכשיו לחשבון: מתאם מהרשימה הלבנה, וכרטיס Wi-Fi שמחובר כרגע לנתב מהרשימה הלבנה – לפי כתובת הנתב והשם יחד.
+  // לא לפי שם הרשת לבד (נקודה חמה בטלפון באותו שם), ולא לפי שם הפרופיל (משתמש רגיל יכול לשמור פרופיל בכל שם)
   public static List<string> NetUserAllowed(List<string> white)
   {
-    var res = white.Where(w => !w.StartsWith("ssid:")).ToList();
-    var ssids = white.Where(w => w.StartsWith("ssid:")).Select(w => w[5..]).ToHashSet(StringComparer.Ordinal);
-    if (ssids.Count == 0)
+    var res = white.Where(w => !IsWifiEntry(w)).ToList();
+    var bss = AllowedBss(white);
+    if (bss.Count == 0)
       return res;
     var conn = Wlan.Connected();
     if (conn.Count == 0)
@@ -1372,7 +1413,7 @@ public static class Enforcer
     try
     {
       foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
-        if (Guid.TryParse(ni.Id, out var g) && conn.TryGetValue(g, out var cn) && ssids.Contains(cn.Ssid))
+        if (Guid.TryParse(ni.Id, out var g) && conn.TryGetValue(g, out var cn) && NormMac(cn.Bssid) is string cm && bss.Contains(cm + "|" + cn.Ssid))
           res.Add(ni.Name);
     }
     catch (Exception __e)
@@ -1479,8 +1520,11 @@ public static class Enforcer
     // 1) פעולות PowerShell / netsh
     if (c.Net.On && !netUser)
     {
-      var ssidWhite = c.Net.White.Where(w => w.StartsWith("ssid:")).Select(w => w[5..]).ToList();
-      var adapterWhite = c.Net.White.Where(w => !w.StartsWith("ssid:")).ToList();
+      // Wi-Fi: המסנן של Windows מאפשר רק לפי שם רשת, ולכן הוא מתיר את שמות הרשתות של הנתבים שנבחרו – והשירות מנתק חיבור לנתב אחר באותו שם
+      // (NetAdapterHeal, לפי רשומות wlanbssid). רשומה ישנה לפי שם בלבד (ssid:) לא מתירה כלום
+      var bssWhite = c.Net.White.Where(w => ParseBssid(w, out _, out _)).ToList();
+      var ssidWhite = bssWhite.Select(w => { ParseBssid(w, out _, out var sn); return sn; }).Distinct(StringComparer.Ordinal).ToList();
+      var adapterWhite = c.Net.White.Where(w => !IsWifiEntry(w)).ToList();
       var nl = Lines(netT!.Result);
       // מתאמי רשת שאינם Wi-Fi (Ethernet וכדומה): נחסמים כולם חוץ מהרשימה הלבנה; מתאם שכבר מושבת לא נוגעים בו שוב
       // שורה: סוג|מצב|מזהה התקן|שם. מזהה ההתקן נשמר בנוסף לשם (netpnp): מתאם שלא מחובר בזמן הביטול (מתאם רשת ב-USB)
@@ -1509,6 +1553,9 @@ public static class Enforcer
       AddA(c, "netapplied"); // סימון: חסימת הרשת הוחלה (השירות חוסם מתאמים חדשים רק אחרי "החל שינויים")
       foreach (var ssid in ssidWhite)
         AddA(c, "wlanfilter|allow|" + ssid);
+      foreach (var w in bssWhite)
+        if (ParseBssid(w, out var bm, out var bs))
+          AddA(c, $"wlanbssid|{bm}|{bs}"); // הנתבים המותרים (רק רישום – אין שינוי במערכת לבטל)
     }
     // חומת האש של Windows חייבת לפעול: לחסימת רשת לפי תוכנה, ולחסימת רשת של חשבון אחד
     var fwl = fwT != null ? Lines(fwT.Result) : Array.Empty<string>();
@@ -5225,6 +5272,8 @@ public static class Enforcer
   static readonly ConcurrentDictionary<string, byte> wlanSeen = new(StringComparer.OrdinalIgnoreCase);
   static DateTime wlanRefresh = DateTime.MinValue;
 
+  static DateTime lastWlanCut = DateTime.MinValue; // התראה על ניתוק Wi-Fi – לכל היותר פעם בדקה
+
   public static void NetAdapterHeal(Config c)
   {
     if (!c.Master || !c.Net.On || Applying())
@@ -5260,13 +5309,34 @@ public static class Enforcer
     {
       Diag.Log(__e);
     }
+    // Wi-Fi: המסנן של Windows מתיר רשת לפי השם בלבד. חיבור לרשת עם שם מותר אבל דרך נתב שלא נבחר (למשל נקודה חמה בטלפון שקיבלה את אותו שם) – מנותק.
+    // רק אחרי שחסימת הרשת הוחלה (המסנן קיים), ולפי הנתבים שההחלה רשמה (wlanbssid). נבדק כל כמה שניות ומיד כשהמחשב מקבל כתובת ברשת
+    if (applied.Contains("wlanfilter|denyall"))
+      try
+      {
+        var ok = applied.Where(x => x.StartsWith("wlanbssid|")).Select(x => x[10..]).ToHashSet(StringComparer.Ordinal);
+        foreach (var (g, cn) in Wlan.Connected())
+        {
+          if (NormMac(cn.Bssid) is string cm && ok.Contains(cm + "|" + cn.Ssid))
+            continue;
+          if (Wlan.Disconnect(g) && (DateTime.UtcNow - lastWlanCut).TotalMinutes >= 1)
+          {
+            lastWlanCut = DateTime.UtcNow;
+            Alerts.Log($"נותק חיבור Wi-Fi לנתב שאינו ברשימה הלבנה: {cn.Ssid} ({cn.Bssid})");
+          }
+        }
+      }
+      catch (Exception __e)
+      {
+        Diag.Log(__e);
+      }
     // מתאמים שאינם Wi-Fi: רק אחרי שחסימת הרשת הוחלה בפועל. סימון "חסימת רשת" בלי "החל שינויים" לא מנתק את הרשת הקווית
     // (רשומה מגרסה קודמת: wlanfilter|denyall נרשם בכל החלה של חסימת רשת)
     if (!applied.Contains("wlanfilter|denyall") && !AppliedHas(c, "netapplied"))
       return;
     try
     {
-      var wl = c.Net.White.Where(w => !w.StartsWith("ssid:")).ToHashSet(StringComparer.OrdinalIgnoreCase);
+      var wl = c.Net.White.Where(w => !IsWifiEntry(w)).ToHashSet(StringComparer.OrdinalIgnoreCase);
       var now = DateTime.UtcNow;
       var bad = NetworkInterface
         .GetAllNetworkInterfaces()
@@ -6749,7 +6819,7 @@ public static class Enforcer
   {
     // מתאמים ומסנן Wi-Fi נשארים רק אם ההחלה החדשה חוסמת את הרשת לכל המחשב. במעבר לחסימה של חשבון אחד (חומת האש) – הם חוזרים לפעול
     var keepNet = soft && c.Master && c.Net.On && !NetUser(c);
-    var keepAd = keepNet ? c.Net.White.Where(w => !w.StartsWith("ssid:")).ToHashSet() : null;
+    var keepAd = keepNet ? c.Net.White.Where(w => !IsWifiEntry(w)).ToHashSet() : null;
     var ps = new List<string>();
     var enDev = new List<string>(); // מתאמים/התקנים שאמורים לחזור לפעול: נבדק אחרי הביצוע, ומה שלא חזר נשמר לניסיון חוזר
     var pnpPend = new List<string>(); // מתאמי רשת שלא מחוברים כרגע (לפי מזהה התקן)
@@ -7122,7 +7192,7 @@ public static class Enforcer
   }
 }
 
-// ---------- Wi-Fi: לאיזו רשת מחובר כל כרטיס כרגע (WLAN API – בלי פלט מתורגם של netsh) ----------
+// ---------- Wi-Fi דרך WLAN API (בלי פלט מתורגם של netsh): לאיזו רשת ולאיזה נתב מחובר כל כרטיס, אילו נתבים בטווח, וניתוק ----------
 static class Wlan
 {
   [DllImport("wlanapi.dll")]
@@ -7141,134 +7211,43 @@ static class Wlan
   static extern void WlanFreeMemory(IntPtr p);
 
   [DllImport("wlanapi.dll")]
-  static extern uint WlanGetProfileList(IntPtr h, ref Guid g, IntPtr res, out IntPtr list);
+  static extern uint WlanScan(IntPtr h, ref Guid g, IntPtr ssid, IntPtr ie, IntPtr res);
 
-  [DllImport("wlanapi.dll", CharSet = CharSet.Unicode)]
-  static extern uint WlanGetProfile(IntPtr h, ref Guid g, string name, IntPtr res, out IntPtr xml, IntPtr flags, IntPtr access);
+  [DllImport("wlanapi.dll")]
+  static extern uint WlanGetNetworkBssList(IntPtr h, ref Guid g, IntPtr ssid, int bssType, bool secEnabled, IntPtr res, out IntPtr list);
 
-  // שמות הרשתות (SSID) של רשתות ה-Wi-Fi ששמורות במחשב, מתוך הפרופילים עצמם – לא מפלט netsh (שמתורגם לשפת Windows, ובעברית לא זוהה),
-  // ולא שם הפרופיל (שיכול להיות שונה משם הרשת). רשימה ריקה = אין Wi-Fi / לא ניתן לקרוא
-  public static List<string> SavedSsids()
+  [DllImport("wlanapi.dll")]
+  static extern uint WlanDisconnect(IntPtr h, ref Guid g, IntPtr res);
+
+  static string Mac(IntPtr p) => string.Join(":", Enumerable.Range(0, 6).Select(i => Marshal.ReadByte(p, i).ToString("x2")));
+
+  static string Ssid(IntPtr p)
+  { // DOT11_SSID: אורך (4) ואז עד 32 בתים
+    int len = Math.Clamp(Marshal.ReadInt32(p, 0), 0, 32);
+    var b = new byte[len];
+    Marshal.Copy(p + 4, b, 0, len);
+    return Encoding.UTF8.GetString(b);
+  }
+
+  // מריץ פעולה על כל כרטיסי ה-Wi-Fi (מזהה הכרטיס). בלי Wi-Fi במחשב / בלי שירות WLAN – לא עושה כלום
+  static void Each(Action<IntPtr, Guid> f)
   {
-    var res = new List<string>();
     var h = IntPtr.Zero;
     try
     {
       if (WlanOpenHandle(2, IntPtr.Zero, out _, out h) != 0)
-        return res;
+        return;
       if (WlanEnumInterfaces(h, IntPtr.Zero, out var list) != 0)
-        return res;
-      try
-      {
-        int n = Marshal.ReadInt32(list, 0);
-        for (int i = 0; i < n && i < 64; i++)
-        {
-          var g = Marshal.PtrToStructure<Guid>(list + 8 + i * 532);
-          if (WlanGetProfileList(h, ref g, IntPtr.Zero, out var pl) != 0)
-            continue;
-          try
-          {
-            // WLAN_PROFILE_INFO_LIST: מספר (4), אינדקס (4), ואז פריטים של 516 בתים: שם הפרופיל (512), דגלים (4)
-            int pn = Marshal.ReadInt32(pl, 0);
-            for (int j = 0; j < pn && j < 1000; j++)
-            {
-              var name = (Marshal.PtrToStringUni(pl + 8 + j * 516, 256) ?? "").Split('\0')[0];
-              if (name.Length == 0 || WlanGetProfile(h, ref g, name, IntPtr.Zero, out var xp, IntPtr.Zero, IntPtr.Zero) != 0)
-                continue;
-              try
-              {
-                if (SsidOfProfile(Marshal.PtrToStringUni(xp) ?? "") is string ssid && ssid.Length > 0 && !res.Contains(ssid))
-                  res.Add(ssid);
-              }
-              finally
-              {
-                WlanFreeMemory(xp);
-              }
-            }
-          }
-          finally
-          {
-            WlanFreeMemory(pl);
-          }
-        }
-      }
-      finally
-      {
-        WlanFreeMemory(list);
-      }
-    }
-    catch (Exception __e)
-    {
-      Diag.Log(__e);
-    }
-    finally
-    {
-      if (h != IntPtr.Zero)
-        WlanCloseHandle(h, IntPtr.Zero);
-    }
-    return res;
-  }
-
-  // שם הרשת מתוך XML של פרופיל Wi-Fi: SSIDConfig/SSID/name, או hex (כשאין name) – כמו שהבתים מפוענחים ב-Connected
-  public static string? SsidOfProfile(string xml)
-  {
-    try
-    {
-      var doc = System.Xml.Linq.XDocument.Parse(xml);
-      var ssid = doc.Descendants().FirstOrDefault(e => e.Name.LocalName == "SSID" && e.Parent?.Name.LocalName == "SSIDConfig");
-      if (ssid == null)
-        return null;
-      var name = ssid.Elements().FirstOrDefault(e => e.Name.LocalName == "name")?.Value;
-      if (!string.IsNullOrEmpty(name))
-        return name;
-      var hex = ssid.Elements().FirstOrDefault(e => e.Name.LocalName == "hex")?.Value;
-      return string.IsNullOrEmpty(hex) ? null : Encoding.UTF8.GetString(Convert.FromHexString(hex));
-    }
-    catch
-    {
-      return null;
-    }
-  }
-
-  // מזהה הכרטיס -> שם הרשת (SSID) ושם הפרופיל. כרטיס שלא מחובר לא מופיע. אין Wi-Fi במחשב – רשימה ריקה
-  public static Dictionary<Guid, (string Ssid, string Profile)> Connected()
-  {
-    var res = new Dictionary<Guid, (string Ssid, string Profile)>();
-    var h = IntPtr.Zero;
-    try
-    {
-      if (WlanOpenHandle(2, IntPtr.Zero, out _, out h) != 0)
-        return res;
-      if (WlanEnumInterfaces(h, IntPtr.Zero, out var list) != 0)
-        return res;
+        return;
       try
       {
         // WLAN_INTERFACE_INFO_LIST: מספר (4), אינדקס (4), ואז פריטים של 532 בתים: GUID (16), תיאור (512), מצב (4)
         int n = Marshal.ReadInt32(list, 0);
+        var ids = new List<Guid>();
         for (int i = 0; i < n && i < 64; i++)
-        {
-          var item = list + 8 + i * 532;
-          var g = Marshal.PtrToStructure<Guid>(item);
-          if (Marshal.ReadInt32(item, 528) != 1) // wlan_interface_state_connected
-            continue;
-          // wlan_intf_opcode_current_connection: מצב (4), סוג חיבור (4), שם הפרופיל (512), ואז אורך ה-SSID (4) והבתים שלו (32)
-          if (WlanQueryInterface(h, ref g, 7, IntPtr.Zero, out var size, out var data, IntPtr.Zero) != 0)
-            continue;
-          try
-          {
-            if (size < 556)
-              continue;
-            var profile = (Marshal.PtrToStringUni(data + 8, 256) ?? "").Split('\0')[0];
-            int len = Math.Clamp(Marshal.ReadInt32(data, 520), 0, 32);
-            var b = new byte[len];
-            Marshal.Copy(data + 524, b, 0, len);
-            res[g] = (Encoding.UTF8.GetString(b), profile);
-          }
-          finally
-          {
-            WlanFreeMemory(data);
-          }
-        }
+          ids.Add(Marshal.PtrToStructure<Guid>(list + 8 + i * 532));
+        foreach (var g in ids)
+          f(h, g);
       }
       finally
       {
@@ -7284,6 +7263,96 @@ static class Wlan
       if (h != IntPtr.Zero)
         WlanCloseHandle(h, IntPtr.Zero);
     }
+  }
+
+  // מזהה הכרטיס -> שם הרשת (SSID), שם הפרופיל וכתובת הנתב (BSSID) שמחוברים אליהם עכשיו. כרטיס שלא מחובר לא מופיע
+  public static Dictionary<Guid, (string Ssid, string Profile, string Bssid)> Connected()
+  {
+    var res = new Dictionary<Guid, (string Ssid, string Profile, string Bssid)>();
+    Each(
+      (h, g) =>
+      {
+        var gg = g;
+        // wlan_intf_opcode_current_connection (WLAN_CONNECTION_ATTRIBUTES): מצב (4), סוג חיבור (4), שם הפרופיל (512),
+        // ואז SSID – אורך (4) ו-32 בתים (מיקום 520), סוג הרשת (4, מיקום 556) וכתובת הנתב (6 בתים, מיקום 560)
+        if (WlanQueryInterface(h, ref gg, 7, IntPtr.Zero, out var size, out var data, IntPtr.Zero) != 0)
+          return;
+        try
+        {
+          if (size < 566 || Marshal.ReadInt32(data, 0) != 1) // wlan_interface_state_connected
+            return;
+          var profile = (Marshal.PtrToStringUni(data + 8, 256) ?? "").Split('\0')[0];
+          res[g] = (Ssid(data + 520), profile, Mac(data + 560));
+        }
+        finally
+        {
+          WlanFreeMemory(data);
+        }
+      }
+    );
     return res;
+  }
+
+  // הנתבים שבטווח עכשיו (רשתות רגילות, לא אד-הוק; בלי רשתות ששמן מוסתר): שם הרשת וכתובת הנתב.
+  // scanMs > 0: מבקשים סריקה חדשה ומחכים לה, כדי שיופיעו גם נתבים / תדרים שלא נראו לאחרונה
+  public static List<(string Ssid, string Bssid)> Visible(int scanMs = 0)
+  {
+    if (scanMs > 0)
+    {
+      bool any = false;
+      Each(
+        (h, g) =>
+        {
+          var gg = g;
+          if (WlanScan(h, ref gg, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero) == 0)
+            any = true;
+        }
+      );
+      if (any)
+        Thread.Sleep(scanMs);
+    }
+    var res = new List<(string, string)>();
+    Each(
+      (h, g) =>
+      {
+        var gg = g;
+        if (WlanGetNetworkBssList(h, ref gg, IntPtr.Zero, 1, false, IntPtr.Zero, out var list) != 0) // dot11_BSS_type_infrastructure
+          return;
+        try
+        {
+          // WLAN_BSS_LIST: גודל (4), מספר (4), ואז פריטים של 360 בתים (WLAN_BSS_ENTRY): SSID (36), מזהה (4), כתובת הנתב (6, מיקום 40)
+          int n = Marshal.ReadInt32(list, 4);
+          for (int i = 0; i < n && i < 1000; i++)
+          {
+            var e = list + 8 + i * 360;
+            var ssid = Ssid(e);
+            var mac = Mac(e + 40);
+            if (ssid.Length > 0 && !res.Contains((ssid, mac)))
+              res.Add((ssid, mac));
+          }
+        }
+        finally
+        {
+          WlanFreeMemory(list);
+        }
+      }
+    );
+    return res;
+  }
+
+  // ניתוק כרטיס Wi-Fi מהרשת. true = נותק
+  public static bool Disconnect(Guid g)
+  {
+    bool ok = false;
+    Each(
+      (h, x) =>
+      {
+        if (x != g)
+          return;
+        var gg = x;
+        ok = WlanDisconnect(h, ref gg, IntPtr.Zero) == 0;
+      }
+    );
+    return ok;
   }
 }

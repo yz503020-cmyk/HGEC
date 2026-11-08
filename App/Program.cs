@@ -719,9 +719,12 @@ public static class Program
     }
     if (blocking)
     {
-      foreach (var r in c.Programs.Where(r => r.On))
+      // רק תוכנות שהחסימה שלהן הוחלה ("החל שינויים" רשם עבורן IFEO). תוכנה שסומנה בחלון בלי החלה לא נסגרת –
+      // אחרת היא הייתה נסגרת מיד (גם אצל המנהל, עם עבודה שלא נשמרה) עוד לפני "החל שינויים"
+      var ifeoDone = new HashSet<string>(Enforcer.IfeoList(c).Select(x => x.Exe + "|" + x.Id), StringComparer.OrdinalIgnoreCase);
+      foreach (var r in c.Programs.Where(r => r.On && ifeoDone.Contains(System.IO.Path.GetFileName(r.Path) + "|" + r.Id)))
         Names(r, r.Mode == Mode.Full);
-      if (c.Settings.On && c.Settings.Mode == Mode.Code)
+      if (c.Settings.On && c.Settings.Mode == Mode.Code && ifeoDone.Contains("SystemSettings.exe|" + c.Settings.Id))
         ck["SystemSettings"] = c.Settings.Id; // רשת ביטחון: אפליקציית ההגדרות של Windows לא תמיד נתפסת ב-IFEO
       // כל מה שנחסם ב-IFEO (כלי אתחול, וירטואליזציה, התקנת MSI, לוח הבקרה...) נסגר גם אם הופעל בכל זאת – למשל מנהל שמחק את החסימה
       // מהרישום והפעיל את הכלי באותו רגע, לפני שהשירות שחזר אותה. תהליכים של Windows עצמו (SYSTEM) ושל השירות לא נסגרים (HandleProc)
@@ -793,7 +796,7 @@ public static class Program
         }
         sizeMap = d;
       });
-    curMap = blocking ? Enforcer.ExtMap(c) : new Dictionary<string, Rule>();
+    curMap = blocking ? Enforcer.AppliedExtMap(c) : new Dictionary<string, Rule>(); // רק סוגי קבצים שהחסימה שלהם הוחלה
     Enforcer.SetSkip(c);
     Alerts.SetUrl(c.AlertUrl);
   }

@@ -1304,24 +1304,57 @@ public static class Enforcer
     } // שומרים את מה שכבר הוחל, כדי שאפשר יהיה לבטל אותו
   }
 
-  public static void SetSkip(Config c)
+  // applied = true (השירות בזמן רגיל): היקף הנעילה, החיזוק ואפשרויות הסריקה – לפי מה שהוחל (AppliedScope), ולא לפי מה שסומן בחלון
+  public static void SetSkip(Config c, bool applied = false)
   {
-    Harden = c.Harden;
-    SkipAppData = c.SkipAppData;
+    var s = applied ? AppliedScope(c) : CurrentScope(c);
+    Harden = s.Harden;
+    SkipAppData = s.SkipAppData;
     Exclude = c.Exclude.ToArray();
-    IncludeRemovable = c.IncludeRemovable;
-    SkipProgramDirs = c.SkipProgramDirs;
+    IncludeRemovable = s.IncludeRemovable;
+    SkipProgramDirs = s.SkipProgramDirs;
     UiExe = string.IsNullOrWhiteSpace(c.UiExe) ? null : c.UiExe.TrimEnd('\\');
     DenyTo = World;
-    if (ScopeHive(c) != "HKLM")
+    if (!s.AllUsers && !string.IsNullOrEmpty(s.OwnerSid)) // כמו ScopeHive(c) != "HKLM"
       try
       {
-        DenyTo = new SecurityIdentifier(c.OwnerSid!);
+        DenyTo = new SecurityIdentifier(s.OwnerSid);
       }
       catch (Exception __e)
       {
         Diag.Log(__e);
       }
+  }
+
+  // ---- על מי ועל מה החסימה חלה – רק אחרי "החל שינויים" ----
+  // "כל המשתמשים" / החשבון שנבחר, חיזוק חסימת הקבצים ואפשרויות הסריקה (AppData, כוננים נשלפים, תיקיות תוכנות).
+  // ההחלה רושמת אותם (רשומת scope|), והשירות פועל לפיהם: שינוי בחלון בלי "החל שינויים" לא סוגר תוכנות אצל משתמש אחר
+  // ולא מתחיל לנעול קבצים במקומות חדשים. בלי רשומה (החלה מגרסה קודמת) – לפי ההגדרות, כמו קודם
+  public sealed record Scope(bool AllUsers, string? OwnerSid, bool Harden, bool SkipAppData, bool IncludeRemovable, bool SkipProgramDirs);
+
+  public static Scope CurrentScope(Config c) => new(c.AllUsers, c.OwnerSid, c.Harden, c.SkipAppData, c.IncludeRemovable, c.SkipProgramDirs);
+
+  static string ScopeEntry(Config c) =>
+    string.Join(
+      "|",
+      "scope",
+      c.AllUsers ? 1 : 0,
+      c.Harden ? 1 : 0,
+      c.SkipAppData ? 1 : 0,
+      c.IncludeRemovable ? 1 : 0,
+      c.SkipProgramDirs ? 1 : 0,
+      c.OwnerSid ?? "" // אחרון: מזהה חשבון לא מכיל "|"
+    );
+
+  public static Scope AppliedScope(Config c)
+  {
+    string? e;
+    lock (c.Applied)
+      e = c.Applied.LastOrDefault(x => x.StartsWith("scope|", StringComparison.Ordinal));
+    var p = e?.Split('|');
+    if (p == null || p.Length != 7)
+      return CurrentScope(c);
+    return new Scope(p[1] == "1", p[6].Length == 0 ? null : p[6], p[2] == "1", p[3] == "1", p[4] == "1", p[5] == "1");
   }
 
   // "רק החשבון שנבחר": החסימות שאפשר להחיל על חשבון אחד (נעילת קבצים/תיקיות/סוגי קבצים, USB, תוכנות ניידות, מדיניות דפדפנים וכו')
@@ -1841,6 +1874,7 @@ public static class Enforcer
       }
     // חוקי סוגי הקבצים שהוחלו: השירות נועל קבצים רק לפיהם (AppliedExtMap). חוק שסומן אחר כך בלי "החל שינויים" לא נועל
     AddA(c, ExtGate);
+    AddA(c, ScopeEntry(c)); // על מי ועל מה החסימה חלה – השירות פועל לפי זה עד ההחלה הבאה (AppliedScope)
     foreach (var r in new[] { c.Movies, c.Songs, c.Images }.Concat(c.Exts).Where(r => r.On))
       AddA(c, "ext|" + r.Id);
     foreach (var r in new[] { c.Movies, c.Songs, c.Images }.Concat(c.Exts).Where(r => r.On && r.Mode == Mode.Code))

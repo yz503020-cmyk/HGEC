@@ -1060,6 +1060,9 @@ public static class Program
     Alerts.Log(full ? "התוכנה הוסרה" : "השירות מתעדכן");
     if (full)
       Enforcer.FlushDevPending(); // התקני USB / מתאמי רשת שעדיין מושבתים (למשל לא היו מחוברים בביטול): חוזרים לפעול לפני שהשירות נעלם
+    // קבצים שהחלון לא הצליח לשחרר (למשל בגלל ההקשחה החזקה): השירות משחרר אותם עכשיו – רק כשהחסימות באמת כבויות
+    if (full && !Blocking(cur))
+      Enforcer.ReleaseLeftovers(cur);
     try
     {
       Enforcer.RunExe("sc.exe", "sdset DeviceGuard D:(A;;GA;;;SY)(A;;GA;;;BA)");

@@ -144,7 +144,7 @@ static class GateMode
   // הפעלה עם DEBUG_ONLY_THIS_PROCESS: Windows לא מפעיל שוב את ה-Debugger, ואז מנתקים את הדיבוג והתוכנה רצה כרגיל.
   // reg != null: התוכנה אושרה, והשירות מתעד אותה (לפני הניתוק, כדי שלא תהיה מרוץ מול לולאת הניטור). תהליכי בן של תוכנה מאושרת עוברים בלי קוד
   // ממתין לסיום התוכנה ומחזיר את קוד היציאה שלה (כמו השער הקל): מי שהפעיל אותה – תוכנת התקנה, סקריפט או Windows – מחכה לה באמת
-  static int Launch(string cmd, string? reg)
+  static int Launch(string cmd, string? reg, bool debug = true)
   {
     var si = new SI { cb = Marshal.SizeOf<SI>() };
     // מעבירים הלאה את הקלט/פלט הסטנדרטי (חשוב לסקריפטים וכלים שקוראים את הפלט של תוכנה חסומה)
@@ -152,7 +152,7 @@ static class GateMode
       ho = GetStdHandle(-11),
       he = GetStdHandle(-12);
     bool any = Ok(hi) || Ok(ho) || Ok(he);
-    uint fl = 2; // DEBUG_ONLY_THIS_PROCESS
+    uint fl = debug ? 2u : 0u; // DEBUG_ONLY_THIS_PROCESS (בלי דיבאג: הפעלה רגילה, ש-IFEO חל עליה)
     if (any)
     {
       si.fl |= 0x100;
@@ -161,12 +161,16 @@ static class GateMode
       si.e = he;
       fl |= 0x08000000;
     } // STARTF_USESTDHANDLES + CREATE_NO_WINDOW
-    DebugSetProcessKillOnExit(false);
+    if (debug)
+      DebugSetProcessKillOnExit(false);
     if (!CreateProcessW(null, new StringBuilder(cmd), 0, 0, any, fl, 0, null, ref si, out var pi))
       return -1;
-    if (reg != null)
-      Config.Pipe($"AUTHPID|{pi.pid}|{reg}", 1500);
-    DebugActiveProcessStop(pi.pid);
+    if (debug)
+    {
+      if (reg != null)
+        Config.Pipe($"AUTHPID|{pi.pid}|{reg}", 1500);
+      DebugActiveProcessStop(pi.pid);
+    }
     CloseHandle(pi.ht);
     WaitForSingleObject(pi.hp, 0xFFFFFFFF);
     int code = GetExitCodeProcess(pi.hp, out var ec) ? unchecked((int)ec) : 0;
@@ -194,13 +198,33 @@ static class GateMode
     if (Native.IsServiceAccount())
       return Launch(orig, null);
     bool sys = Native.IsSystemContext();
+    // הפעלה עם דגל דיבאג עוקפת את IFEO – מותרת רק כשהשער הופעל באמת על ידי IFEO של התוכנה הזו (ראו GateCheck).
+    // אין IFEO עם המזהה (מזהה שהומצא / חסימה שבוטלה): הפעלה רגילה – תוכנה חסומה תחזור לשער עם המזהה הנכון
+    var names = GateCheck.IfeoNames(id);
+    if (names.Count == 0)
+    {
+      if (!GateCheck.PlainStart(id))
+        return Blocked; // הגנה מלולאה (ראו PlainStart)
+      var rc = Launch(orig, null, false);
+      return rc == -1 ? Blocked : rc;
+    }
+    var img = GateCheck.ImageName(orig);
+    if (img == null || !names.Contains(img))
+    {
+      if (!sys)
+      {
+        Init();
+        Msg("לא ניתן להפעיל את התוכנה בדרך הזו.");
+      }
+      return Blocked;
+    }
     var info = GetInfo(id);
     if (info == null)
     {
       if (!sys)
       {
         Init();
-        Msg("שירות ההגנה אינו פעיל, ולכן לא ניתן להפעיל תוכנה חסומה. פתח את DeviceGuard ולחץ 'החל שינויים'.");
+        Msg($"שירות ההגנה אינו פעיל, ולכן לא ניתן להפעיל תוכנה חסומה. פתח את {Config.AppName} ולחץ 'החל שינויים'.");
       }
       return Blocked;
     }
@@ -259,7 +283,7 @@ static class GateMode
     var need = info.HasOwn ? "הקוד הנפרד של התוכנה הזו" : "קוד ברירת המחדל (שהוגדר בחלון 1)";
     var w = new Window
     {
-      Title = "DeviceGuard",
+      Title = Config.AppName,
       Topmost = true,
       ResizeMode = ResizeMode.NoResize,
       SizeToContent = SizeToContent.WidthAndHeight,
@@ -340,7 +364,7 @@ static class GateMode
 
   static void Msg(string t)
   { // הודעה שתמיד מופיעה מעל שאר החלונות
-    MainWin.Say(t, "DeviceGuard", warn: true);
+    MainWin.Say(t, Config.AppName, warn: true);
   }
 
   // תיקייה נפתחת ישירות ב-Explorer (כדי שלא יתפוס במקומה את הקיצור שנוצר לצידה); קובץ נפתח כרגיל
@@ -496,7 +520,7 @@ static class GateMode
       return;
     var w = new Window
     {
-      Title = "DeviceGuard",
+      Title = Config.AppName,
       ResizeMode = ResizeMode.CanMinimize,
       SizeToContent = SizeToContent.WidthAndHeight,
       WindowStartupLocation = WindowStartupLocation.CenterScreen,

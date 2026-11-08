@@ -729,7 +729,8 @@ public static class Program
       {
         var n = System.IO.Path.GetFileNameWithoutExtension(exe);
         var r = c.Find(id);
-        if (n.Length == 0 || r == null || Enforcer.IsCritical(n) || ks.Contains(n) || ck.ContainsKey(n))
+        // חוק שהסימון שלו הוסר (גם בלי "החל שינויים"): השער כבר מאפשר אותו (RuleInfo), ולכן לא סוגרים – אחרת התוכנה נפתחת ונסגרת לבד
+        if (n.Length == 0 || r == null || !r.On || Enforcer.IsCritical(n) || ks.Contains(n) || ck.ContainsKey(n))
           continue;
         if (r.Mode == Mode.Full)
           ks.Add(n);
@@ -746,7 +747,7 @@ public static class Program
         var q = e.Split('|');
         if (q[0] == "wslbash")
         {
-          if (q.Length >= 2 && c.Find(q[1]) != null)
+          if (q.Length >= 2 && c.Find(q[1]) is { On: true })
             wr = q[1];
           continue;
         }
@@ -754,7 +755,7 @@ public static class Program
           continue;
         var n = q[1];
         var r = c.Find(q[2]);
-        if (n.Length == 0 || r == null || Enforcer.IsCritical(n) || ks.Contains(n) || ck.ContainsKey(n))
+        if (n.Length == 0 || r == null || !r.On || Enforcer.IsCritical(n) || ks.Contains(n) || ck.ContainsKey(n))
           continue;
         if (r.Mode == Mode.Full)
           ks.Add(n);
@@ -1985,14 +1986,14 @@ public static class Program
       using var single = new Mutex(true, "Global\\DeviceGuard.UI", out var created); // מופע אחד בלבד של החלון (שני חלונות היו דורסים זה את ההגדרות של זה)
       if (!created)
       {
-        MainWin.Say("DeviceGuard כבר פתוח.");
+        MainWin.Say(Config.AppName + " כבר פתוח.");
         return;
       }
       var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
       Theme.Apply(app);
       app.DispatcherUnhandledException += (s, e) =>
       {
-        MainWin.Say(e.Exception.Message, "DeviceGuard");
+        MainWin.Say(e.Exception.Message, Config.AppName);
         e.Handled = true;
       };
       var c = Config.Load();
@@ -2079,7 +2080,7 @@ public static class Program
     }
     catch (Exception x)
     {
-      MainWin.Say(x.ToString(), "DeviceGuard – שגיאה");
+      MainWin.Say(x.ToString(), Config.AppName + " – שגיאה");
     }
   }
 }

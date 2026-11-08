@@ -518,3 +518,115 @@ public class NetUserTests
     Assert.Contains("Ethernet 2", a);
   }
 }
+
+// ---------- השער: הפעלה עם דגל דיבאג (עוקפת IFEO) רק כשהשער הופעל באמת על ידי IFEO של התוכנה ----------
+public class GateCheckTests
+{
+  [Fact]
+  public void DebuggerMatchesExactId()
+  {
+    var d = "\"C:\\ProgramData\\DeviceGuard\\DeviceGuardGate.exe\" --gate abc123";
+    Assert.True(GateCheck.DebuggerIs(d, "abc123"));
+    Assert.False(GateCheck.DebuggerIs(d, "abc")); // מזהה שמתחיל באותן אותיות – לא אותו חוק
+    Assert.False(GateCheck.DebuggerIs(d, "x"));
+    Assert.True(GateCheck.DebuggerIs(d + " ", "abc123"));
+  }
+
+  static readonly HashSet<string> Files = new(StringComparer.OrdinalIgnoreCase)
+  {
+    @"C:\Program Files\My App\app.exe",
+    @"C:\Windows\System32\notepad.exe",
+  };
+
+  static string? Img(string cmd) => GateCheck.ImageName(cmd, Files.Contains);
+
+  [Fact]
+  public void ImageFromQuotedPath()
+  {
+    Assert.Equal("app.exe", Img("\"C:\\Program Files\\My App\\app.exe\" --x \"C:\\a b\\notepad.exe\""));
+    Assert.Equal("notepad.exe", Img("\"C:\\Windows\\System32\\notepad.exe\""));
+  }
+
+  [Fact]
+  public void ImageFromBareName()
+  {
+    Assert.Equal("notepad.exe", Img("notepad"));
+    Assert.Equal("notepad.exe", Img("notepad.exe C:\\x\\calc.exe")); // ארגומנט לא משנה את התוכנה שמופעלת
+    Assert.Equal("calc.exe", Img("calc notepad.exe"));
+  }
+
+  [Fact]
+  public void ImageFromUnquotedPathWithSpaces()
+  {
+    // כמו Windows: הקידומת הקצרה ביותר שהיא קובץ קיים
+    Assert.Equal("app.exe", Img(@"C:\Program Files\My App\app.exe --flag"));
+    Assert.Equal("app.exe", Img(@"C:\Program Files\My App\app --flag"));
+  }
+
+  [Fact]
+  public void UnknownPathFallsBackToFirstWord()
+  {
+    Assert.Equal("b.exe", Img(@"C:\dir\b C:\r.exe")); // לא "r.exe": התוכנה שתופעל היא b
+    Assert.Null(Img("   "));
+  }
+
+  [Fact]
+  public void PlainStartOnlyOncePerId()
+  {
+    Environment.SetEnvironmentVariable("DG_GATE_PLAIN", null);
+    Assert.True(GateCheck.PlainStart("rule1"));
+    Assert.False(GateCheck.PlainStart("rule1")); // חזר לשער עם אותו מזהה – לא מפעילים שוב (לולאה)
+    Assert.True(GateCheck.PlainStart("rule2"));
+    Environment.SetEnvironmentVariable("DG_GATE_PLAIN", null);
+  }
+}
+
+// ---------- רכיבי מערכת שאסור לחסום ----------
+public class CriticalTests
+{
+  [Fact]
+  public void SystemUiProcessesAreCritical()
+  {
+    foreach (var n in new[] { "LockApp.exe", "TextInputHost.exe", "ShellHost.exe", "ApplicationFrameHost.exe", "WUDFHost.exe", "explorer.exe" })
+      Assert.True(Enforcer.IsCritical(n), n);
+    Assert.False(Enforcer.IsCritical("notepad.exe"));
+  }
+}
+
+// ---------- רשימה לבנה של Wi-Fi לפי כתובת הנתב (BSSID) ----------
+public class WifiBssidTests
+{
+  [Fact]
+  public void MacIsNormalized()
+  {
+    Assert.Equal("aa:bb:cc:0d:0e:0f", Enforcer.NormMac("AA-BB-CC-0D-0E-0F"));
+    Assert.Equal("aa:bb:cc:0d:0e:0f", Enforcer.NormMac("aa:bb:cc:0d:0e:0f"));
+    Assert.Null(Enforcer.NormMac("aa:bb:cc"));
+    Assert.Null(Enforcer.NormMac("zz:bb:cc:dd:ee:ff"));
+    Assert.Null(Enforcer.NormMac(null));
+  }
+
+  [Fact]
+  public void EntryRoundTrip()
+  {
+    var e = Enforcer.BssidEntry("AA:BB:CC:DD:EE:FF", "Home|5G"); // שם רשת עם "|" נשמר שלם
+    Assert.True(Enforcer.ParseBssid(e, out var mac, out var ssid));
+    Assert.Equal("aa:bb:cc:dd:ee:ff", mac);
+    Assert.Equal("Home|5G", ssid);
+    Assert.False(Enforcer.ParseBssid("ssid:Home", out _, out _)); // רשומה ישנה לפי שם בלבד – לא נתב
+    Assert.False(Enforcer.ParseBssid("bssid:xx|Home", out _, out _));
+  }
+
+  [Fact]
+  public void WifiEntriesAreNotAdapterNames()
+  {
+    var white = new List<string> { "Ethernet 2", "ssid:Home", Enforcer.BssidEntry("aa:bb:cc:dd:ee:ff", "Home") };
+    Assert.True(Enforcer.IsWifiEntry(white[1]));
+    Assert.True(Enforcer.IsWifiEntry(white[2]));
+    Assert.False(Enforcer.IsWifiEntry(white[0]));
+    var a = Enforcer.NetUserAllowed(white);
+    Assert.Contains("Ethernet 2", a);
+    Assert.DoesNotContain("ssid:Home", a);
+    Assert.DoesNotContain(white[2], a);
+  }
+}

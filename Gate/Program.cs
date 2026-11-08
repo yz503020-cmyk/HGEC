@@ -220,6 +220,21 @@ static unsafe class Program
       return c == -1 ? Blocked : c;
     }
 
+    // אין ב-IFEO אף תוכנה עם המזהה הזה (מזהה שהומצא, או שהחסימה בוטלה בינתיים): הפעלה רגילה, בלי דגל הדיבאג –
+    // אם התוכנה חסומה, Windows מעביר אותה שוב לשער עם המזהה הנכון. כך אין עקיפה, ואין לולאה (אף IFEO לא מפנה למזהה הזה)
+    var names = DG.GateCheck.IfeoNames(id);
+    if (names.Count == 0)
+    {
+      // הגנה מלולאה: אם קריאת הרישום נכשלה וההפעלה הרגילה חזרה לשער עם אותו מזהה – לא מפעילים שוב
+      if (!DG.GateCheck.PlainStart(id))
+        return Blocked;
+      var rc = Run(orig, null, false);
+      return rc == -1 ? Blocked : rc;
+    }
+    // יש IFEO עם המזהה, אבל לא של התוכנה שמופעלת: הפעלה ידנית של השער עם מזהה של חוק אחר – נחסם (השער המלא מציג הודעה)
+    var img = DG.GateCheck.ImageName(orig);
+    if (img == null || !names.Contains(img))
+      return sys ? Blocked : Delegate();
     var r = Pipe("RULE|" + id + "|" + sidStr, 3000);
     if (r == null)
       return sys ? Blocked : Delegate(); // שירות לא זמין: השער המלא מציג הודעה

@@ -32,7 +32,7 @@ jobs:
         run: dotnet publish Gate/DeviceGuardGate.csproj -c Release -r win-x64 -o Gate/out
       - name: Publish app
         shell: bash
-        run: dotnet publish App/DeviceGuard.csproj -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -p:Version=2.1.${{ github.run_number }} -o out
+        run: dotnet publish App/DeviceGuard.csproj -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -p:Version=2.8.${{ github.run_number }} -o out
       # חתימה דיגיטלית (אופציונלית – מקטינה זיהוי שגוי של אנטי-וירוס). דורשת סודות: SIGN_PFX_BASE64 ו-SIGN_PFX_PASSWORD
       - name: Sign (optional)
         if: ${{ env.SIGN_PFX_BASE64 != '' }}

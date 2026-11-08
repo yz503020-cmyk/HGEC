@@ -9,10 +9,10 @@
     <RootNamespace>DG</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>icon.ico</ApplicationIcon>
-    <Version>2.1.0</Version>
-    <Product>DeviceGuard</Product>
-    <Company>DeviceGuard</Company>
-    <Description>DeviceGuard device restrictions manager</Description>
+    <Version>2.8.0</Version>
+    <Product>אלף המגן</Product>
+    <Company>אלף המגן</Company>
+    <Description>אלף המגן – מנהל חסימות</Description>
     <!-- אריזה לקובץ יחיד: האפליקציה והשער המלא הם אותו קובץ (השירות מעתיק אותו ל-DeviceGuardWatch.exe) -->
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>

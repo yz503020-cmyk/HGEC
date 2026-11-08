@@ -190,6 +190,10 @@ public class Config
   };
 
   public static readonly JsonSerializerOptions O = new() { IncludeFields = true, WriteIndented = true };
+
+  // השם שמוצג למשתמש (חלונות, הודעות, קיצורי דרך). השמות הפנימיים – השירות, תיקיית ההגדרות, מפתחות הרישום, קובצי ההפעלה – נשארים DeviceGuard,
+  // כדי שהתקנות קיימות ימשיכו לעבוד ויתעדכנו כרגיל
+  public const string AppName = "אלף המגן";
   public static string Dir = System.IO.Path.Combine(
     Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
     "DeviceGuard"

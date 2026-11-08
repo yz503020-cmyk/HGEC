@@ -209,7 +209,7 @@ public partial class MainWin
         + "קבצים שהוגדרו כמוסתרים מוסתרים בכל החשבונות, אבל נחסמים רק בחשבון שנבחר."
     );
     Theme.Tipped(code, "קוד ברירת המחדל משמש לפתיחת כל חסימה בקוד שלא הוגדר לה קוד נפרד.");
-    Theme.Tipped(appc, $"מחליף את הקוד שנדרש כדי לפתוח את DeviceGuard ולהסיר אותו. לפחות {MinCode} תווים; מומלץ גם אותיות.");
+    Theme.Tipped(appc, $"מחליף את הקוד שנדרש כדי לפתוח את {Config.AppName} ולהסיר אותו. לפחות {MinCode} תווים; מומלץ גם אותיות.");
     Theme.Tipped(exp, "שומר את ההגדרות לקובץ, לגיבוי או להעברה למחשב אחר.");
     Theme.Tipped(imp, "טוען הגדרות מקובץ שיוצא קודם. אחרי הטעינה לוחצים 'החל שינויים'.");
     Theme.Tipped(un2, "מכבה את כל החסימות ומסיר את שירות ההגנה מהמחשב, אחרי הקשת קוד הכניסה.");
@@ -406,7 +406,7 @@ public partial class MainWin
     );
     if (sel == null || sel.Count == 0)
       return;
-    var d = new SaveFileDialog { Filter = "DeviceGuard|*.dgcfg", FileName = "settings.dgcfg" };
+    var d = new SaveFileDialog { Filter = Config.AppName + "|*.dgcfg", FileName = "settings.dgcfg" };
     if (d.ShowDialog() != true)
       return;
     var node = System.Text.Json.Nodes.JsonNode.Parse(
@@ -418,7 +418,7 @@ public partial class MainWin
 
   void Import()
   {
-    var d = new OpenFileDialog { Filter = "DeviceGuard|*.dgcfg" };
+    var d = new OpenFileDialog { Filter = Config.AppName + "|*.dgcfg" };
     if (d.ShowDialog() != true)
       return;
     try
@@ -473,33 +473,33 @@ public partial class MainWin
   // ---------- חלון 2 ----------
   static string RunCmd(string exe, string args) => Enforcer.RunExe(exe, args);
 
-  // שמות רשתות Wi-Fi: גם רשתות שבטווח כרגע וגם רשתות ששמורות במחשב (כדי שאפשר יהיה לבחור אותן לרשימה הלבנה גם אם אינן בטווח כרגע)
-  static IEnumerable<(string, string)> WifiSsids()
+  // נתבי Wi-Fi לרשימה הלבנה – לפי כתובת הנתב (BSSID), ולא רק לפי שם הרשת (שאפשר לתת לכל נקודה חמה).
+  // מוצגים הנתבים שבטווח עכשיו (אחרי סריקה קצרה), וגם מה שכבר נבחר: נתב שלא בטווח כרגע נשאר ברשימה (אחרת היה נמחק באישור),
+  // ורשומה ישנה לפי שם בלבד מוצגת עם הסבר – היא לא מאשרת שום רשת עד שבוחרים את הנתב מחדש
+  static IEnumerable<(string, string)> WifiOptions(List<string> white)
   {
-    var names = new HashSet<string>();
-    foreach (
-      System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(
-        RunCmd("netsh", "wlan show networks"),
-        @"SSID\s+\d+\s*:\s*(.+)"
-      )
-    )
+    var res = new List<(string, string)>();
+    var seen = new HashSet<string>(StringComparer.Ordinal);
+    var now = Wlan.Connected().Values.Select(v => Enforcer.NormMac(v.Bssid) + "|" + v.Ssid).ToHashSet(StringComparer.Ordinal);
+    foreach (var (ssid, mac) in Wlan.Visible(2500).OrderBy(x => x.Ssid, StringComparer.CurrentCulture).ThenBy(x => x.Bssid))
     {
-      var n = m.Groups[1].Value.Trim();
-      if (n.Length > 0)
-        names.Add(n);
+      var e = Enforcer.BssidEntry(mac, ssid);
+      if (!seen.Add(e))
+        continue;
+      var cur = now.Contains(Enforcer.NormMac(mac) + "|" + ssid) ? " – מחובר עכשיו" : "";
+      res.Add(($"רשת Wi-Fi: {ssid} (נתב {mac}){cur}", e));
     }
-    foreach (
-      System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(
-        RunCmd("netsh", "wlan show profiles"),
-        @"All User Profile\s*:\s*(.+)"
-      )
-    )
+    foreach (var w in white)
     {
-      var n = m.Groups[1].Value.Trim();
-      if (n.Length > 0)
-        names.Add(n);
+      if (Enforcer.ParseBssid(w, out var mac, out var ssid))
+      {
+        if (seen.Add(w))
+          res.Add(($"רשת Wi-Fi: {ssid} (נתב {mac}) – לא בטווח כרגע", w));
+      }
+      else if (w.StartsWith("ssid:", StringComparison.Ordinal) && seen.Add(w))
+        res.Add(($"רשת Wi-Fi: {w[5..]} – נשמרה לפי השם בלבד ולכן חסומה. בחר את הנתב שלה מהרשימה (כשהוא בטווח)", w));
     }
-    return names.Select(n => ("רשת Wi-Fi: " + n, "ssid:" + n));
+    return res;
   }
 
   static List<(string N, string E)> Installed()
@@ -894,7 +894,7 @@ public partial class MainWin
         .Where(n => n.NetworkInterfaceType != System.Net.NetworkInformation.NetworkInterfaceType.Loopback)
         .Select(n => (n.Name, n.Name))
         .ToList();
-      items.AddRange(WifiSsids());
+      items.AddRange(WifiOptions(C.Net.White));
       return items.AsEnumerable();
     };
     var note = new TextBlock

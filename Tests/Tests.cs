@@ -496,3 +496,25 @@ public class RegValueTests
     Assert.False(Enforcer.SidOk("Everyone"));
   }
 }
+
+// ---------- חסימת רשת לחשבון אחד: גם עם רשימה לבנה ----------
+public class NetUserTests
+{
+  [Fact]
+  public void OneAccountWithWhitelistIsPerAccount()
+  {
+    var c = new Config { AllUsers = false, OwnerSid = "S-1-5-21-1-2-3-1001" };
+    c.Net.White.Add("ssid:Home");
+    c.Net.White.Add("Ethernet");
+    Assert.True(Enforcer.NetUser(c));
+    c.AllUsers = true;
+    Assert.False(Enforcer.NetUser(c));
+  }
+
+  [Fact]
+  public void WhitelistedAdapterIsAllowed()
+  {
+    var a = Enforcer.NetUserAllowed(new List<string> { "Ethernet 2" });
+    Assert.Contains("Ethernet 2", a);
+  }
+}

@@ -1748,6 +1748,7 @@ public static class Program
           {
             lastAd = now;
             Enforcer.NetAdapterHeal(c);
+            Enforcer.NetUserHeal(c); // גם מיד בשינוי ברשת: רשימה לבנה של Wi-Fi לחשבון אחד מתעדכנת לפי הרשת שמחוברים אליה
           }
           if (quiet && (now - lastPaths).TotalSeconds >= 30)
           { // חסימות קבצים/תיקיות והנעילה של hosts שהוסרו מבחוץ

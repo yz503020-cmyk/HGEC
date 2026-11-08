@@ -1314,9 +1314,9 @@ public static class Enforcer
   public static bool UsbUser(Config c) => ScopeHive(c) != "HKLM" && !c.Usb.White.Any(w => !w.StartsWith("usbparent:"));
 
   // חסימת רשת לחשבון אחד בלבד: כלל חסימה יוצא בחומת האש של Windows, שחל רק על התעבורה של החשבון שנבחר (לפי ה-SID).
-  // מתאמי הרשת וה-Wi-Fi לא מושבתים, ושאר החשבונות (גם המנהל) מתחברים כרגיל. עם רשימה לבנה של מתאמים / רשתות Wi-Fi
-  // אי אפשר לבטא את זה בחומת האש – ואז החסימה חלה על כל המחשב, כמו קודם
-  public static bool NetUser(Config c) => ScopeHive(c) != "HKLM" && SidOk(c.OwnerSid) && c.Net.White.Count == 0;
+  // מתאמי הרשת וה-Wi-Fi לא מושבתים, ושאר החשבונות (גם המנהל) מתחברים כרגיל. עם רשימה לבנה: הכלל חל על כל המתאמים חוץ ממתאם
+  // שברשימה וכרטיס Wi-Fi שמחובר עכשיו לרשת שברשימה – והשירות מעדכן אותו בכל שינוי ברשת (NetUserHeal)
+  public static bool NetUser(Config c) => ScopeHive(c) != "HKLM" && SidOk(c.OwnerSid);
 
   const string NetUserGroup = "DeviceGuardNetUser";
   const string NetUserRule = "DeviceGuard Block User Outbound";
@@ -1325,8 +1325,77 @@ public static class Enforcer
   public static bool SidOk(string? sid) =>
     sid != null && sid.Length < 200 && sid.StartsWith("S-1-", StringComparison.Ordinal) && sid.Skip(4).All(ch => char.IsAsciiDigit(ch) || ch == '-');
 
-  static string NetUserCmd(string sid) =>
-    $"New-NetFirewallRule -DisplayName '{NetUserRule}' -Group '{NetUserGroup}' -Direction Outbound -Action Block -LocalUser 'D:(A;;CC;;;{sid})' -Profile Any | Out-Null";
+  // מה שהוחל: netuser|SID[|רשימה לבנה – Base64 של JSON]. בלי רשימה – חסימה בכל המתאמים
+  static string NetUserEntry(string sid, List<string> white) =>
+    "netuser|" + sid + (white.Count > 0 ? "|" + Convert.ToBase64String(Encoding.UTF8.GetBytes(System.Text.Json.JsonSerializer.Serialize(white))) : "");
+
+  static (string Sid, List<string> White)? NetUserApplied(Config c)
+  {
+    string? e;
+    lock (c.Applied)
+      e = c.Applied.FirstOrDefault(x => x.StartsWith("netuser|"));
+    if (e == null)
+      return null;
+    var q = e.Split('|');
+    if (q.Length < 2 || !SidOk(q[1]))
+      return null;
+    var w = new List<string>();
+    if (q.Length > 2 && q[2].Length > 0)
+      try
+      {
+        w = System.Text.Json.JsonSerializer.Deserialize<List<string>>(Encoding.UTF8.GetString(Convert.FromBase64String(q[2]))) ?? new List<string>();
+      }
+      catch (Exception __e)
+      {
+        Diag.Log(__e);
+      }
+    return (q[1], w);
+  }
+
+  // המתאמים שמותרים עכשיו לחשבון: מתאם מהרשימה הלבנה, וכרטיס Wi-Fi שמחובר כרגע לרשת מהרשימה הלבנה (לפי שם הרשת או שם הפרופיל)
+  public static List<string> NetUserAllowed(List<string> white)
+  {
+    var res = white.Where(w => !w.StartsWith("ssid:")).ToList();
+    var ssids = white.Where(w => w.StartsWith("ssid:")).Select(w => w[5..]).ToHashSet(StringComparer.Ordinal);
+    if (ssids.Count == 0)
+      return res;
+    var conn = Wlan.Connected();
+    if (conn.Count == 0)
+      return res;
+    try
+    {
+      foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+        if (Guid.TryParse(ni.Id, out var g) && conn.TryGetValue(g, out var cn) && (ssids.Contains(cn.Ssid) || ssids.Contains(cn.Profile)))
+          res.Add(ni.Name);
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
+    }
+    return res;
+  }
+
+  // פקודות PowerShell שבונות מחדש את כלל החסימה. השורה האחרונה בפלט: "#all" (כל המתאמים) או "#מספר" (כמה מתאמים נחסמו)
+  static List<string> NetUserCmds(string sid, List<string> white)
+  {
+    var l = new List<string> { $"Remove-NetFirewallRule -Group '{NetUserGroup}' -ErrorAction SilentlyContinue" };
+    var nr = $"New-NetFirewallRule -DisplayName '{NetUserRule}' -Group '{NetUserGroup}' -Direction Outbound -Action Block -LocalUser 'D:(A;;CC;;;{sid})' -Profile Any";
+    if (white.Count == 0)
+    {
+      l.Add(nr + " | Out-Null");
+      l.Add("'#all'");
+      return l;
+    }
+    var allow = NetUserAllowed(white);
+    l.Add("$dgAllow = @(" + string.Join(",", allow.Select(a => "'" + Q(a) + "'")) + ")");
+    // כל המתאמים (גם מוסתרים, למשל חיבור VPN) חוץ מהמותרים. אם Windows דוחה את הרשימה – רק המתאמים הגלויים, ואם גם זה נכשל – חסימה בכל המתאמים
+    l.Add("function dgIfs($h) { @(Get-NetAdapter -IncludeHidden:$h -ErrorAction SilentlyContinue | ? { $dgAllow -notcontains $_.Name } | % { [System.Management.Automation.WildcardPattern]::Escape($_.Name) }) }");
+    l.Add("$dgN = '#0'");
+    l.Add("foreach ($h in @($true, $false)) { $i = dgIfs $h; if ($i.Count -eq 0) { $dgN = '#0'; break }; try { " + nr + " -InterfaceAlias $i -ErrorAction Stop | Out-Null; $dgN = '#' + $i.Count; break } catch { $dgN = '#fail' } }");
+    l.Add("if ($dgN -eq '#fail') { " + nr + " | Out-Null; $dgN = '#all' }");
+    l.Add("$dgN");
+    return l;
+  }
 
   // סיכום קצר של מה שעומד להיות מוחל (לחלון האישור)
   public static string Describe(Config c)
@@ -1453,9 +1522,9 @@ public static class Enforcer
     // חסימת רשת לחשבון אחד: כלל חסימה יוצא בחומת האש, שחל רק על התעבורה של החשבון שנבחר. שאר החשבונות (גם המנהל) לא מושפעים
     if (netUser)
     {
-      AddA(c, "netuser|" + c.OwnerSid);
-      fwCmds.Add($"Remove-NetFirewallRule -Group '{NetUserGroup}' -ErrorAction SilentlyContinue");
-      fwCmds.Add(NetUserCmd(c.OwnerSid!));
+      var nw = c.Net.White.ToList();
+      AddA(c, NetUserEntry(c.OwnerSid!, nw));
+      fwCmds.AddRange(NetUserCmds(c.OwnerSid!, nw));
     }
     // חסימת חיבור לרשת לפי תוכנה (חומת האש של Windows)
     if (c.NetApps.On)
@@ -4868,32 +4937,27 @@ public static class Enforcer
     }
   }
 
-  // ---- חסימת הרשת של חשבון אחד: שחזור כלל חומת האש שנמחק / הושבת / שונה, או חומת אש שכובתה ----
+  // ---- חסימת הרשת של חשבון אחד: עדכון הכלל בכל שינוי ברשת (רשימה לבנה), ושחזור כלל שנמחק / שונה או חומת אש שכובתה ----
   static DateTime nuBackoff = DateTime.MinValue;
   static int nuBusy;
+  static string? nuSig, // מצב הרשת שלפיו נבנה הכלל (מתאמים קיימים ומה מותר)
+    nuSnap; // הכלל כפי שנשמר ברישום אחרי הבנייה – כל שינוי בו (מחיקה, השבתה, שינוי מתאמים/משתמש) מזוהה
+  static object? nuCfg; // ההגדרות שבזמנן נבנה הכלל: אחרי החלה (הגדרות חדשות) – בנייה מחדש בלי התראה
 
-  static bool NetUserOk(string sid)
+  static string NetUserSnap()
   {
+    var l = new List<string>();
     using (var k = Registry.LocalMachine.OpenSubKey(FWPOL + "FirewallRules"))
-    {
-      bool found = false;
       if (k != null)
         foreach (var n in k.GetValueNames())
-          if (
-            k.GetValue(n) is string v
-            && string.Equals(FwField(v, "EmbedCtxt"), NetUserGroup, StringComparison.OrdinalIgnoreCase)
-            && string.Equals(FwField(v, "Active"), "TRUE", StringComparison.OrdinalIgnoreCase)
-            && string.Equals(FwField(v, "Action"), "Block", StringComparison.OrdinalIgnoreCase)
-            && string.Equals(FwField(v, "Dir"), "Out", StringComparison.OrdinalIgnoreCase)
-            && v.Contains(sid, StringComparison.OrdinalIgnoreCase)
-          )
-          {
-            found = true;
-            break;
-          }
-      if (!found)
-        return false;
-    }
+          if (k.GetValue(n) is string v && string.Equals(FwField(v, "EmbedCtxt"), NetUserGroup, StringComparison.OrdinalIgnoreCase))
+            l.Add(n + "=" + v);
+    l.Sort(StringComparer.Ordinal);
+    return string.Join("\n", l);
+  }
+
+  static bool FwProfilesOn()
+  {
     foreach (var pf in new[] { "DomainProfile", "StandardProfile", "PublicProfile" })
     {
       using var pk = Registry.LocalMachine.OpenSubKey(FWPOL + pf);
@@ -4903,36 +4967,63 @@ public static class Enforcer
     return true;
   }
 
-  // נקרא מהשירות (עם בדיקת חומת האש): רק אחרי שחסימת הרשת של החשבון הוחלה בפועל (רשומת netuser)
+  static string NetUserSig(string sid, List<string> white)
+  {
+    if (white.Count == 0)
+      return sid + "|all";
+    var names = new List<string>();
+    try
+    {
+      names = NetworkInterface.GetAllNetworkInterfaces().Select(n => n.Name + "/" + n.Id).ToList();
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
+    }
+    names.Sort(StringComparer.Ordinal);
+    var allow = NetUserAllowed(white);
+    allow.Sort(StringComparer.OrdinalIgnoreCase);
+    return sid + "|" + string.Join("\n", allow) + "#" + string.Join("\n", names);
+  }
+
+  // נקרא מהשירות כל כמה שניות ומיד בשינוי ברשת: רק אחרי שחסימת הרשת של החשבון הוחלה בפועל (רשומת netuser)
   public static void NetUserHeal(Config c)
   {
     if (!c.Master || !c.Net.On || DateTime.UtcNow < nuBackoff || Applying())
       return;
-    string? sid;
-    lock (c.Applied)
-      sid = c.Applied.FirstOrDefault(x => x.StartsWith("netuser|"))?[8..];
-    if (!SidOk(sid))
+    var ap = NetUserApplied(c);
+    if (ap == null)
       return;
+    var (sid, white) = ap.Value;
     if (Interlocked.Exchange(ref nuBusy, 1) == 1)
       return;
     try
     {
-      if (NetUserOk(sid!))
+      var sig = NetUserSig(sid, white);
+      bool on = FwProfilesOn();
+      var snap = NetUserSnap();
+      if (on && sig == nuSig && snap == nuSnap && ReferenceEquals(c, nuCfg))
         return;
-      Alerts.Log("חסימת הרשת של החשבון שנבחר הוסרה או שונתה בחומת האש – משחזר");
-      PSAll(
-        new List<string>
-        {
-          "Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True",
-          $"Remove-NetFirewallRule -Group '{NetUserGroup}' -ErrorAction SilentlyContinue",
-          NetUserCmd(sid!),
-        }
-      );
-      if (!NetUserOk(sid!))
+      // אותן הגדרות ואותו מצב רשת, אבל הכלל או חומת האש השתנו מבחוץ
+      if (ReferenceEquals(c, nuCfg) && sig == nuSig && nuSnap != null)
+        Alerts.Log("חסימת הרשת של החשבון שנבחר הוסרה או שונתה בחומת האש – משחזר");
+      var cmds = new List<string> { "Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True" };
+      cmds.AddRange(NetUserCmds(sid, white));
+      var res = Lines(PS(string.Join("\n", cmds))).LastOrDefault(l => l.StartsWith('#'));
+      nuSig = sig;
+      nuCfg = c;
+      nuSnap = NetUserSnap();
+      bool want = res != "#0"; // "#0" = כל המתאמים מותרים כרגע, ואין כלל
+      if (!FwProfilesOn() || res == null || (want && nuSnap.Length == 0))
+      {
+        nuSnap = null;
         nuBackoff = DateTime.UtcNow.AddMinutes(10); // לא הצליח: לא מנסים (ולא מתריעים) שוב כל כמה שניות
+        Alerts.Log("לא ניתן היה להחיל את חסימת הרשת של החשבון שנבחר בחומת האש (ניסיון נוסף בעוד 10 דקות)");
+      }
     }
-    catch
+    catch (Exception __e)
     {
+      Diag.Log(__e);
       nuBackoff = DateTime.UtcNow.AddMinutes(10);
     }
     finally
@@ -6987,5 +7078,81 @@ public static class Enforcer
       c.Applied.Clear();
     if (!soft)
       c.State = 0;
+  }
+}
+
+// ---------- Wi-Fi: לאיזו רשת מחובר כל כרטיס כרגע (WLAN API – בלי פלט מתורגם של netsh) ----------
+static class Wlan
+{
+  [DllImport("wlanapi.dll")]
+  static extern uint WlanOpenHandle(uint ver, IntPtr res, out uint neg, out IntPtr h);
+
+  [DllImport("wlanapi.dll")]
+  static extern uint WlanCloseHandle(IntPtr h, IntPtr res);
+
+  [DllImport("wlanapi.dll")]
+  static extern uint WlanEnumInterfaces(IntPtr h, IntPtr res, out IntPtr list);
+
+  [DllImport("wlanapi.dll")]
+  static extern uint WlanQueryInterface(IntPtr h, ref Guid g, int op, IntPtr res, out int size, out IntPtr data, IntPtr type);
+
+  [DllImport("wlanapi.dll")]
+  static extern void WlanFreeMemory(IntPtr p);
+
+  // מזהה הכרטיס -> שם הרשת (SSID) ושם הפרופיל. כרטיס שלא מחובר לא מופיע. אין Wi-Fi במחשב – רשימה ריקה
+  public static Dictionary<Guid, (string Ssid, string Profile)> Connected()
+  {
+    var res = new Dictionary<Guid, (string Ssid, string Profile)>();
+    var h = IntPtr.Zero;
+    try
+    {
+      if (WlanOpenHandle(2, IntPtr.Zero, out _, out h) != 0)
+        return res;
+      if (WlanEnumInterfaces(h, IntPtr.Zero, out var list) != 0)
+        return res;
+      try
+      {
+        // WLAN_INTERFACE_INFO_LIST: מספר (4), אינדקס (4), ואז פריטים של 532 בתים: GUID (16), תיאור (512), מצב (4)
+        int n = Marshal.ReadInt32(list, 0);
+        for (int i = 0; i < n && i < 64; i++)
+        {
+          var item = list + 8 + i * 532;
+          var g = Marshal.PtrToStructure<Guid>(item);
+          if (Marshal.ReadInt32(item, 528) != 1) // wlan_interface_state_connected
+            continue;
+          // wlan_intf_opcode_current_connection: מצב (4), סוג חיבור (4), שם הפרופיל (512), ואז אורך ה-SSID (4) והבתים שלו (32)
+          if (WlanQueryInterface(h, ref g, 7, IntPtr.Zero, out var size, out var data, IntPtr.Zero) != 0)
+            continue;
+          try
+          {
+            if (size < 556)
+              continue;
+            var profile = (Marshal.PtrToStringUni(data + 8, 256) ?? "").Split('\0')[0];
+            int len = Math.Clamp(Marshal.ReadInt32(data, 520), 0, 32);
+            var b = new byte[len];
+            Marshal.Copy(data + 524, b, 0, len);
+            res[g] = (Encoding.UTF8.GetString(b), profile);
+          }
+          finally
+          {
+            WlanFreeMemory(data);
+          }
+        }
+      }
+      finally
+      {
+        WlanFreeMemory(list);
+      }
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
+    }
+    finally
+    {
+      if (h != IntPtr.Zero)
+        WlanCloseHandle(h, IntPtr.Zero);
+    }
+    return res;
   }
 }

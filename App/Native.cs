@@ -172,6 +172,19 @@ static class Native
     }
   }
 
+  public static DateTime? StartTime(int pid)
+  {
+    try
+    {
+      using var p = Process.GetProcessById(pid);
+      return p.StartTime;
+    }
+    catch
+    {
+      return null;
+    }
+  }
+
   public static bool SameStart(int pid, DateTime start)
   {
     try
@@ -263,6 +276,57 @@ static class Native
 
   [DllImport("kernel32.dll", SetLastError = true)]
   static extern bool DeviceIoControl(nint h, uint code, byte[] inb, int inSize, byte[] outb, int outSize, out int ret, nint ov);
+
+  // ניתוק (dismount) של כונן לפני השבתת ההתקן שלו. כשהכונן פתוח (סייר הקבצים, AutoPlay, סריקת אנטי-וירוס) Windows דוחה את ההשבתה
+  // ("נדרשת הפעלה מחדש"), והכונן ממשיך לעבוד. הניתוק סוגר את הגישה הפתוחה אליו, ואז ההשבתה מצליחה. רק בשירות (SYSTEM).
+  // letter = אות הכונן בלבד (למשל 'E')
+  public static bool DismountVolume(char letter)
+  {
+    try
+    {
+      if (!char.IsAsciiLetter(letter))
+        return false;
+      // GENERIC_READ | GENERIC_WRITE, שיתוף קריאה+כתיבה, OPEN_EXISTING
+      var h = CreateFileW(@"\\.\" + letter + ":", 0xC0000000, 3, 0, 3, 0, 0);
+      if (h == 0 || h == -1)
+        return false;
+      try
+      {
+        DeviceIoControl(h, 0x00090018, Array.Empty<byte>(), 0, Array.Empty<byte>(), 0, out _, 0); // FSCTL_LOCK_VOLUME (נכשל כשיש קבצים פתוחים – לא חובה)
+        return DeviceIoControl(h, 0x00090020, Array.Empty<byte>(), 0, Array.Empty<byte>(), 0, out _, 0); // FSCTL_DISMOUNT_VOLUME
+      }
+      finally
+      {
+        CloseHandle(h);
+      }
+    }
+    catch
+    {
+      return false;
+    }
+  }
+
+  [DllImport("ntdll.dll")]
+  static extern int NtSuspendProcess(nint h);
+
+  [DllImport("ntdll.dll")]
+  static extern int NtResumeProcess(nint h);
+
+  // הקפאה / המשך של תהליך (PROCESS_SUSPEND_RESUME). משמש להקפאת אפליקציית ההגדרות עד שמוקש קוד
+  public static bool Suspend(int pid, bool on)
+  {
+    var h = OpenProcess(0x0800, false, pid);
+    if (h == 0)
+      return false;
+    try
+    {
+      return (on ? NtSuspendProcess(h) : NtResumeProcess(h)) == 0;
+    }
+    finally
+    {
+      CloseHandle(h);
+    }
+  }
 
   // האם הכונן מחובר דרך USB (או כרטיס SD/MMC). דיסק USB חיצוני מסווג ב-Windows כ"קבוע" (Fixed), ולכן אי אפשר לסמוך על DriveType.
   // root = "E:\". בכל ספק מחזיר false

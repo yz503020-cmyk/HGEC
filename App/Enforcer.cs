@@ -1493,11 +1493,17 @@ public static class Enforcer
     return res;
   }
 
+  // על מי הכלל חל. Windows בודק את התנאי מול ההרשאות של התהליך שפותח את החיבור, ותהליך בארגז חול (AppContainer) נבדק פעמיים:
+  // לפי החשבון, וגם לפי זהות הארגז. עם החשבון בלבד הכלל לא חל על תהליכים כאלה – ובהם תהליך הרשת של Chrome / Edge ואפליקציות מהחנות,
+  // ולכן הדפדפן המשיך לגלוש. "כל האפליקציות" (S-1-15-2-1) ו"כל האפליקציות המוגבלות" (S-1-15-2-2) מוסיפים את הארגזים – רק של אותו חשבון,
+  // כי הבדיקה לפי החשבון נשארת חובה (תהליך של חשבון אחר לא עובר אותה)
+  public static string NetUserSddl(string sid) => $"D:(A;;CC;;;{sid})(A;;CC;;;S-1-15-2-1)(A;;CC;;;S-1-15-2-2)";
+
   // פקודות PowerShell שבונות מחדש את כלל החסימה. השורה האחרונה בפלט: "#all" (כל המתאמים) או "#מספר" (כמה מתאמים נחסמו)
   static List<string> NetUserCmds(string sid, List<string> white)
   {
     var l = new List<string> { $"Remove-NetFirewallRule -Group '{NetUserGroup}' -ErrorAction SilentlyContinue" };
-    var nr = $"New-NetFirewallRule -DisplayName '{NetUserRule}' -Group '{NetUserGroup}' -Direction Outbound -Action Block -LocalUser 'D:(A;;CC;;;{sid})' -Profile Any";
+    var nr = $"New-NetFirewallRule -DisplayName '{NetUserRule}' -Group '{NetUserGroup}' -Direction Outbound -Action Block -LocalUser '{NetUserSddl(sid)}' -Profile Any";
     if (white.Count == 0)
     {
       l.Add(nr + " | Out-Null");
@@ -1803,8 +1809,10 @@ public static class Enforcer
     {
       if (s.Mode == Mode.Code)
       {
+        // אפליקציית ההגדרות החדשה (SystemSettings) לא נחסמת ב-IFEO: Windows מפעיל אותה כאפליקציה מותקנת (Store), ושער שמופעל במקומה
+        // משבש את ההפעלה – לפעמים נפתח חלון הגדרות ריק שלא נטען במקום חלון הקוד. במקום זה השירות מקפיא אותה ברגע שהיא עולה,
+        // מבקש קוד, וממשיך אותה רק אחרי קוד נכון (אחרת היא נסגרת). ראו Watcher.HandleProc
         Ifeo(c, "control.exe", s);
-        Ifeo(c, "SystemSettings.exe", s);
       }
       else
       {
@@ -5651,11 +5659,13 @@ public static class Enforcer
   static string NetHealPnpFile => System.IO.Path.Combine(Config.Dir, "var", "netheal.pnp"); // מזהה|שם
   static readonly ConcurrentDictionary<string, DateTime> adBackoff = new(StringComparer.OrdinalIgnoreCase);
 
+  // קודם ההיתרים ורק אחריהם "חסום הכול": כש"חסום הכול" נוסף לפני ההיתר, Windows מנתק מיד גם את הרשת המותרת שמחוברים אליה
   static List<string> WlanArgs(List<string> ssidWhite)
   {
-    var l = new List<string> { "wlan add filter permission=denyall networktype=infrastructure" };
+    var l = new List<string>();
     foreach (var ssid in ssidWhite)
       l.Add($"wlan add filter permission=allow ssid=\"{ssid.Replace("\"", "")}\" networktype=infrastructure");
+    l.Add("wlan add filter permission=denyall networktype=infrastructure");
     return l;
   }
 
@@ -5690,11 +5700,20 @@ public static class Enforcer
         .Where(n => n.NetworkInterfaceType == NetworkInterfaceType.Wireless80211 && wlanSeen.TryAdd(n.Id, 0))
         .ToList();
       if (wifiNew.Count > 0 && applied.Contains("wlanfilter|denyall"))
-        foreach (var a in WlanArgs(applied.Where(x => x.StartsWith("wlanfilter|allow|")).Select(x => x[17..]).ToList()))
+      {
+        // קודם מוחקים, כדי שלא ייווצר מסנן כפול (ביטול מוחק עותק אחד בלבד). הסדר חשוב: "חסום הכול" נמחק ראשון ונוסף אחרון.
+        // קודם (מחיקה והוספה של כל מסנן בתורו) היה רגע שבו "חסום הכול" כבר קיים וההיתר של הרשת המותרת עוד לא – ו-Windows ניתק
+        // את ה-Wi-Fi המותר כל 2 דקות
+        var args = WlanArgs(applied.Where(x => x.StartsWith("wlanfilter|allow|")).Select(x => x[17..]).ToList());
+        var deny = args[^1];
+        Netsh(deny.Replace("wlan add filter", "wlan delete filter"));
+        foreach (var a in args.Take(args.Count - 1))
         {
-          Netsh(a.Replace("wlan add filter", "wlan delete filter")); // קודם מוחקים, כדי שלא ייווצר מסנן כפול (ביטול מוחק עותק אחד בלבד)
+          Netsh(a.Replace("wlan add filter", "wlan delete filter"));
           Netsh(a);
         }
+        Netsh(deny);
+      }
     }
     catch (Exception __e)
     {
@@ -5928,10 +5947,8 @@ public static class Enforcer
         .ToList();
       if (bad.Count == 0)
         return;
-      PSAll(bad.Select(id => $"Disable-PnpDevice -InstanceId '{Q(id)}' -Confirm:$false").ToList());
-      foreach (var id in bad)
-        if (Native.DevState(id) == 0)
-          usbBackoff[id] = now.AddMinutes(10); // לא הצליח: לא מנסים שוב כל כמה שניות
+      foreach (var id in DisableUsbDisks(bad))
+        usbBackoff[id] = now.AddMinutes(1); // לא הצליח (למשל כונן שפתוח כרגע): לא מנסים שוב כל כמה שניות, אבל גם לא מחכים 10 דקות שבהן הכונן פתוח
       Alerts.Log("התקן USB חסום הופעל מחדש – הושבת שוב: " + string.Join(", ", bad));
     }
     catch (Exception __e)
@@ -5963,29 +5980,55 @@ public static class Enforcer
       return c.Applied.Contains("usbapplied") || c.Applied.Any(x => x.StartsWith("reg|") && x.Contains(@"DeviceInstall\Restrictions|DenyRemovableDevices|"));
   }
 
+  static volatile bool usbHealAgain; // התקן נוסף חובר בזמן שהבדיקה רצה: בודקים שוב בסופה
+
   public static void UsbDiskHeal(Config c)
   {
     if (!c.Master || !c.Usb.On || !UsbApplied(c) || Applying())
       return;
     if (Interlocked.Exchange(ref usbHealBusy, 1) == 1)
+    {
+      usbHealAgain = true;
       return;
+    }
     try
     {
-      var bad = new List<string>();
-      foreach (var l in Lines(PS(UsbQuery)))
+      for (int round = 0; round < 3; round++)
       {
-        var q = l.Split('|', 3);
-        if (q.Length < 2 || c.Usb.White.Contains(q[0]) || c.Usb.White.Contains(q[1]))
-          continue;
-        bad.Add(q[0]);
+        usbHealAgain = false;
+        var bad = new List<string>();
+        foreach (var l in Lines(PS(UsbQuery)))
+        {
+          var q = l.Split('|', 3);
+          if (q.Length < 2 || c.Usb.White.Contains(q[0]) || c.Usb.White.Contains(q[1]))
+            continue;
+          if (Native.DevState(q[0]) == 1)
+            continue; // כבר מושבת
+          bad.Add(q[0]);
+        }
+        if (bad.Count > 0)
+        {
+          // נרשם לפני ההשבתה: גם אם השירות נעצר באמצע, הביטול יחזיר אותם לפעול
+          Directory.CreateDirectory(System.IO.Path.GetDirectoryName(UsbHealFile)!);
+          var known = File.Exists(UsbHealFile) ? File.ReadAllLines(UsbHealFile).ToHashSet(StringComparer.OrdinalIgnoreCase) : new HashSet<string>();
+          var add = bad.Where(b => !known.Contains(b)).ToList();
+          if (add.Count > 0)
+            File.AppendAllLines(UsbHealFile, add);
+          var left = DisableUsbDisks(bad);
+          if (left.Count > 0)
+          { // עוד לא הושבת (למשל אנטי-וירוס או AutoPlay שפתחו את הכונן ברגע שחובר): ניסיון נוסף אחרי רגע
+            Thread.Sleep(3000);
+            left = DisableUsbDisks(left);
+          }
+          var done = bad.Except(left).ToList();
+          if (done.Count > 0)
+            Alerts.Log("התקן אחסון USB שחובר נחסם: " + string.Join(", ", done));
+          if (left.Count > 0)
+            Alerts.Log("לא ניתן היה להשבית כונן USB שחובר – ניסיון נוסף בעוד דקה: " + string.Join(", ", left));
+        }
+        if (!usbHealAgain)
+          break;
       }
-      if (bad.Count == 0)
-        return;
-      // נרשם לפני ההשבתה: גם אם השירות נעצר באמצע, הביטול יחזיר אותם לפעול
-      Directory.CreateDirectory(System.IO.Path.GetDirectoryName(UsbHealFile)!);
-      File.AppendAllLines(UsbHealFile, bad);
-      PSAll(bad.Select(id => $"Disable-PnpDevice -InstanceId '{Q(id)}' -Confirm:$false").ToList());
-      Alerts.Log("התקן אחסון USB שחובר נחסם: " + string.Join(", ", bad));
     }
     catch (Exception __e)
     {
@@ -5994,6 +6037,53 @@ public static class Enforcer
     finally
     {
       Interlocked.Exchange(ref usbHealBusy, 0);
+    }
+  }
+
+  // משבית כונני USB לפי מזהה ההתקן, ומחזיר את אלה שעדיין לא הושבתו.
+  // כונן שפתוח (סייר הקבצים / AutoPlay / סריקת אנטי-וירוס – מה שקורה כמעט תמיד מיד אחרי שמחברים אותו) גורם ל-Windows לדחות את ההשבתה
+  // ("נדרשת הפעלה מחדש"), והכונן המשיך לעבוד. לכן קודם מנתקים (dismount) את הכוננים שלו, ורק אז משביתים.
+  // רק כוננים של ההתקנים האלה – לפי הנתיב הפנימי של הדיסק (כמו הזיהוי של דיסק המערכת ב-UsbQuery), ולעולם לא כונן המערכת
+  static List<string> DisableUsbDisks(List<string> ids)
+  {
+    if (ids.Count == 0)
+      return ids;
+    try
+    {
+      var keys = ids.Select(i => "'" + Q(i.Replace('\\', '#').ToUpperInvariant()) + "'");
+      var o = PS(
+        "$ids = @(" + string.Join(",", keys) + ")\n"
+          + "Get-Disk -ErrorAction SilentlyContinue | % { $p = ([string]$_.Path).ToUpperInvariant(); $n = $_.Number; "
+          + "foreach ($i in $ids) { if ($p.Contains($i)) { Get-Partition -DiskNumber $n -ErrorAction SilentlyContinue | "
+          + "? { [int][char]$_.DriveLetter -ne 0 } | % { 'L|' + $_.DriveLetter } } } }"
+      );
+      var sys = char.ToUpperInvariant((Environment.GetEnvironmentVariable("SystemDrive") ?? "C:")[0]);
+      var letters = Lines(o).Where(x => x.Length == 3 && x.StartsWith("L|")).Select(x => char.ToUpperInvariant(x[2])).Distinct().ToList();
+      foreach (var dl in letters)
+        if (dl != sys)
+          Native.DismountVolume(dl);
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
+    }
+    PSAll(ids.Select(id => $"Disable-PnpDevice -InstanceId '{Q(id)}' -Confirm:$false").ToList());
+    return ids.Where(id => Native.DevState(id) == 0).ToList();
+  }
+
+  // הדיסקים שמחוברים כרגע (לפי מנהל ההתקן של הדיסקים). משתנה ברגע שמחברים כונן – גם לפני שיש לו אות, וגם כשאין לו בכלל
+  public static string DiskSig()
+  {
+    try
+    {
+      using var k = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\disk\Enum");
+      if (k == null)
+        return "";
+      return string.Join("\n", k.GetValueNames().Where(n => n != "Count" && n != "NextInstance").Select(n => n + "=" + k.GetValue(n)));
+    }
+    catch
+    {
+      return "";
     }
   }
 

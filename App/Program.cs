@@ -635,6 +635,49 @@ public static class Program
       {
         return;
       }
+      // אפליקציית ההגדרות של Windows (חסימת הגדרות בקוד): לא נחסמת ב-IFEO (ראו Enforcer.ApplyCore), ולכן מוקפאת מיד כשהיא עולה –
+      // החלון שלה לא מגיב ואי אפשר לשנות בו כלום – וחלון הקוד נפתח מיד. קוד נכון: ממשיכה לפעול. אחרת: נסגרת.
+      // הפעלה דרך השער (IFEO ישן מגרסה קודמת, עד ההחלה הבאה) – במסלול הרגיל: האישור מגיע מהשער תוך רגע
+      if (
+        rid == c.Settings.Id
+        && n.Equals("SystemSettings", StringComparison.OrdinalIgnoreCase)
+        && !(ppid > 0 && FromGate(ppid))
+        && OwnerApplies(c, pid)
+        && Native.StartTime(pid) is DateTime start
+      )
+      {
+        bool frozen = Native.Suspend(pid, true);
+        try
+        {
+          UserSession.Launch(Enforcer.GateExe, $"--promptkill {rid} {pid}", sess);
+        }
+        catch (Exception __e)
+        {
+          Diag.Log(__e);
+        }
+        Task.Run(async () =>
+        {
+          // חלון הקוד נותן 15 שניות; מחכים קצת יותר (הקשת הקוד ואישורו)
+          for (int i = 0; i < 125; i++)
+          {
+            await Task.Delay(200);
+            if (!Native.SameStart(pid, start))
+              return; // התהליך נסגר (ומספר התהליך עבר לתהליך אחר)
+            if (IsAuth(pid, rid))
+            {
+              if (frozen)
+                Native.Suspend(pid, false);
+              return;
+            }
+          }
+          if (!IsAuth(pid, rid) && Native.SameStart(pid, start))
+          {
+            KillPid(pid);
+            Alerts.Log("אפליקציית ההגדרות נסגרה (לא הוקש קוד)", false);
+          }
+        });
+        return;
+      }
       // ממתינים רגע: אם התוכנה הופעלה דרך השער, הקוד כבר הוקש והאישור מגיע בעוד מילישניות
       Task.Run(async () =>
       {
@@ -744,8 +787,14 @@ public static class Program
       var ifeoDone = new HashSet<string>(Enforcer.IfeoList(c).Select(x => x.Exe + "|" + x.Id), StringComparer.OrdinalIgnoreCase);
       foreach (var r in c.Programs.Where(r => r.On && ifeoDone.Contains(System.IO.Path.GetFileName(r.Path) + "|" + r.Id)))
         Names(r, Enforcer.AppliedMode(c, r) == Mode.Full); // סוג החסימה שהוחל (מעבר גמורה/קוד – רק ב"החל שינויים")
-      if (c.Settings.On && Enforcer.AppliedMode(c, c.Settings) == Mode.Code && ifeoDone.Contains("SystemSettings.exe|" + c.Settings.Id))
-        ck["SystemSettings"] = c.Settings.Id; // רשת ביטחון: אפליקציית ההגדרות של Windows לא תמיד נתפסת ב-IFEO
+      // אפליקציית ההגדרות של Windows נחסמת בקוד דרך השירות (הקפאה ובקשת קוד – ראו HandleProc), ולא ב-IFEO. ההחלה מסומנת לפי ה-IFEO של
+      // לוח הבקרה, שנרשם באותה החלה עם אותו חוק (החלה מגרסה קודמת רשמה גם IFEO ל-SystemSettings.exe – גם הוא מתקבל)
+      if (
+        c.Settings.On
+        && Enforcer.AppliedMode(c, c.Settings) == Mode.Code
+        && (ifeoDone.Contains("control.exe|" + c.Settings.Id) || ifeoDone.Contains("SystemSettings.exe|" + c.Settings.Id))
+      )
+        ck["SystemSettings"] = c.Settings.Id;
       // כל מה שנחסם ב-IFEO (כלי אתחול, וירטואליזציה, התקנת MSI, לוח הבקרה...) נסגר גם אם הופעל בכל זאת – למשל מנהל שמחק את החסימה
       // מהרישום והפעיל את הכלי באותו רגע, לפני שהשירות שחזר אותה. תהליכים של Windows עצמו (SYSTEM) ושל השירות לא נסגרים (HandleProc)
       foreach (var (exe, id) in Enforcer.IfeoList(c))
@@ -1408,6 +1457,7 @@ public static class Program
       .Select(x => x.RootDirectory.FullName)
       .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
+    string? diskSig = null; // הדיסקים שמחוברים (Enforcer.DiskSig): כונן USB שחובר מזוהה גם בלי אות כונן
     var stamp = DateTime.MinValue;
     var loadedAt = DateTime.MinValue; // מתי נטען שינוי ההגדרות האחרון (זמן מונוטוני – לא לפי שעון המחשב, שמנהל יכול להזיז)
     var c = new Config();
@@ -1506,11 +1556,17 @@ public static class Program
             var newOther = ready.Where(r => !otherSeen.Contains(r)).ToList();
             foreach (var r in newOther)
               otherSeen.Add(r);
+            // כונן USB חדש: לפי אות כונן חדשה, וגם לפי שינוי ברשימת הדיסקים (מהיר יותר, ותופס גם כונן בלי אות / שעוד לא "מוכן").
+            // בבדיקה הראשונה (הפעלת השירות) – גם כונן שחובר כשהמחשב היה כבוי
+            var ds = Enforcer.DiskSig();
+            bool diskChanged = ds != diskSig;
+            diskSig = ds;
             if (newOther.Count > 0)
-            {
               Enforcer.ResetDriveCache();
-              if (blockingNow && c.Usb.On)
-                _ = Task.Run(() => Enforcer.UsbDiskHeal(c));
+            if ((newOther.Count > 0 || diskChanged) && blockingNow && c.Usb.On)
+            {
+              var cu = c;
+              _ = Task.Run(() => Enforcer.UsbDiskHeal(cu));
             }
             var present = Drives().ToHashSet(StringComparer.OrdinalIgnoreCase);
             foreach (var r in newOther.Where(nr => !present.Contains(nr)))

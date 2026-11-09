@@ -53,7 +53,9 @@ public static class Diag
           return; // לא יוצרים את התיקייה: ההרשאות שלה נקבעות רק בהתקנה/בשירות
         try
         {
-          if (new FileInfo(p).Length > MaxBytes)
+          if ((File.GetAttributes(p) & FileAttributes.ReparsePoint) != 0)
+            File.Delete(p); // קיצור (symlink) במקום היומן: לא כותבים דרכו לקובץ אחר
+          else if (new FileInfo(p).Length > MaxBytes)
             File.Move(p, p + ".1", true);
         }
         catch (FileNotFoundException) { }

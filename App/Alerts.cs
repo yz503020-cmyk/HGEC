@@ -48,11 +48,12 @@ static class Alerts
       {
         var f = LogPath;
         Directory.CreateDirectory(System.IO.Path.GetDirectoryName(f)!);
-        if (File.Exists(f) && new FileInfo(f).Length > 512 * 1024)
-        {
-          File.Copy(f, f + ".old", true);
+        // קיצור (symlink) במקום היומן: השירות (SYSTEM) היה כותב דרכו לקובץ אחר. מוחקים את הקיצור עצמו, ונוצר יומן רגיל
+        if (File.Exists(f) && (File.GetAttributes(f) & FileAttributes.ReparsePoint) != 0)
           File.Delete(f);
-        }
+        // החלפת שם (ולא העתקה): העתקה הייתה כותבת דרך קיצור בשם events.log.old לקובץ שהוא מפנה אליו
+        if (File.Exists(f) && new FileInfo(f).Length > 512 * 1024)
+          File.Move(f, f + ".old", true);
         File.AppendAllText(f, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss}  {msg}\n", Encoding.UTF8);
       }
     }

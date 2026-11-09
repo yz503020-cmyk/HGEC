@@ -1032,6 +1032,8 @@ public partial class MainWin
     on.Click += (s, e) =>
     {
       C.Sched.On = on.IsChecked == true;
+      if (C.Sched.On)
+        C.SchedArmed = false; // התזמון ייכנס לתוקף רק ב"החל שינויים" (עד אז השירות לא מחיל ולא משחרר לפיו)
       if (C.Sched.On && string.IsNullOrEmpty(C.Sched.TzId))
         C.Sched.TzId = Schedule.Local();
       C.Save();

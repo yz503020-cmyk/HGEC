@@ -855,6 +855,13 @@ public partial class MainWin
         );
         return;
       }
+      if (Enforcer.IsOwnPath(p))
+      {
+        Say(
+          $"זו תיקייה של {Config.AppName} עצמה (תיקיית ההגדרות, או התיקייה שממנה התוכנה נפתחה – למשל 'הורדות'), או קובץ התוכנה. חסימתה הייתה מונעת את פתיחת התוכנה, ולכן לא ניתן לחסום אותה.\n\nאפשר להעביר את DeviceGuard.exe לתיקייה אחרת, או לפתוח את התוכנה מהקיצור \"{Config.AppName}\", ואז לחסום."
+        );
+        return;
+      }
       if (C.Paths.Any(x => x.Path.Equals(p, StringComparison.OrdinalIgnoreCase)))
         return;
       C.Paths.Add(new Rule { Name = p, Path = p });

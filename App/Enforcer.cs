@@ -53,6 +53,11 @@ public static class Enforcer
     }
   }
   const string ADV = @"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced";
+  // זמן מונוטוני: מתקדם רק קדימה ולא מושפע משינוי שעון המחשב. משמש למרווחים ולהשהיות בזיכרון (בדיקות כל כמה שניות, נעילות זמניות, טוקנים).
+  // קודם המרווחים נמדדו לפי שעון המחשב – ומנהל שהזיז את השעון אחורה "הקפיא" את השחזורים ואת תחילת חלון הזמנים עד הפעלה מחדש
+  static readonly long monoBase = DateTime.UtcNow.Ticks - Environment.TickCount64 * TimeSpan.TicksPerMillisecond;
+  public static DateTime Mono => new(monoBase + Environment.TickCount64 * TimeSpan.TicksPerMillisecond, DateTimeKind.Utc);
+
   public static int Blocked,
     Failed;
   public static string? LastErr; // תוצאת החסימה האחרונה (לחיווי בחלון)
@@ -1028,12 +1033,12 @@ public static class Enforcer
   static int localApplying;
   static long uiApplyUntil; // ticks (UTC)
 
-  public static void UiApplying(bool on) => Interlocked.Exchange(ref uiApplyUntil, on ? DateTime.UtcNow.AddMinutes(5).Ticks : 0);
+  public static void UiApplying(bool on) => Interlocked.Exchange(ref uiApplyUntil, on ? Mono.AddMinutes(5).Ticks : 0);
 
   public static bool Applying()
   {
     if (InService)
-      return Volatile.Read(ref localApplying) > 0 || DateTime.UtcNow.Ticks < Interlocked.Read(ref uiApplyUntil);
+      return Volatile.Read(ref localApplying) > 0 || Mono.Ticks < Interlocked.Read(ref uiApplyUntil);
     try
     {
       var f = ApplyFlag;
@@ -1074,7 +1079,7 @@ public static class Enforcer
   {
     if (applyLockDepth++ > 0)
       return new ApplyLockRel(null);
-    var start = DateTime.UtcNow;
+    var start = Mono;
     var until = start.AddMinutes(10);
     while (true)
     {
@@ -1083,11 +1088,11 @@ public static class Enforcer
         Directory.CreateDirectory(System.IO.Path.GetDirectoryName(ApplyLockFile)!);
         return new ApplyLockRel(new FileStream(ApplyLockFile, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None));
       }
-      catch (IOException) when (DateTime.UtcNow < until)
+      catch (IOException) when (Mono < until)
       {
         // בשירות: מי שמחזיק את הנעילה חייב להיות החלה אמיתית – של השירות, או של החלון (שמודיע עליה דרך ה-Pipe בקוד הכניסה).
         // אם אחרי 15 שניות אין החלה כזו, מישהו אחר מחזיק את הקובץ (מנהל שמנסה לעכב את תחילת החסימה): ממשיכים בלי לחכות
-        if (InService && (DateTime.UtcNow - start).TotalSeconds > 15 && !Applying())
+        if (InService && (Mono - start).TotalSeconds > 15 && !Applying())
         {
           Alerts.Log("קובץ הנעילה של ההחלה תפוס על ידי תהליך אחר – ממשיכים בלי לחכות", false);
           return new ApplyLockRel(null);
@@ -1346,6 +1351,16 @@ public static class Enforcer
       c.OwnerSid ?? "" // אחרון: מזהה חשבון לא מכיל "|"
     );
 
+  // סוג החסימה שהוחל לחוק (רשומת mode|). בלי רשומה – החלה מגרסה קודמת, או חוק שלא הוחל: לפי ההגדרות, כמו קודם
+  public static Mode AppliedMode(Config c, Rule r)
+  {
+    var pre = "mode|" + r.Id + "|";
+    string? e;
+    lock (c.Applied)
+      e = c.Applied.LastOrDefault(x => x.StartsWith(pre, StringComparison.Ordinal));
+    return e != null && int.TryParse(e[pre.Length..], out var m) && Enum.IsDefined(typeof(Mode), m) ? (Mode)m : r.Mode;
+  }
+
   public static Scope AppliedScope(Config c)
   {
     string? e;
@@ -1492,7 +1507,7 @@ public static class Enforcer
     var allow = NetUserAllowed(white);
     l.Add("$dgAllow = @(" + string.Join(",", allow.Select(a => "'" + Q(a) + "'")) + ")");
     // כל המתאמים (גם מוסתרים, למשל חיבור VPN) חוץ מהמותרים. אם Windows דוחה את הרשימה – רק המתאמים הגלויים, ואם גם זה נכשל – חסימה בכל המתאמים
-    l.Add("function dgIfs($h) { @(Get-NetAdapter -IncludeHidden:$h -ErrorAction SilentlyContinue | ? { $dgAllow -notcontains $_.Name } | % { [System.Management.Automation.WildcardPattern]::Escape($_.Name) }) }");
+    l.Add("function dgIfs($h) { @(Get-NetAdapter -IncludeHidden:$h -ErrorAction SilentlyContinue | ? { $dgAllow -notcontains $_.Name } | % { $_.Name -replace '([\\[\\]*?`])', '`$1' }) }");
     l.Add("$dgN = '#0'");
     l.Add("foreach ($h in @($true, $false)) { $i = dgIfs $h; if ($i.Count -eq 0) { $dgN = '#0'; break }; try { " + nr + " -InterfaceAlias $i -ErrorAction Stop | Out-Null; $dgN = '#' + $i.Count; break } catch { $dgN = '#fail' } }");
     l.Add("if ($dgN -eq '#fail') { " + nr + " | Out-Null; $dgN = '#all' }");
@@ -1872,9 +1887,17 @@ public static class Enforcer
         if (r.Mode == Mode.Code)
           MakeLnk(c, r);
       }
+      else
+      { // נתיב מערכת / תיקייה של התוכנה עצמה: לא נחסם – ומדווח (קודם דולג בשקט, והמשתמש חשב שהוא חסום)
+        Interlocked.Increment(ref Failed);
+        LastErr = "לא נחסם כי זה נתיב מערכת או תיקייה של התוכנה עצמה: " + r.Path;
+      }
     // חוקי סוגי הקבצים שהוחלו: השירות נועל קבצים רק לפיהם (AppliedExtMap). חוק שסומן אחר כך בלי "החל שינויים" לא נועל
     AddA(c, ExtGate);
     AddA(c, ScopeEntry(c)); // על מי ועל מה החסימה חלה – השירות פועל לפי זה עד ההחלה הבאה (AppliedScope)
+    // סוג החסימה (גמורה / בקוד) שהוחל לכל חוק: מעבר בין הסוגים בחלון נכנס לתוקף רק ב"החל שינויים" (AppliedMode)
+    foreach (var r in c.All().Where(r => r.On))
+      AddA(c, $"mode|{r.Id}|{(int)r.Mode}");
     foreach (var r in new[] { c.Movies, c.Songs, c.Images }.Concat(c.Exts).Where(r => r.On))
       AddA(c, "ext|" + r.Id);
     foreach (var r in new[] { c.Movies, c.Songs, c.Images }.Concat(c.Exts).Where(r => r.On && r.Mode == Mode.Code))
@@ -2296,6 +2319,7 @@ public static class Enforcer
   static void StrongApply(Config c)
   {
     var failed = new List<string>();
+    var single = new HashSet<string>(StringComparer.OrdinalIgnoreCase); // חשבונות בודדים (לא קבוצה) שקיבלו זכות ישירות – למשל חשבון של תוכנת גיבוי
     foreach (var r in StrongRights)
     {
       var holders = Lsa.Holders(r);
@@ -2308,6 +2332,8 @@ public static class Enforcer
       {
         // לפני ההסרה (יומן ההחלה): זכות שהוסרה בלי רישום לא הייתה חוזרת אף פעם. נכשלה – הרישום יורד (ביומן הוא נשאר, ובשחזור רק מוסיף זכות שכבר קיימת)
         var e = $"lsaright|{sid}|{r}";
+        if (sid.StartsWith("S-1-5-21-", StringComparison.Ordinal))
+          single.Add(Native.AccountName(sid) ?? sid);
         AddA(c, e);
         if (!Lsa.Change(sid, r, false))
         {
@@ -2323,6 +2349,12 @@ public static class Enforcer
       StrongWarn = "ההקשחה החזקה לא הוחלה במלואה: Windows לא אפשר להסיר את הזכויות " + string.Join(", ", failed) + ". שאר החסימות הוחלו.";
       Alerts.Log(StrongWarn);
     }
+    // הודעה (לא חסימה): גם חשבון ייעודי של תוכנה – למשל גיבוי – מאבד את הזכויות בזמן החסימה, והתוכנה עלולה להיכשל עד הביטול.
+    // לא מדלגים עליו: אחרת מנהל היה נותן לעצמו את הזכות ישירות לחשבון שלו ועוקף את ההקשחה
+    if (single.Count > 0)
+      StrongWarn = (StrongWarn == null ? "" : StrongWarn + "\n\n")
+        + "שים לב: ההקשחה החזקה הסירה זכויות גיבוי/שחזור גם מהחשבונות: " + string.Join(", ", single)
+        + ". אם זה חשבון של תוכנת גיבוי או שירות – התוכנה עלולה להיכשל בזמן החסימה (הזכויות חוזרות בביטול).";
   }
 
   // נקרא מהשירות: זכות שהוחזרה בזמן החסימה (למשל דרך secpol.msc) מוסרת שוב. השינוי של מנהל ייכנס לתוקף רק בכניסה הבאה – והשירות מקדים אותו.
@@ -2531,10 +2563,10 @@ public static class Enforcer
     List<string> bins;
     lock (SvcLock)
     {
-      if (svcBins == null || (DateTime.UtcNow - svcBinsAt).TotalMinutes >= 1)
+      if (svcBins == null || (Mono - svcBinsAt).TotalMinutes >= 1)
       {
         svcBins = ServiceBinaries();
-        svcBinsAt = DateTime.UtcNow;
+        svcBinsAt = Mono;
       }
       bins = svcBins;
     }
@@ -2658,6 +2690,9 @@ public static class Enforcer
   public static string? UiExe; // DeviceGuard.exe שממנו נפתח החלון (מההגדרות)
 
   static bool ProtectedPath(string p) => IsDangerous(p) || Protected(p);
+
+  // לחלון "קבצים ותיקיות": תיקיית ההגדרות, התיקייה שממנה רצה התוכנה (למשל "הורדות") או קובץ התוכנה – לא ניתנים לחסימה
+  public static bool IsOwnPath(string p) => Protected(p);
 
   // ---------- IFEO (שער חסימה) ----------
   static void Ifeo(Config c, string exe, Rule r)
@@ -2995,6 +3030,9 @@ public static class Enforcer
   static void AclOn(FileSystemInfo i, bool dir)
   {
     Mine(i.FullName);
+    // קובץ: דרך ידית לקובץ עצמו (כמו בשחרור). לא נפתח – בדרך הרגילה, כמו קודם
+    if (!dir && AclOnH(i.FullName))
+      return;
     var s = i is DirectoryInfo d ? (FileSystemSecurity)d.GetAccessControl() : ((FileInfo)i).GetAccessControl();
     s.AddAccessRule(Deny(dir));
     var hard = HardenFor(s);
@@ -3011,6 +3049,10 @@ public static class Enforcer
   static void AclOff(FileSystemInfo i, bool dir)
   {
     Mine(i.FullName);
+    // קובץ: דרך ידית לקובץ עצמו (קריאה וכתיבה של ההרשאות על אותו קובץ, גם אם תיקייה בדרך הוחלפה באמצע בקיצור).
+    // לא נפתח (למשל אין הרשאה) – השחרור הרגיל שלמטה, כמו קודם: שחרור אסור שייכשל
+    if (!dir && AclOffH(i.FullName))
+      return;
     Label(i.FullName, dir, false);
     try
     {
@@ -3027,6 +3069,105 @@ public static class Enforcer
       // קובץ שאין בהרשאות שלו גישה ל-SYSTEM/מנהלים (וחיזוק OWNER RIGHTS חוסם גם את הבעלים): משחררים בעזרת הרשאת השחזור של המערכת, כדי שהקובץ לא יישאר נעול לתמיד
       if (!ForceFileAclOff(i.FullName))
         throw;
+    }
+  }
+
+  [DllImport("advapi32.dll")]
+  static extern uint SetSecurityInfo(IntPtr h, int type, uint info, IntPtr owner, IntPtr group, IntPtr dacl, IntPtr sacl);
+
+  // נעילת קובץ דרך ידית (כלל הדחייה, ובחיזוק – OWNER RIGHTS ותווית השלמות). false = לא ניתן (המשך בדרך הרגילה)
+  static bool AclOnH(string path)
+  {
+    try
+    {
+      if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+        return false; // קיצור (symlink): בדרך הרגילה, כמו קודם
+      using var h = CreateFileW(path, 0x20000 | 0x40000 | 0x80000, 7, IntPtr.Zero, 3, 0x00200000, IntPtr.Zero);
+      if (h.IsInvalid)
+        return false;
+      var s = HandleSecurity(h);
+      if (s == null)
+        return false;
+      s.AddAccessRule(Deny(false));
+      var hard = HardenFor(s);
+      if (hard)
+        Own(s, false);
+      if (!SetKernelObjectSecurity(h, 4, s.GetSecurityDescriptorBinaryForm()))
+        return false;
+      if (hard)
+        LabelOnH(h);
+      return true;
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
+      return false;
+    }
+  }
+
+  // שחרור קובץ דרך ידית: כלל הדחייה שלנו, כלל OWNER RIGHTS ותווית השלמות שלנו. false = לא ניתן (המשך בדרך הרגילה)
+  static bool AclOffH(string path)
+  {
+    try
+    {
+      // קיצור (symlink) בשם הקובץ: גרסאות קודמות נעלו את הקובץ שהוא מפנה אליו – השחרור הרגיל (שעוקב אחרי הקיצור) מטפל בו
+      if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+        return false;
+      // READ_CONTROL | WRITE_DAC | WRITE_OWNER, שיתוף מלא, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT
+      using var h = CreateFileW(path, 0x20000 | 0x40000 | 0x80000, 7, IntPtr.Zero, 3, 0x00200000, IntPtr.Zero);
+      if (h.IsInvalid)
+        return false;
+      var s = HandleSecurity(h);
+      if (s == null)
+        return false;
+      // התווית: רק שלנו (או שלא ניתן לקרוא – כמו ב-Label)
+      const uint LABEL = 0x10;
+      string? lbl = null;
+      GetKernelObjectSecurity(h, LABEL, null, 0, out var need);
+      if (need > 0)
+      {
+        var buf = new byte[need];
+        if (GetKernelObjectSecurity(h, LABEL, buf, need, out _))
+        {
+          var gh = GCHandle.Alloc(buf, GCHandleType.Pinned);
+          try
+          {
+            if (ConvertSecurityDescriptorToStringSecurityDescriptorW(gh.AddrOfPinnedObject(), 1, LABEL, out var str, IntPtr.Zero))
+              try
+              {
+                lbl = Marshal.PtrToStringUni(str) ?? "";
+              }
+              finally
+              {
+                LocalFree(str);
+              }
+          }
+          finally
+          {
+            gh.Free();
+          }
+        }
+      }
+      if (lbl == null || IsOurLabel(lbl))
+      {
+        var eh = GCHandle.Alloc(EmptyAcl, GCHandleType.Pinned);
+        try
+        {
+          SetSecurityInfo(h.DangerousGetHandle(), 1, LABEL, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, eh.AddrOfPinnedObject());
+        }
+        finally
+        {
+          eh.Free();
+        }
+      }
+      RemoveOurDeny(s, false);
+      Unown(s, false);
+      return SetKernelObjectSecurity(h, 4, s.GetSecurityDescriptorBinaryForm()); // DACL
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
+      return false;
     }
   }
 
@@ -3470,7 +3611,7 @@ public static class Enforcer
 
   static bool Cached(string key, Func<bool> f)
   {
-    var now = DateTime.UtcNow;
+    var now = Mono;
     if (dllDirs.TryGetValue(key, out var e) && (now - e.T).TotalMinutes < 10)
       return e.V;
     var v = f();
@@ -4003,13 +4144,27 @@ public static class Enforcer
       if (RemovableExcluded(p) || InSkipped(p, fresh) || !AclOk(p))
         return true;
       var fi = new FileInfo(p);
-      if (!fi.Exists || Protected(p))
+      if (!fi.Exists || Protected(p) || (fi.Attributes & FileAttributes.ReparsePoint) != 0)
+        return true; // קיצור (symlink) בשם הקובץ לא ננעל: הקובץ שהוא מפנה אליו נסרק ונבדק במקום שלו
+      // ההרשאות נקראות ונכתבות דרך ידית לקובץ עצמו (ולא פעמיים לפי הנתיב): משתמש שמחליף באמצע תיקייה בקיצור (junction) לא יכול
+      // לגרום לשירות לכתוב את ההרשאות של הקובץ שלו על קובץ אחר. קיצור בשם הקובץ עצמו (symlink) לא נפתח דרכו
+      // READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES, שיתוף מלא, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT
+      using var h = CreateFileW(p, 0x20000 | 0x40000 | 0x80000 | 0x80 | 0x100, 7, IntPtr.Zero, 3, 0x00200000, IntPtr.Zero);
+      if (h.IsInvalid)
+        return false;
+      // הנתיב האמיתי של מה שנפתח. שונה מהנתיב שנבדק (תיקייה בדרך הוחלפה בקיצור): כל הבדיקות שוב על הנתיב האמיתי
+      var q = HandlePath(h);
+      if (q == null)
+        return false;
+      if (!string.Equals(q, p, StringComparison.OrdinalIgnoreCase) && (RemovableExcluded(q) || InSkipped(q, fresh) || !AclOk(q) || Protected(q)))
         return true;
-      var s = fi.GetAccessControl();
+      var s = HandleSecurity(h);
+      if (s == null)
+        return false;
       // קובץ שהבעלים שלו הוא המערכת / מנהלים / TrustedInstaller – נוצר על ידי תוכנת התקנה או שירות (משאבים של תוכנות ב-ProgramData, קבצים שמתקין דרייבר מחלץ ל-Windows\Temp).
       // לא נועלים אותו, כדי לא לשבור תוכנות והתקנות. משתמש רגיל לא יכול ליצור קובץ בבעלות כזו (העתקה יוצרת קובץ בבעלותו).
       // בבעלות קבוצת המנהלים – רק ב-ProgramData (העתקה בחלון מורם מחוץ לשם נחסמת)
-      if (InstallerSid(s.GetOwner(typeof(SecurityIdentifier))?.Value, p))
+      if (InstallerSid(s.GetOwner(typeof(SecurityIdentifier))?.Value, q))
         return true;
       if (
         s.GetAccessRules(true, false, typeof(SecurityIdentifier))
@@ -4021,42 +4176,136 @@ public static class Enforcer
       )
       {
         // קובץ שכבר נעול בחסימה שלנו אבל לא רשום ביומן (למשל אחרי שביטול קודם איבד את הרישום): רושמים אותו, כדי שישוחרר בביטול הבא
-        if (!logged.ContainsKey(p) && HasOurDeny(s))
+        if (!logged.ContainsKey(q) && HasOurDeny(s))
         {
-          var cur = File.GetAttributes(p);
+          var cur = File.GetAttributes(q);
           var hs = FileAttributes.Hidden | FileAttributes.System;
-          EnqueueLog($"{p}|{(int)((cur & hs) == hs && !WinHiddenArt(p) ? cur & ~hs : cur)}"); // מוסתר+מערכת = הוסתר על ידינו (חוץ מעטיפות אלבום של Windows)
+          EnqueueLog($"{q}|{(int)((cur & hs) == hs && !WinHiddenArt(q) ? cur & ~hs : cur)}"); // מוסתר+מערכת = הוסתר על ידינו (חוץ מעטיפות אלבום של Windows)
         }
         known[p] = 0;
         return true;
       }
-      var a = File.GetAttributes(p);
+      var a = File.GetAttributes(q);
       // החוק פתוח עכשיו בקוד ("פתיחת תמונות (קוד)"): לא נועלים – לא קובץ חדש ולא בסריקה התקופתית. רק רושמים ביומן,
       // כך שכשהחלון נסגר (RelockExt) גם הקובץ הזה ננעל
       if (openIds.ContainsKey(r.Id))
       {
-        if (!logged.ContainsKey(p))
-          EnqueueLog($"{p}|{(int)a}");
+        if (!logged.ContainsKey(q))
+          EnqueueLog($"{q}|{(int)a}");
         known[p] = 0;
         return true;
       }
       if (r.Hidden && r.Mode == Mode.Full)
-        File.SetAttributes(p, a | FileAttributes.Hidden | FileAttributes.System);
-      Mine(p);
+        SetAttributesH(h, a | FileAttributes.Hidden | FileAttributes.System);
+      Mine(q);
       s.AddAccessRule(Deny(false));
       var hard = HardenFor(s);
       if (hard)
         Own(s, false);
-      fi.SetAccessControl(s);
+      if (!SetKernelObjectSecurity(h, 4, s.GetSecurityDescriptorBinaryForm())) // DACL_SECURITY_INFORMATION, דרך אותה ידית
+        return false;
       if (hard)
-        Label(p, false, true);
-      EnqueueLog($"{p}|{(int)a}");
+        LabelOnH(h);
+      EnqueueLog($"{q}|{(int)a}");
       known[p] = 0;
       return true;
     }
     catch
     {
       return false;
+    }
+  }
+
+  // הנתיב האמיתי של ידית פתוחה (בלי הקידומת \\?\). null = לא ניתן לקרוא
+  static string? HandlePath(SafeHandle h)
+  {
+    var sb = new StringBuilder(1024);
+    var n = GetFinalPathNameByHandleW(h, sb, (uint)sb.Capacity, 0);
+    if (n == 0 || n >= sb.Capacity)
+      return null;
+    var r = sb.ToString();
+    if (r.StartsWith(@"\\?\UNC\", StringComparison.Ordinal))
+      r = @"\\" + r[8..];
+    else if (r.StartsWith(@"\\?\", StringComparison.Ordinal))
+      r = r[4..];
+    return r;
+  }
+
+  // הבעלים וההרשאות (DACL) של קובץ דרך ידית פתוחה. null = לא ניתן לקרוא
+  static FileSecurity? HandleSecurity(SafeHandle h)
+  {
+    const uint Info = 1 | 4; // OWNER | DACL
+    GetKernelObjectSecurity(h, Info, null, 0, out var need);
+    if (need == 0)
+      return null;
+    var buf = new byte[need];
+    if (!GetKernelObjectSecurity(h, Info, buf, need, out _))
+      return null;
+    var fs = new FileSecurity();
+    fs.SetSecurityDescriptorBinaryForm(buf, AccessControlSections.Owner | AccessControlSections.Access);
+    return fs;
+  }
+
+  // מאפייני קובץ דרך ידית (FILE_BASIC_INFO: זמנים 0 = בלי שינוי)
+  static void SetAttributesH(SafeHandle h, FileAttributes a)
+  {
+    var basic = new byte[40];
+    BitConverter.GetBytes((int)a).CopyTo(basic, 32);
+    SetFileInformationByHandle(h, 0, basic, (uint)basic.Length);
+  }
+
+  [DllImport("advapi32.dll")]
+  static extern uint GetSecurityDescriptorLength(IntPtr sd);
+
+  // תווית השלמות שלנו (No-Write-Up ברמה High) דרך ידית – כמו Label, בלי לדרוס תווית אחרת שכבר יש לקובץ
+  static void LabelOnH(SafeHandle h)
+  {
+    const uint LABEL = 0x10;
+    try
+    {
+      GetKernelObjectSecurity(h, LABEL, null, 0, out var need);
+      if (need > 0)
+      {
+        var buf = new byte[need];
+        if (GetKernelObjectSecurity(h, LABEL, buf, need, out _))
+        {
+          var gh = GCHandle.Alloc(buf, GCHandleType.Pinned);
+          try
+          {
+            if (ConvertSecurityDescriptorToStringSecurityDescriptorW(gh.AddrOfPinnedObject(), 1, LABEL, out var str, IntPtr.Zero))
+              try
+              {
+                var cur = Marshal.PtrToStringUni(str) ?? "";
+                if (HasLabel(cur) && !IsOurLabel(cur))
+                  return;
+              }
+              finally
+              {
+                LocalFree(str);
+              }
+          }
+          finally
+          {
+            gh.Free();
+          }
+        }
+      }
+      if (!ConvertStringSecurityDescriptorToSecurityDescriptorW("S:(ML;;NW;;;HI)", 1, out var sd, IntPtr.Zero))
+        return;
+      try
+      {
+        var b = new byte[GetSecurityDescriptorLength(sd)];
+        Marshal.Copy(sd, b, 0, b.Length);
+        SetKernelObjectSecurity(h, LABEL, b);
+      }
+      finally
+      {
+        LocalFree(sd);
+      }
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
     }
   }
 
@@ -4225,9 +4474,18 @@ public static class Enforcer
         AddLost(p); // הקובץ נמחק – או הועבר (שינוי שם של תיקייה שמעליו). אם הועבר, הוא עדיין נעול: נחפש אותו בדיסק ונשחרר
         return true;
       }
+      // המאפיינים המקוריים מוחזרים דרך ידית שנפתחת לפני השחרור, ורק לקובץ שבאמת נעול על ידינו (או שהנתיב מוביל ישר אליו) –
+      // לא לקובץ אחר שאליו מפנה תיקייה שהוחלפה בקיצור. READ_CONTROL | FILE_READ/WRITE_ATTRIBUTES, OPEN_REPARSE_POINT
+      using var h = CreateFileW(p, 0x20000 | 0x80 | 0x100, 7, IntPtr.Zero, 3, 0x00200000, IntPtr.Zero);
+      bool attrOk = !h.IsInvalid && (string.Equals(HandlePath(h), fi.FullName, StringComparison.OrdinalIgnoreCase) || HandleSecurity(h) is { } hs0 && HasOurDeny(hs0));
       AclOff(fi, false);
       if (int.TryParse(l[(i + 1)..], out var at))
-        File.SetAttributes(p, (FileAttributes)at);
+      {
+        if (h.IsInvalid)
+          File.SetAttributes(p, (FileAttributes)at); // לא נפתח: כמו קודם
+        else if (attrOk)
+          SetAttributesH(h, (FileAttributes)at == 0 ? FileAttributes.Normal : (FileAttributes)at);
+      }
       return true;
     }
     catch (Exception __e)
@@ -5119,7 +5377,7 @@ public static class Enforcer
   // (אחרת השינוי לא היה נרשם, לא היה מבוטל בביטול החסימה, והאינטרנט היה עלול להישאר חסום לכל התוכנות)
   public static void NetHeal(Config c)
   {
-    if (!c.Master || DateTime.UtcNow < healBackoff || Applying())
+    if (!c.Master || Mono < healBackoff || Applying())
       return;
     var fw = FwApplied(c);
     if (fw == null)
@@ -5146,11 +5404,11 @@ public static class Enforcer
         cmds.Add("Set-NetFirewallProfile -Profile Domain,Private,Public -DefaultOutboundAction Block");
       PSAll(cmds);
       if (!NetOk(c, white, list))
-        healBackoff = DateTime.UtcNow.AddMinutes(10);
+        healBackoff = Mono.AddMinutes(10);
     }
     catch
     {
-      healBackoff = DateTime.UtcNow.AddMinutes(10);
+      healBackoff = Mono.AddMinutes(10);
     }
     finally
     {
@@ -5210,7 +5468,7 @@ public static class Enforcer
   // נקרא מהשירות כל כמה שניות ומיד בשינוי ברשת: רק אחרי שחסימת הרשת של החשבון הוחלה בפועל (רשומת netuser)
   public static void NetUserHeal(Config c)
   {
-    if (!c.Master || !c.Net.On || DateTime.UtcNow < nuBackoff || Applying())
+    if (!c.Master || !c.Net.On || Mono < nuBackoff || Applying())
       return;
     var ap = NetUserApplied(c);
     if (ap == null)
@@ -5238,14 +5496,14 @@ public static class Enforcer
       if (!FwProfilesOn() || res == null || (want && nuSnap.Length == 0))
       {
         nuSnap = null;
-        nuBackoff = DateTime.UtcNow.AddMinutes(10); // לא הצליח: לא מנסים (ולא מתריעים) שוב כל כמה שניות
+        nuBackoff = Mono.AddMinutes(10); // לא הצליח: לא מנסים (ולא מתריעים) שוב כל כמה שניות
         Alerts.Log("לא ניתן היה להחיל את חסימת הרשת של החשבון שנבחר בחומת האש (ניסיון נוסף בעוד 10 דקות)");
       }
     }
     catch (Exception __e)
     {
       Diag.Log(__e);
-      nuBackoff = DateTime.UtcNow.AddMinutes(10);
+      nuBackoff = Mono.AddMinutes(10);
     }
     finally
     {
@@ -5420,9 +5678,9 @@ public static class Enforcer
     List<string> applied;
     lock (c.Applied)
       applied = c.Applied.Where(x => x.StartsWith("wlanfilter|")).ToList();
-    if ((DateTime.UtcNow - wlanRefresh).TotalMinutes >= 2)
+    if ((Mono - wlanRefresh).TotalMinutes >= 2)
     {
-      wlanRefresh = DateTime.UtcNow;
+      wlanRefresh = Mono;
       wlanSeen.Clear();
     }
     try
@@ -5452,9 +5710,9 @@ public static class Enforcer
         {
           if (NormMac(cn.Bssid) is string cm && ok.Contains(cm + "|" + cn.Ssid))
             continue;
-          if (Wlan.Disconnect(g) && (DateTime.UtcNow - lastWlanCut).TotalMinutes >= 1)
+          if (Wlan.Disconnect(g) && (Mono - lastWlanCut).TotalMinutes >= 1)
           {
-            lastWlanCut = DateTime.UtcNow;
+            lastWlanCut = Mono;
             Alerts.Log($"נותק חיבור Wi-Fi לנתב שאינו ברשימה הלבנה: {cn.Ssid} ({cn.Bssid})");
           }
         }
@@ -5470,7 +5728,7 @@ public static class Enforcer
     try
     {
       var wl = c.Net.White.Where(w => !IsWifiEntry(w)).ToHashSet(StringComparer.OrdinalIgnoreCase);
-      var now = DateTime.UtcNow;
+      var now = Mono;
       var bad = NetworkInterface
         .GetAllNetworkInterfaces()
         .Where(n =>
@@ -5662,7 +5920,7 @@ public static class Enforcer
       {
         Diag.Log(__e);
       }
-      var now = DateTime.UtcNow;
+      var now = Mono;
       var bad = ids.Distinct(StringComparer.OrdinalIgnoreCase)
         .Where(id =>
           !c.Usb.White.Contains(id) && !(usbBackoff.TryGetValue(id, out var u) && now < u) && Native.DevState(id) == 0
@@ -5788,9 +6046,9 @@ public static class Enforcer
   // נקרא מהשירות: מנסה שוב להפעיל מה שלא חזר לפעול – אבל לא מתאם/התקן שהחסימה הנוכחית אמורה להשאיר חסום
   public static void ProcessDevPending(Config c, bool blocking)
   {
-    if ((DateTime.UtcNow - lastDevPend).TotalMinutes < 5 || !File.Exists(DevPendFile))
+    if ((Mono - lastDevPend).TotalMinutes < 5 || !File.Exists(DevPendFile))
       return;
-    lastDevPend = DateTime.UtcNow;
+    lastDevPend = Mono;
     lock (DevPendLock)
     {
       try
@@ -6057,9 +6315,9 @@ public static class Enforcer
       {
         if (!File.Exists(NetPendFile))
           return left;
-        if (!force && (DateTime.UtcNow - lastNetPend).TotalSeconds < 15)
+        if (!force && (Mono - lastNetPend).TotalSeconds < 15)
           return File.ReadAllLines(NetPendFile).Where(l => l.Length > 0).Select(l => l.Split('\t')[0]).ToList();
-        lastNetPend = DateTime.UtcNow;
+        lastNetPend = Mono;
         bool fwOwned,
           netUserOwned,
           wlanOwned;

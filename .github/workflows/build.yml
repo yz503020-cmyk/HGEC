@@ -42,10 +42,13 @@ jobs:
           $st = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName | Select-Object -Last 1
           & $st.FullName sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f "$env:RUNNER_TEMP\sign.pfx" /p $env:SIGN_PFX_PASSWORD out\DeviceGuard.exe
           Remove-Item "$env:RUNNER_TEMP\sign.pfx"
+      # כישלון בהעלאה (למשל מכסת האחסון של Actions מלאה) לא עוצר את פרסום הגרסה; הקבצים נמחקים לבד אחרי 3 ימים
       - uses: actions/upload-artifact@v6
+        continue-on-error: true
         with:
           name: DeviceGuard
           path: out/DeviceGuard.exe
+          retention-days: 3
       - name: Draft release (tag or manual)
         if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.release == 'true'
         shell: bash

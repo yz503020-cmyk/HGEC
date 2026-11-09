@@ -728,3 +728,51 @@ public class AppliedScopeTests
     Assert.Equal(Enforcer.CurrentScope(c), Enforcer.AppliedScope(c));
   }
 }
+
+// ---------- סקירה 13 ----------
+public class Review13Tests
+{
+  // סוג החסימה (גמורה / בקוד) – לפי מה שהוחל, ולא לפי מה שסומן בחלון
+  [Fact]
+  public void AppliedModeFollowsWhatWasApplied()
+  {
+    var c = new Config();
+    var r = new Rule { On = true, Mode = Mode.Code };
+    c.Programs.Add(r);
+    Assert.Equal(Mode.Code, Enforcer.AppliedMode(c, r)); // בלי רשומה (החלה מגרסה קודמת): לפי ההגדרות
+    c.Applied.Add($"mode|{r.Id}|{(int)Mode.Full}");
+    Assert.Equal(Mode.Full, Enforcer.AppliedMode(c, r)); // הוחל כגמורה; המעבר לקוד ייכנס לתוקף רק ב"החל שינויים"
+    c.Applied.Add($"mode|{r.Id}|9");
+    Assert.Equal(Mode.Code, Enforcer.AppliedMode(c, r)); // ערך לא תקין: לפי ההגדרות
+  }
+
+  // תזמון שסומן ולא הוחל לא משפיע (לא משחרר ולא מחיל לבד)
+  [Fact]
+  public void ScheduleTakesEffectOnlyWhenArmed()
+  {
+    var c = new Config
+    {
+      Master = true,
+      Sched = new Schedule { On = true, From = "08:00", To = "09:00", Days = 0 }, // אף יום: מחוץ לחלון תמיד
+    };
+    c.SchedArmed = true;
+    Assert.False(Program.Blocking(c));
+    c.SchedArmed = false;
+    Assert.True(Program.Blocking(c));
+  }
+
+  [Fact]
+  public void OldConfigsKeepTheirSchedule() =>
+    Assert.True(System.Text.Json.JsonSerializer.Deserialize<Config>("{}", Config.O)!.SchedArmed);
+
+  [Fact]
+  public void MonotonicTimeNeverGoesBack()
+  {
+    var a = Enforcer.Mono;
+    Thread.Sleep(20);
+    Assert.True(Enforcer.Mono >= a);
+  }
+
+  [Fact]
+  public void OwnFolderCannotBeBlocked() => Assert.True(Enforcer.IsOwnPath(Config.Dir));
+}

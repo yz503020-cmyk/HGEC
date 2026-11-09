@@ -83,7 +83,7 @@ public static class Program
 
   // האם החסימות אמורות להיות פעילות כרגע (מתג ראשי, פתיחה זמנית, תזמון)
   public static bool Blocking(Config c) =>
-    c.Master && c.TempOpenUntil <= Clock.UtcNow().Ticks && (!c.Sched.On || c.Sched.Active(c.Sched.NowPinned()));
+    c.Master && c.TempOpenUntil <= Clock.UtcNow().Ticks && (!c.Sched.On || !c.SchedArmed || c.Sched.Active(c.Sched.NowPinned()));
 
   public static void InternalAdd(int pid, int d)
   {
@@ -95,7 +95,7 @@ public static class Program
   static bool Locked(string key)
   {
     lock (lk)
-      return fails.TryGetValue(key, out var f) && DateTime.UtcNow < f.Until;
+      return fails.TryGetValue(key, out var f) && Enforcer.Mono < f.Until;
   }
 
   static void Fail(string key, string what)
@@ -111,7 +111,7 @@ public static class Program
       {
         n = 0;
         lvl = Math.Min(lvl + 1, 5);
-        until = DateTime.UtcNow.AddSeconds(30 << lvl);
+        until = Enforcer.Mono.AddSeconds(30 << lvl);
         Alerts.Log("נעילה זמנית אחרי ניסיונות קוד שגויים: " + what);
       }
       fails[key] = (n, lvl, until);
@@ -136,9 +136,9 @@ public static class Program
 
   static bool TokenOk(string t)
   {
-    if (tokens.TryGetValue(t, out var d) && (DateTime.UtcNow - d).TotalHours < 8)
+    if (tokens.TryGetValue(t, out var d) && (Enforcer.Mono - d).TotalHours < 8)
     {
-      tokens[t] = DateTime.UtcNow; // תוקף מתחדש בכל שימוש: חלון שפתוח יום שלם לא מאבד את הטוקן באמצע עבודה
+      tokens[t] = Enforcer.Mono; // תוקף מתחדש בכל שימוש: חלון שפתוח יום שלם לא מאבד את הטוקן באמצע עבודה
       return true;
     }
     tokens.TryRemove(t, out _);
@@ -205,7 +205,7 @@ public static class Program
     {
       using var pr = Process.GetProcessById(pid);
       authPid[pid] = (rule, pr.StartTime);
-      ruleAuth[rule] = DateTime.UtcNow;
+      ruleAuth[rule] = Enforcer.Mono;
     }
     catch (Exception __e)
     {
@@ -266,10 +266,17 @@ public static class Program
         "icacls",
         $"\"{Config.Dir}\" /inheritance:r /grant *S-1-5-18:(OI)(CI)F /grant *S-1-5-32-544:(OI)(CI)RX /grant *S-1-5-32-545:(OI)(CI)RX"
       );
+      // var: מנהלים (החלון המורם) יוצרים, כותבים ומוחקים קבצים בתוכה – אבל לא מוחקים / משנים את השם של התיקייה עצמה ולא את ההרשאות שלה.
+      // קודם הייתה להם שליטה מלאה גם על התיקייה, ואפשר היה להחליף אותה (וגם את תיקיית החילוץ שבתוכה) בתיקייה אחרת.
+      // קודם מסירים את ההרשאה הישנה של המנהלים (‎/grant מוסיף ולא מחליף, ובהתקנה קיימת השליטה המלאה הייתה נשארת)
+      Enforcer.RunExe("icacls", $"\"{System.IO.Path.Combine(Config.Dir, "var")}\" /remove:g *S-1-5-32-544");
       Enforcer.RunExe(
         "icacls",
-        $"\"{System.IO.Path.Combine(Config.Dir, "var")}\" /inheritance:r /grant *S-1-5-18:(OI)(CI)F /grant *S-1-5-32-544:(OI)(CI)F"
+        $"\"{System.IO.Path.Combine(Config.Dir, "var")}\" /inheritance:r /grant *S-1-5-18:(OI)(CI)F /grant *S-1-5-32-544:(RD,X,RA,REA,RC,S,WD,AD,WA,WEA) /grant *S-1-5-32-544:(OI)(CI)(IO)F"
       );
+      // הבעלים של התיקיות – המערכת (בעלים מקבל תמיד זכות לשנות הרשאות; תיקייה שהחלון יצר הייתה בבעלות קבוצת המנהלים)
+      foreach (var d in new[] { Config.Dir, System.IO.Path.Combine(Config.Dir, "var"), System.IO.Path.Combine(Config.Dir, "var", "net") })
+        Enforcer.RunExe("icacls", $"\"{d}\" /setowner *S-1-5-18");
       // תיקיית החילוץ של השירות (קובצי DLL שהשירות טוען כ-SYSTEM): רק המערכת כותבת אליה. בירושה מ-var מנהלים יכלו לכתוב לשם
       // ולשתול קובץ שירוץ כ-SYSTEM. נעילה כאן חלה גם על הקבצים שכבר חולצו (ההרשאות שבירושה מתעדכנות)
       Enforcer.RunExe(
@@ -290,11 +297,12 @@ public static class Program
   static void Reconcile(Config c)
   {
     // החלון באמצע החלה/ביטול: לא מתחילים במקביל (ננסה שוב בסבב הבא, אחרי שההגדרות החדשות נשמרו)
-    if (Interlocked.CompareExchange(ref applyBusy, 0, 0) != 0 || DateTime.UtcNow < reconBackoff || Enforcer.Applying())
+    if (Interlocked.CompareExchange(ref applyBusy, 0, 0) != 0 || Enforcer.Mono < reconBackoff || Enforcer.Applying())
       return;
     bool need = Blocking(c),
       applied = c.State == 1 || c.Applied.Count > 0;
-    if (need && c.AnyOn() && (reapply || (!applied && (c.Sched.On || c.TempOpenUntil != 0))))
+    // תחילת חלון זמנים – רק לתזמון שהוחל ("החל שינויים"); חסימות שרק סומנו בחלון לא מוחלות לבד
+    if (need && c.AnyOn() && (reapply || (!applied && ((c.Sched.On && c.SchedArmed) || c.TempOpenUntil != 0))))
       Job(true);
     else if (!need && applied)
       Job(false);
@@ -333,7 +341,7 @@ public static class Program
         catch (Exception x)
         {
           Alerts.Log("שגיאה בהפעלה/הסרה אוטומטית: " + x.Message);
-          reconBackoff = DateTime.UtcNow.AddMinutes(2);
+          reconBackoff = Enforcer.Mono.AddMinutes(2);
         }
         finally
         {
@@ -583,7 +591,7 @@ public static class Program
       var wrr = c.Find(wslId);
       if (wrr == null)
         return;
-      full = wrr.Mode == Mode.Full;
+      full = Enforcer.AppliedMode(c, wrr) == Mode.Full;
       crid = full ? null : wslId;
     }
     else
@@ -735,8 +743,8 @@ public static class Program
       // אחרת היא הייתה נסגרת מיד (גם אצל המנהל, עם עבודה שלא נשמרה) עוד לפני "החל שינויים"
       var ifeoDone = new HashSet<string>(Enforcer.IfeoList(c).Select(x => x.Exe + "|" + x.Id), StringComparer.OrdinalIgnoreCase);
       foreach (var r in c.Programs.Where(r => r.On && ifeoDone.Contains(System.IO.Path.GetFileName(r.Path) + "|" + r.Id)))
-        Names(r, r.Mode == Mode.Full);
-      if (c.Settings.On && c.Settings.Mode == Mode.Code && ifeoDone.Contains("SystemSettings.exe|" + c.Settings.Id))
+        Names(r, Enforcer.AppliedMode(c, r) == Mode.Full); // סוג החסימה שהוחל (מעבר גמורה/קוד – רק ב"החל שינויים")
+      if (c.Settings.On && Enforcer.AppliedMode(c, c.Settings) == Mode.Code && ifeoDone.Contains("SystemSettings.exe|" + c.Settings.Id))
         ck["SystemSettings"] = c.Settings.Id; // רשת ביטחון: אפליקציית ההגדרות של Windows לא תמיד נתפסת ב-IFEO
       // כל מה שנחסם ב-IFEO (כלי אתחול, וירטואליזציה, התקנת MSI, לוח הבקרה...) נסגר גם אם הופעל בכל זאת – למשל מנהל שמחק את החסימה
       // מהרישום והפעיל את הכלי באותו רגע, לפני שהשירות שחזר אותה. תהליכים של Windows עצמו (SYSTEM) ושל השירות לא נסגרים (HandleProc)
@@ -747,7 +755,7 @@ public static class Program
         // חוק שהסימון שלו הוסר (גם בלי "החל שינויים"): השער כבר מאפשר אותו (RuleInfo), ולכן לא סוגרים – אחרת התוכנה נפתחת ונסגרת לבד
         if (n.Length == 0 || r == null || !r.On || Enforcer.IsCritical(n) || ks.Contains(n) || ck.ContainsKey(n))
           continue;
-        if (r.Mode == Mode.Full)
+        if (Enforcer.AppliedMode(c, r) == Mode.Full)
           ks.Add(n);
         else
           ck[n] = r.Id;
@@ -772,7 +780,7 @@ public static class Program
         var r = c.Find(q[2]);
         if (n.Length == 0 || r == null || !r.On || Enforcer.IsCritical(n) || ks.Contains(n) || ck.ContainsKey(n))
           continue;
-        if (r.Mode == Mode.Full)
+        if (Enforcer.AppliedMode(c, r) == Mode.Full)
           ks.Add(n);
         else
           ck[n] = r.Id;
@@ -826,14 +834,14 @@ public static class Program
       c.Paths.Contains(r) ? "path"
       : Enforcer.IsExt(c, r) ? "ext"
       : "other";
-    return string.Join("|", "OK", r.Name.Replace('|', '/'), (int)r.Mode, r.OwnCode != null ? 1 : 0, applies ? 1 : 0, kind, r.Path ?? "");
+    return string.Join("|", "OK", r.Name.Replace('|', '/'), (int)Enforcer.AppliedMode(c, r), r.OwnCode != null ? 1 : 0, applies ? 1 : 0, kind, r.Path ?? "");
   }
 
   static string Auth(string code)
   {
     lock (lk)
     {
-      if (DateTime.UtcNow < authLock)
+      if (Enforcer.Mono < authLock)
         return "LOCK";
     }
     if (Config.Check(code, cur.AppCode))
@@ -845,7 +853,7 @@ public static class Program
       }
       Trust.SetCode(code, cur.AppCode); // מפתח החתימה של ההגדרות (ראו Trust)
       var t = Guid.NewGuid().ToString("N");
-      tokens[t] = DateTime.UtcNow;
+      tokens[t] = Enforcer.Mono;
       return "TOKEN|" + t;
     }
     lock (lk)
@@ -855,7 +863,7 @@ public static class Program
       {
         authFails = 0;
         authLevel = Math.Min(authLevel + 1, 5);
-        authLock = DateTime.UtcNow.AddSeconds(30 << authLevel);
+        authLock = Enforcer.Mono.AddSeconds(30 << authLevel);
         Alerts.Log("נעילה זמנית אחרי ניסיונות כניסה שגויים לתוכנה");
       }
     }
@@ -927,7 +935,7 @@ public static class Program
           {
             Ok(k);
             if (clientPid > 0)
-              grants[(clientPid, p[1])] = DateTime.UtcNow;
+              grants[(clientPid, p[1])] = Enforcer.Mono;
             return "OK";
           }
           Fail(k, r.Name);
@@ -937,7 +945,7 @@ public static class Program
         {
           var c = cur;
           var r = c.Find(p[1]);
-          if (r == null || !r.On || !Blocking(c) || r.Mode != Mode.Code || !(c.Paths.Contains(r) || Enforcer.IsExt(c, r)))
+          if (r == null || !r.On || !Blocking(c) || Enforcer.AppliedMode(c, r) != Mode.Code || !(c.Paths.Contains(r) || Enforcer.IsExt(c, r)))
             return "ERR";
           var k = LockKey(r, sid);
           if (Locked(k))
@@ -949,7 +957,7 @@ public static class Program
           }
           Ok(k);
           Enforcer.Unlock(r, c);
-          lease[p[1]] = DateTime.UtcNow;
+          lease[p[1]] = Enforcer.Mono;
           Alerts.Log("נפתח בקוד: " + r.Name, false);
           var lt = Guid.NewGuid().ToString("N");
           leaseTok[lt] = p[1];
@@ -965,10 +973,10 @@ public static class Program
           if (!yes && p.Length > 3 && p[3] == "SYS" && ClientSys(clientPid, sid)) // "SYS" מתקבל רק מתהליך שבאמת רץ כמערכת / בסשן 0
           {
             var r = cur.Find(p[1]);
-            yes = r != null && r.Mode == Mode.Code && ruleAuth.TryGetValue(p[1], out var t) && (DateTime.UtcNow - t).TotalMinutes < 15;
+            yes = r != null && Enforcer.AppliedMode(cur, r) == Mode.Code && ruleAuth.TryGetValue(p[1], out var t) && (Enforcer.Mono - t).TotalMinutes < 15;
           }
           if (yes && clientPid > 0)
-            grants[(clientPid, p[1])] = DateTime.UtcNow;
+            grants[(clientPid, p[1])] = Enforcer.Mono;
           return yes ? "OK" : "NO";
         }
         case "CANCELTEMP":
@@ -1006,7 +1014,7 @@ public static class Program
           // והתהליך המאושר חייב להיות בן של השער – או התהליך שעליו נשאל הקוד (PromptKill)
           if (!FromGate(clientPid) || p.Length < 3 || !int.TryParse(p[1], out var ap))
             return "DENY";
-          if (!grants.TryRemove((clientPid, p[2]), out var gt) || (DateTime.UtcNow - gt).TotalSeconds > 60)
+          if (!grants.TryRemove((clientPid, p[2]), out var gt) || (Enforcer.Mono - gt).TotalSeconds > 60)
             return "DENY";
           bool child = Native.ParentOf(ap) == clientPid;
           bool prompted = promptedPid.TryGetValue(ap, out var pr) && pr.Rule == p[2] && Native.SameStart(ap, pr.Start);
@@ -1030,7 +1038,7 @@ public static class Program
         { // PING|ruleId|token
           if (p.Length < 3 || !leaseTok.TryGetValue(p[2], out var lid) || lid != p[1] || !lease.ContainsKey(p[1]))
             return "DENY";
-          lease[p[1]] = DateTime.UtcNow;
+          lease[p[1]] = Enforcer.Mono;
           return "OK";
         }
         case "RELOCK":
@@ -1080,8 +1088,9 @@ public static class Program
     {
       Enforcer.RunExe("sc.exe", "sdset DeviceGuard D:(A;;GA;;;SY)(A;;GA;;;BA)");
       Enforcer.RunExe("icacls", $"\"{Config.Dir}\" /grant *S-1-5-32-544:(OI)(CI)F");
-      if (full) // הסרה מלאה: גם תיקיית החילוץ (שנעולה בנפרד) – כדי שאפשר יהיה למחוק את התיקייה אחרי ההסרה
-        Enforcer.RunExe("icacls", $"\"{System.IO.Path.Combine(Config.Dir, "var", "net")}\" /grant *S-1-5-32-544:(OI)(CI)F");
+      if (full) // הסרה מלאה: גם var ותיקיית החילוץ (שנעולות בנפרד) – כדי שאפשר יהיה למחוק את התיקייה אחרי ההסרה
+        foreach (var d in new[] { System.IO.Path.Combine(Config.Dir, "var"), System.IO.Path.Combine(Config.Dir, "var", "net") })
+          Enforcer.RunExe("icacls", $"\"{d}\" /grant *S-1-5-32-544:(OI)(CI)F");
       if (full)
         foreach (var m in new[] { "Minimal", "Network" })
         {
@@ -1186,9 +1195,9 @@ public static class Program
         {
           Diag.Log(__e);
         }
-        if (first && (DateTime.UtcNow - lastWarn).TotalMinutes >= 10)
+        if (first && (Enforcer.Mono - lastWarn).TotalMinutes >= 10)
         {
-          lastWarn = DateTime.UtcNow;
+          lastWarn = Enforcer.Mono;
           Alerts.Log("תהליך אחר תפס את ערוץ התקשורת של שירות ההגנה");
         }
         Thread.Sleep(500);
@@ -1343,7 +1352,7 @@ public static class Program
     void Add(string p)
     {
       if (curMap.ContainsKey(ExtOf(p)) && !Enforcer.CheapSkip(p))
-        q.Enqueue((p, 0, DateTime.UtcNow.AddSeconds(2)));
+        q.Enqueue((p, 0, Enforcer.Mono.AddSeconds(2)));
     }
     void Watch1(string root)
     {
@@ -1400,27 +1409,28 @@ public static class Program
       .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
     var stamp = DateTime.MinValue;
+    var loadedAt = DateTime.MinValue; // מתי נטען שינוי ההגדרות האחרון (זמן מונוטוני – לא לפי שעון המחשב, שמנהל יכול להזיז)
     var c = new Config();
     var ifeo = new List<(string Exe, string Id)>();
     var regs = new List<RegWant>();
     var lastScan = DateTime.MinValue;
-    var lastIfeo = DateTime.UtcNow;
-    var lastReg = DateTime.UtcNow;
-    var lastFw = DateTime.UtcNow;
-    var lastAd = DateTime.UtcNow;
+    var lastIfeo = Enforcer.Mono;
+    var lastReg = Enforcer.Mono;
+    var lastFw = Enforcer.Mono;
+    var lastAd = Enforcer.Mono;
     var lastPoll = DateTime.MinValue;
-    var lastRec = DateTime.UtcNow;
-    var lastSweep = DateTime.UtcNow;
+    var lastRec = Enforcer.Mono;
+    var lastSweep = Enforcer.Mono;
     var lastOverflow = DateTime.MinValue;
     var lastDrv = DateTime.MinValue;
-    var lastWmi = DateTime.UtcNow;
-    var lastPend = DateTime.UtcNow;
-    var lastLost = DateTime.UtcNow;
-    var lastSvc = DateTime.UtcNow;
-    var lastSec = DateTime.UtcNow;
-    var lastPaths = DateTime.UtcNow;
-    var lastUsbT = DateTime.UtcNow;
-    var lastIter = DateTime.UtcNow;
+    var lastWmi = Enforcer.Mono;
+    var lastPend = Enforcer.Mono;
+    var lastLost = Enforcer.Mono;
+    var lastSvc = Enforcer.Mono;
+    var lastSec = Enforcer.Mono;
+    var lastPaths = Enforcer.Mono;
+    var lastUsbT = Enforcer.Mono;
+    var lastIter = Enforcer.Mono;
     var lastTamper = DateTime.MinValue;
     var lastStrong = DateTime.MinValue;
     string? lastSig = null;
@@ -1480,9 +1490,9 @@ public static class Program
           netChanged = false;
           lastAd = DateTime.MinValue;
         }
-        if ((DateTime.UtcNow - lastDrv).TotalSeconds >= 2 && stamp != DateTime.MinValue)
+        if ((Enforcer.Mono - lastDrv).TotalSeconds >= 2 && stamp != DateTime.MinValue)
         { // בדיקת כוננים חדשים כל כמה שניות (ולא כל שנייה). רק אחרי שההגדרות נטענו, כדי לא לשחרר עם מפה ריקה
-          lastDrv = DateTime.UtcNow;
+          lastDrv = Enforcer.Mono;
           var blockingNow = Blocking(c);
           try
           {
@@ -1537,9 +1547,9 @@ public static class Program
             Diag.Log(__e);
           }
         }
-        if (pw == null && (DateTime.UtcNow - lastWmi).TotalSeconds >= 30)
+        if (pw == null && (Enforcer.Mono - lastWmi).TotalSeconds >= 30)
         {
-          lastWmi = DateTime.UtcNow;
+          lastWmi = Enforcer.Mono;
           StartWmi();
         } // ניטור WMI שנפל – מפעילים מחדש
         var ts = File.GetLastWriteTimeUtc(Config.CfgPath);
@@ -1573,9 +1583,9 @@ public static class Program
         }
         if (restore != null)
         {
-          if ((DateTime.UtcNow - lastTamper).TotalMinutes >= 1)
+          if ((Enforcer.Mono - lastTamper).TotalMinutes >= 1)
           {
-            lastTamper = DateTime.UtcNow;
+            lastTamper = Enforcer.Mono;
             Alerts.Log("קובץ ההגדרות שונה שלא דרך התוכנה – שוחזר");
           }
           try
@@ -1600,7 +1610,9 @@ public static class Program
             }
             // פתיחה זמנית: החלון מחשב את זמן הסיום לפי שעון המחשב. השירות ממיר אותו לשעה האמינה (אותו משך, עד 30 דקות) –
             // כך ששעון שהוזז קדימה לא מאריך את הפתיחה בשעות, ושעון שמאחר לא מסיים אותה מיד
-            if (nc.TempOpenUntil != 0 && nc.TempOpenUntil != c.TempOpenUntil)
+            // רק לערך חדש שהגיע מהחלון – לא בטעינה הראשונה אחרי הפעלה (מחדש) של השירות: הערך שבקובץ כבר הומר לשעה האמינה,
+            // והמרה חוזרת לפי שעון המחשב (שאולי הוזז אחורה) הייתה מאריכה את הפתיחה ל-30 דקות מלאות בכל הפעלה מחדש של השירות
+            if (nc.TempOpenUntil != 0 && stamp != DateTime.MinValue && nc.TempOpenUntil != c.TempOpenUntil)
             {
               var left = Math.Clamp(nc.TempOpenUntil - DateTime.UtcNow.Ticks, 0, TimeSpan.FromMinutes(30).Ticks);
               var want = Clock.UtcNow().Ticks + left;
@@ -1631,6 +1643,7 @@ public static class Program
               }
             }
             stamp = ts;
+            loadedAt = Enforcer.Mono;
             c = nc;
             cur = nc;
             Reload(nc);
@@ -1651,13 +1664,13 @@ public static class Program
             {
               lastSig = sig;
               StartScan(curMap, true);
-              lastScan = DateTime.UtcNow;
+              lastScan = Enforcer.Mono;
               thumbWant = curMap.Count > 0;
             }
           }
         }
         var blocking = Blocking(c);
-        var now = DateTime.UtcNow;
+        var now = Enforcer.Mono;
         foreach (var kv in lease.ToArray())
           if ((now - kv.Value).TotalSeconds > 15 && lease.TryRemove(kv.Key, out _))
           {
@@ -1701,13 +1714,13 @@ public static class Program
               {
                 for (int n = q.Count; n > 0 && q.TryDequeue(out var it); n--)
                 {
-                  if (it.At > DateTime.UtcNow)
+                  if (it.At > Enforcer.Mono)
                   {
                     q.Enqueue(it);
                     continue;
                   }
                   if (Blocking(cur) && curMap.TryGetValue(ExtOf(it.P), out var rule) && !Enforcer.BlockNewFile(rule, it.P, true) && it.T < 5)
-                    q.Enqueue((it.P, it.T + 1, DateTime.UtcNow.AddSeconds(3)));
+                    q.Enqueue((it.P, it.T + 1, Enforcer.Mono.AddSeconds(3)));
                 }
               }
               catch (Exception __e)
@@ -1741,7 +1754,7 @@ public static class Program
             thumbWant = false;
             _ = Task.Run(Enforcer.ClearUserThumbs);
           }
-          bool quiet = !Enforcer.Applying() && Interlocked.CompareExchange(ref applyBusy, 0, 0) == 0 && (now - stamp).TotalSeconds > 5;
+          bool quiet = !Enforcer.Applying() && Interlocked.CompareExchange(ref applyBusy, 0, 0) == 0 && (now - loadedAt).TotalSeconds > 5;
           if (quiet && (now - lastIfeo).TotalSeconds >= 5)
           {
             lastIfeo = now;
@@ -1839,7 +1852,7 @@ public static class Program
           (now - lastPend).TotalSeconds >= 15
           && !Enforcer.Applying()
           && Interlocked.CompareExchange(ref applyBusy, 0, 0) == 0
-          && (now - stamp).TotalSeconds > 5
+          && (now - loadedAt).TotalSeconds > 5
         )
         {
           lastPend = now;
@@ -1931,10 +1944,10 @@ public static class Program
       }
       // שינה עד שנייה, או עד שינוי ברישום / ברשת (RegWatch). לפחות רבע שנייה בין סבבים, כדי שרצף שינויים לא יעסיק את המעבד
       RegWatch.Wake.WaitOne(1000);
-      var since = (DateTime.UtcNow - lastIter).TotalMilliseconds;
+      var since = (Enforcer.Mono - lastIter).TotalMilliseconds;
       if (since >= 0 && since < 250)
         Thread.Sleep(250 - (int)since);
-      lastIter = DateTime.UtcNow;
+      lastIter = Enforcer.Mono;
     }
   }
 

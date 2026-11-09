@@ -315,6 +315,7 @@ public partial class MainWin : Window
       {
         // השירות חייב להיות מותקן ומעודכן – הוא זה שיחיל את החסימות בתחילת החלון (בהתקנה ראשונה הוא עוד לא קיים)
         await Task.Run(Enforcer.EnsureService);
+        C.SchedArmed = true; // "החל שינויים": מעכשיו התזמון פעיל
         // שמירה רגילה (SAVE) ולא של מצב ההחלה: העותק של "מה הוחל" בחלון עלול להיות ישן בשנייה-שתיים, ודריסה שלו (אם השירות
         // בדיוק החיל בתחילת החלון) הייתה משאירה הגבלות אחרי הביטול. ביטול פתיחה זמנית נשלח בנפרד
         C.Save();
@@ -341,6 +342,7 @@ public partial class MainWin : Window
       && !Say(Enforcer.Describe(C) + "\n\nלהחיל?", "סיכום החלה", yesNo: true)
     )
       return;
+    C.SchedArmed = true; // "החל שינויים": מעכשיו התזמון פעיל (נשמר עם ההחלה)
     status.Text = "מחיל...";
     IsEnabled = false;
     busy = true;

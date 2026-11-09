@@ -682,3 +682,49 @@ public class AppliedExtTests
     Assert.Same(c.Images, Enforcer.AppliedExtMap(c)["png"]); // png נשאר נעול לפי חסימת התמונות שהוחלה
   }
 }
+
+// ---------- על מי ועל מה החסימה חלה – רק אחרי "החל שינויים" ----------
+public class AppliedScopeTests
+{
+  [Fact]
+  public void UsesAppliedNotMarked()
+  {
+    // הוחל: רק החשבון S-1-5-21-1, בלי חיזוק, דילוג על AppData, בלי כוננים נשלפים, דילוג על תיקיות תוכנות
+    var c = new Config { AllUsers = true, OwnerSid = "S-1-5-21-2", Harden = true, SkipAppData = false, IncludeRemovable = true, SkipProgramDirs = false };
+    c.Applied.Add("scope|0|0|1|0|1|S-1-5-21-1");
+    var s = Enforcer.AppliedScope(c);
+    Assert.False(s.AllUsers);
+    Assert.Equal("S-1-5-21-1", s.OwnerSid);
+    Assert.False(s.Harden);
+    Assert.True(s.SkipAppData);
+    Assert.False(s.IncludeRemovable);
+    Assert.True(s.SkipProgramDirs);
+  }
+
+  [Fact]
+  public void AllUsersWithoutOwner()
+  {
+    var c = new Config();
+    c.Applied.Add("scope|1|1|0|1|0|");
+    var s = Enforcer.AppliedScope(c);
+    Assert.True(s.AllUsers);
+    Assert.Null(s.OwnerSid);
+    Assert.True(s.Harden);
+    Assert.True(s.IncludeRemovable);
+  }
+
+  [Fact]
+  public void OldVersionWithoutRecordUsesSettings()
+  {
+    var c = new Config { AllUsers = false, OwnerSid = "S-1-5-21-3", Harden = true };
+    Assert.Equal(Enforcer.CurrentScope(c), Enforcer.AppliedScope(c)); // החלה מגרסה קודמת: כמו קודם
+  }
+
+  [Fact]
+  public void BrokenRecordUsesSettings()
+  {
+    var c = new Config { AllUsers = false, OwnerSid = "S-1-5-21-3" };
+    c.Applied.Add("scope|1|0");
+    Assert.Equal(Enforcer.CurrentScope(c), Enforcer.AppliedScope(c));
+  }
+}

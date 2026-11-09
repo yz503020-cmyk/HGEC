@@ -386,8 +386,20 @@ public static class Program
     }
   }
 
-  static bool OwnerApplies(Config c, int pid) =>
-    c.AllUsers || string.IsNullOrEmpty(c.OwnerSid) || string.Equals(Native.ProcSid(pid), c.OwnerSid, StringComparison.OrdinalIgnoreCase);
+  // על מי החסימה חלה – לפי מה שהוחל (Enforcer.AppliedScope), ולא לפי מה שסומן בחלון ועוד לא הוחל. מתעדכן ב-Reload
+  static volatile Enforcer.Scope curScope = new(true, null, false, true, false, true);
+
+  static bool ScopeApplies(string? sid)
+  {
+    var s = curScope;
+    return s.AllUsers || string.IsNullOrEmpty(s.OwnerSid) || string.Equals(sid, s.OwnerSid, StringComparison.OrdinalIgnoreCase);
+  }
+
+  static bool OwnerApplies(Config c, int pid)
+  {
+    var s = curScope;
+    return s.AllUsers || string.IsNullOrEmpty(s.OwnerSid) || ScopeApplies(Native.ProcSid(pid));
+  }
 
   static void KillPid(int pid)
   {
@@ -797,7 +809,8 @@ public static class Program
         sizeMap = d;
       });
     curMap = blocking ? Enforcer.AppliedExtMap(c) : new Dictionary<string, Rule>(); // רק סוגי קבצים שהחסימה שלהם הוחלה
-    Enforcer.SetSkip(c);
+    curScope = Enforcer.AppliedScope(c);
+    Enforcer.SetSkip(c, true); // היקף הנעילה, החיזוק ואפשרויות הסריקה – לפי מה שהוחל
     Alerts.SetUrl(c.AlertUrl);
   }
 
@@ -808,10 +821,7 @@ public static class Program
     var r = c.Find(id);
     if (r == null)
       return "NONE";
-    bool applies =
-      Blocking(c)
-      && r.On
-      && (c.AllUsers || string.IsNullOrEmpty(c.OwnerSid) || string.Equals(sid, c.OwnerSid, StringComparison.OrdinalIgnoreCase));
+    bool applies = Blocking(c) && r.On && ScopeApplies(sid);
     var kind =
       c.Paths.Contains(r) ? "path"
       : Enforcer.IsExt(c, r) ? "ext"
@@ -903,7 +913,7 @@ public static class Program
             return "DENY";
           // החוק חל לפי הזהות האמיתית של הלקוח (מהזדהות ה-Pipe), ולא לפי ה-SID שהשער שולח (לא סומכים על הלקוח).
           // אם הזיהוי נכשל – כאילו זה המשתמש המוגבל (החוק חל), ולא להפך
-          return RuleInfo(p[1], sid.Length > 0 ? sid : cur.OwnerSid ?? "");
+          return RuleInfo(p[1], sid.Length > 0 ? sid : curScope.OwnerSid ?? "");
         case "VERIFY":
         {
           var c = cur;
@@ -1290,13 +1300,14 @@ public static class Program
     var sb = new StringBuilder();
     foreach (var kv in curMap.OrderBy(k => k.Key, StringComparer.Ordinal))
       sb.Append(kv.Key).Append('=').Append(kv.Value.Id).Append(kv.Value.Hidden && kv.Value.Mode == Mode.Full ? 'h' : '-').Append(';');
+    var s = curScope; // מה שהוחל – אותם ערכים שהסריקה פועלת לפיהם (SetSkip)
     sb.Append('|')
       .Append(string.Join(",", c.Exclude))
       .Append('|')
-      .Append(c.SkipAppData)
-      .Append(c.Harden)
-      .Append(c.IncludeRemovable)
-      .Append(c.SkipProgramDirs);
+      .Append(s.SkipAppData)
+      .Append(s.Harden)
+      .Append(s.IncludeRemovable)
+      .Append(s.SkipProgramDirs);
     return sb.ToString();
   }
 

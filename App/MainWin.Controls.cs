@@ -1019,6 +1019,16 @@ public partial class MainWin
     return cb;
   }
 
+  // שינוי בשעות / בימים של תזמון פעיל: נכנס לתוקף רק ב"החל שינויים", כמו סימון התזמון עצמו.
+  // קודם השינוי פעל מיד – למשל קיצור שעת הסיום שחרר את כל החסימות בלי "החל שינויים"
+  void SchedChanged()
+  {
+    if (!C.Sched.On)
+      return;
+    C.SchedArmed = false;
+    status.Text = "שינוי התזמון ייכנס לתוקף אחרי 'החל שינויים'";
+  }
+
   // תזמון: החסימות פעילות רק בתוך החלון. השירות מפעיל ומסיר אותן לבד
   UIElement SchedulePanel()
   {
@@ -1056,9 +1066,12 @@ public partial class MainWin
         {
           var v = ts.ToString(@"hh\:mm");
           t.Text = v;
+          if (v == get())
+            return; // לא השתנה (רק יציאה מהשדה): לא שומרים ולא מבטלים את התזמון שהוחל
           set(v);
           if (string.IsNullOrEmpty(C.Sched.TzId))
             C.Sched.TzId = Schedule.Local();
+          SchedChanged();
           C.Save();
         }
         else
@@ -1101,6 +1114,7 @@ public partial class MainWin
           C.Sched.Days |= bit;
         else
           C.Sched.Days &= ~bit;
+        SchedChanged();
         C.Save();
       };
       row.Children.Add(cb);

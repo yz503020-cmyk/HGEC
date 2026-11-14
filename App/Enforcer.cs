@@ -1404,6 +1404,31 @@ public static class Enforcer
   static string NetUserEntry(string sid, List<string> white) =>
     "netuser|" + sid + (white.Count > 0 ? "|" + Convert.ToBase64String(Encoding.UTF8.GetBytes(System.Text.Json.JsonSerializer.Serialize(white))) : "");
 
+  // רשימה לבנה כפי שהוחלה ("החל שינויים"): מפתח|Base64 של JSON. השירות פועל לפיה – ולא לפי שינוי ברשימה שסומן בחלון ועוד לא הוחל.
+  // קודם השירות עבד לפי הרשימה שבחלון: הסרת מתאם רשת מהרשימה הלבנה (בלי "החל שינויים") השביתה אותו מיד, וכונן USB שהוסר מהרשימה הושבת כשחובר
+  public static string ListEntry(string key, IEnumerable<string> list) =>
+    key + "|" + Convert.ToBase64String(Encoding.UTF8.GetBytes(System.Text.Json.JsonSerializer.Serialize(list.ToList())));
+
+  // null = אין רשומה (החלה מגרסה קודמת): לפי ההגדרות, כמו קודם
+  public static List<string>? AppliedList(Config c, string key)
+  {
+    var pre = key + "|";
+    string? e;
+    lock (c.Applied)
+      e = c.Applied.LastOrDefault(x => x.StartsWith(pre, StringComparison.Ordinal));
+    if (e == null)
+      return null;
+    try
+    {
+      return System.Text.Json.JsonSerializer.Deserialize<List<string>>(Encoding.UTF8.GetString(Convert.FromBase64String(e[pre.Length..]))) ?? new List<string>();
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
+      return null;
+    }
+  }
+
   static (string Sid, List<string> White)? NetUserApplied(Config c)
   {
     string? e;
@@ -1621,6 +1646,7 @@ public static class Enforcer
       wlanArgs.AddRange(WlanArgs(ssidWhite));
       AddA(c, "wlanfilter|denyall");
       AddA(c, "netapplied"); // סימון: חסימת הרשת הוחלה (השירות חוסם מתאמים חדשים רק אחרי "החל שינויים")
+      AddA(c, ListEntry("netwhite", adapterWhite)); // המתאמים המותרים שהוחלו (NetAdapterHeal / ProcessDevPending)
       foreach (var ssid in ssidWhite)
         AddA(c, "wlanfilter|allow|" + ssid);
       foreach (var w in bssWhite)
@@ -1701,6 +1727,7 @@ public static class Enforcer
           usbCmds.Add($"Disable-PnpDevice -InstanceId '{Q(q[0])}' -Confirm:$false");
         AddA(c, "usb|" + q[0]);
       }
+      AddA(c, ListEntry("usbwhite", c.Usb.White)); // הכוננים המותרים שהוחלו (כולל ההתקנים האב שנוספו עכשיו) – UsbDiskHeal / UsbTamperHeal
       foreach (var w in c.Usb.White.ToList())
       {
         var wv = w.StartsWith("usbparent:") ? w[10..] : w;
@@ -1902,7 +1929,10 @@ public static class Enforcer
       AddA(c, "ext|" + r.Id);
     foreach (var r in new[] { c.Movies, c.Songs, c.Images }.Concat(c.Exts).Where(r => r.On && r.Mode == Mode.Code))
       MakeExtLnk(c, r);
-    if (c.Applied.Any(x => x.StartsWith("hid|")))
+    bool anyHid;
+    lock (c.Applied)
+      anyHid = c.Applied.Any(x => x.StartsWith("hid|"));
+    if (anyHid)
     { // מונע הצגת קבצים מוסתרים בסייר הקבצים
       try
       {
@@ -2523,6 +2553,20 @@ public static class Enforcer
     {
       Diag.Log(__e);
     }
+    // פרופילים שנמצאים מחוץ ל-C:\Users (למשל D:\Users\שם, או פרופיל שהועבר): אותה הגנה – הפרופיל עצמו, תיקייה שמכילה אותו,
+    // ה-AppData שלו והרישום הפרטי (NTUSER.DAT). קודם נבדקה רק C:\Users, וחסימה של פרופיל כזה הייתה עלולה למנוע כניסה לחשבון
+    foreach (var u in ProfileDirs())
+    {
+      if (t.Equals(u, StringComparison.OrdinalIgnoreCase) || u.StartsWith(t + "\\", StringComparison.OrdinalIgnoreCase))
+        return true;
+      if (Under(t, System.IO.Path.Combine(u, "AppData")))
+        return true;
+      if (
+        string.Equals(System.IO.Path.GetDirectoryName(t), u, StringComparison.OrdinalIgnoreCase)
+        && System.IO.Path.GetFileName(t).StartsWith("ntuser", StringComparison.OrdinalIgnoreCase)
+      )
+        return true;
+    }
     // תיקייה/קובץ שמכילים שירות או מנהל התקן רשומים של Windows (למשל אנטי-וירוס או מנהל התקן ב-Program Files): חסימה מונעת מהם לעלות
     if (HasServiceBinary(t))
       return true;
@@ -2552,6 +2596,47 @@ public static class Enforcer
     "$SysReset",
     "$GetCurrent",
   };
+
+  // תיקיות הפרופיל של כל החשבונות במחשב (ProfileList ברישום, נשמר לדקה)
+  static List<string>? profDirs;
+  static DateTime profAt = DateTime.MinValue;
+  static readonly object ProfLock = new();
+
+  static List<string> ProfileDirs()
+  {
+    lock (ProfLock)
+    {
+      if (profDirs != null && (Mono - profAt).TotalMinutes < 1)
+        return profDirs;
+      var res = new List<string>();
+      try
+      {
+        using var k = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList");
+        if (k != null)
+          foreach (var sid in k.GetSubKeyNames())
+            try
+            {
+              using var sk = k.OpenSubKey(sid);
+              if (sk?.GetValue("ProfileImagePath") is string pp)
+              {
+                var d = Environment.ExpandEnvironmentVariables(pp).Trim().TrimEnd('\\');
+                if (d.Length > 3 && System.IO.Path.IsPathFullyQualified(d))
+                  res.Add(d);
+              }
+            }
+            catch (Exception __e)
+            {
+              Diag.Log(__e);
+            }
+      }
+      catch (Exception __e)
+      {
+        Diag.Log(__e);
+      }
+      profAt = Mono;
+      return profDirs = res;
+    }
+  }
 
   // קובצי ההפעלה של כל השירותים ומנהלי ההתקן הרשומים (מתוך הרישום, נשמר לדקה)
   static List<string>? svcBins;
@@ -4036,6 +4121,23 @@ public static class Enforcer
     }
   }
 
+  // כתיבה מיידית של יומן החסימות (נקרא כשהשירות נעצר / המחשב נכבה). השורות נכתבות באצוות כל 0.7 שניות, ובלי זה כיבוי של המחשב
+  // באמצע סריקה השאיר קבצים שכבר ננעלו בלי רישום – והם לא היו משתחררים בביטול החסימה (עד סריקה נוספת או הסרת התוכנה)
+  public static volatile bool Stopping; // השירות נעצר: לא נועלים קבצים חדשים (נעילה שלא תספיק להירשם הייתה נשארת בלי רישום)
+
+  public static void FlushLog()
+  {
+    try
+    {
+      lock (LogLock)
+        DrainLog();
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
+    }
+  }
+
   // קבצים שרשומים ביומן החסימות (בשירות). משמש לזיהוי קובץ שנעול על ידינו אבל לא רשום (למשל אחרי שחזור כונן שהיה מנותק), כדי לרשום אותו מחדש
   static readonly ConcurrentDictionary<string, byte> logged = new(StringComparer.OrdinalIgnoreCase);
 
@@ -4139,7 +4241,7 @@ public static class Enforcer
   {
     try
     {
-      if (known.ContainsKey(p))
+      if (Stopping || known.ContainsKey(p))
         return true;
       if (RemovableExcluded(p) || InSkipped(p, fresh) || !AclOk(p))
         return true;
@@ -5727,7 +5829,7 @@ public static class Enforcer
       return;
     try
     {
-      var wl = c.Net.White.Where(w => !IsWifiEntry(w)).ToHashSet(StringComparer.OrdinalIgnoreCase);
+      var wl = (AppliedList(c, "netwhite") ?? c.Net.White).Where(w => !IsWifiEntry(w)).ToHashSet(StringComparer.OrdinalIgnoreCase);
       var now = Mono;
       var bad = NetworkInterface
         .GetAllNetworkInterfaces()
@@ -5921,9 +6023,10 @@ public static class Enforcer
         Diag.Log(__e);
       }
       var now = Mono;
+      var uw = AppliedList(c, "usbwhite") ?? c.Usb.White;
       var bad = ids.Distinct(StringComparer.OrdinalIgnoreCase)
         .Where(id =>
-          !c.Usb.White.Contains(id) && !(usbBackoff.TryGetValue(id, out var u) && now < u) && Native.DevState(id) == 0
+          !uw.Contains(id) && !(usbBackoff.TryGetValue(id, out var u) && now < u) && Native.DevState(id) == 0
         )
         .ToList();
       if (bad.Count == 0)
@@ -5972,10 +6075,11 @@ public static class Enforcer
     try
     {
       var bad = new List<string>();
+      var uw = AppliedList(c, "usbwhite") ?? c.Usb.White;
       foreach (var l in Lines(PS(UsbQuery)))
       {
         var q = l.Split('|', 3);
-        if (q.Length < 2 || c.Usb.White.Contains(q[0]) || c.Usb.White.Contains(q[1]))
+        if (q.Length < 2 || uw.Contains(q[0]) || uw.Contains(q[1]))
           continue;
         bad.Add(q[0]);
       }
@@ -6059,16 +6163,18 @@ public static class Enforcer
           .Select(p => (Key: p[0] + "|" + string.Join("|", p[1..^1]), Tries: int.TryParse(p[^1], out var t) ? t : 0))
           .ToList();
         bool netWide = AppliedHas(c, "netapplied") || AppliedHas(c, "wlanfilter|denyall");
+        var nw = AppliedList(c, "netwhite") ?? c.Net.White; // הרשימות הלבנות שהוחלו (לא שינוי בחלון שעוד לא הוחל)
+        var uw = AppliedList(c, "usbwhite") ?? c.Usb.White;
         bool Hold(string key)
         {
           if (!blocking || !c.Master)
             return false;
           // רק כשחסימת רשת לכל המחשב הוחלה בפועל. חסימת רשת של חשבון אחד (חומת האש) לא משביתה מתאמים: מה שהושבת קודם חוזר לפעול
           if (key.StartsWith("net|"))
-            return c.Net.On && netWide && !c.Net.White.Contains(key[4..]);
+            return c.Net.On && netWide && !nw.Contains(key[4..]);
           if (key.StartsWith("pnp|"))
             return c.Net.On && netWide; // מתאם רשת לפי מזהה: בזמן חסימת רשת לא מחזירים
-          return c.Usb.On && !UsbUser(c) && !c.Usb.White.Contains(key[4..]); // חסימה של חשבון אחד לא משביתה התקנים
+          return c.Usb.On && !UsbUser(c) && !uw.Contains(key[4..]); // חסימה של חשבון אחד לא משביתה התקנים
         }
         // אחרי יום של ניסיונות (288) ממשיכים, אבל פעם בשעה (כל 12 סבבים) – לא מוותרים: התקן שנשאר מושבת לא היה חוזר לעבוד אף פעם
         var now = items.Where(x => !Hold(x.Key) && (x.Tries < 288 || x.Tries % 12 == 0)).ToList();

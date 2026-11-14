@@ -776,3 +776,21 @@ public class Review13Tests
   [Fact]
   public void OwnFolderCannotBeBlocked() => Assert.True(Enforcer.IsOwnPath(Config.Dir));
 }
+
+// ---------- רשימות לבנות כפי שהוחלו: השירות פועל לפיהן, ולא לפי שינוי בחלון שעוד לא הוחל ----------
+public class AppliedListTests
+{
+  [Fact]
+  public void AppliedWhitelistRoundTrips()
+  {
+    var c = new Config();
+    Assert.Null(Enforcer.AppliedList(c, "netwhite")); // אין רשומה (החלה מגרסה קודמת): לפי ההגדרות
+    c.Applied.Add(Enforcer.ListEntry("netwhite", new[] { "Ethernet 2", "שם|עם קו" }));
+    c.Applied.Add(Enforcer.ListEntry("usbwhite", new string[0]));
+    Assert.Equal(new[] { "Ethernet 2", "שם|עם קו" }, Enforcer.AppliedList(c, "netwhite"));
+    Assert.Empty(Enforcer.AppliedList(c, "usbwhite")!);
+    // שינוי ברשימה שבחלון (בלי "החל שינויים") לא משנה את מה שהוחל
+    c.Net.White.Add("Wi-Fi");
+    Assert.DoesNotContain("Wi-Fi", Enforcer.AppliedList(c, "netwhite")!);
+  }
+}

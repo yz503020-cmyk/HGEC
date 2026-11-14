@@ -459,6 +459,8 @@ public partial class MainWin
         C.Adv = D<Rule>(g7, "Adv");
         C.AdvOpts = D<AdvOpts>(g7, "AdvOpts");
         C.Sched = D<Schedule>(g7, "Sched");
+        if (C.Sched.On)
+          C.SchedArmed = false; // תזמון שיובא – רק אחרי "החל שינויים" (כמו סימון בחלון)
       }
       C.Save();
       host.Content = P1();

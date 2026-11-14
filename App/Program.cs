@@ -243,15 +243,33 @@ public static class Program
 
     protected override void OnShutdown()
     {
+      FlushFileLocks();
       Alerts.Log("המחשב נכבה – השירות נעצר", false);
     } // כיבוי רגיל של המחשב: בלי התראה
 
     protected override void OnStop()
     {
+      FlushFileLocks();
       if (removing)
         return;
       Alerts.Log("שירות ההגנה נעצר", true, true);
       Alerts.Event("שירות ההגנה נעצר");
+    }
+  }
+
+  // לפני שהתהליך נסגר: מפסיקים לנעול קבצים, ורושמים ליומן החסימות את מה שכבר ננעל (כדי שישתחרר בביטול החסימה)
+  static void FlushFileLocks()
+  {
+    try
+    {
+      Enforcer.Stopping = true;
+      Enforcer.FlushLog();
+      Thread.Sleep(300); // נעילה שהייתה באמצע ברגע העצירה מספיקה להיכנס לתור
+      Enforcer.FlushLog();
+    }
+    catch (Exception __e)
+    {
+      Diag.Log(__e);
     }
   }
 
@@ -346,6 +364,15 @@ public static class Program
         finally
         {
           Interlocked.Exchange(ref applyBusy, 0);
+          // טעינה של ההגדרות שקרתה בזמן ה-Job לא עדכנה את ההיקף (ראו Reload): מעדכנים עכשיו לפי ההגדרות האחרונות שנטענו
+          try
+          {
+            Enforcer.SetSkip(cur, true);
+          }
+          catch (Exception __e)
+          {
+            Diag.Log(__e);
+          }
         }
       },
       CancellationToken.None,
@@ -818,7 +845,10 @@ public static class Program
       });
     curMap = blocking ? Enforcer.AppliedExtMap(c) : new Dictionary<string, Rule>(); // רק סוגי קבצים שהחסימה שלהם הוחלה
     curScope = Enforcer.AppliedScope(c);
-    Enforcer.SetSkip(c, true); // היקף הנעילה, החיזוק ואפשרויות הסריקה – לפי מה שהוחל
+    // היקף הנעילה, החיזוק ואפשרויות הסריקה – לפי מה שהוחל. לא באמצע החלה/ביטול של השירות עצמו (Job): שמירה של החלון באותו רגע
+    // הייתה מחזירה את ההיקף הישן באמצע ההחלה, וחלק מהקבצים היו ננעלים לחשבון הלא נכון. בסוף ה-Job ההיקף מתעדכן (Job)
+    if (Interlocked.CompareExchange(ref applyBusy, 0, 0) == 0)
+      Enforcer.SetSkip(c, true);
     Alerts.SetUrl(c.AlertUrl);
   }
 

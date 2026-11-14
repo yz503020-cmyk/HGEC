@@ -49,12 +49,12 @@ jobs:
           name: DeviceGuard
           path: out/DeviceGuard.exe
           retention-days: 3
-      - name: Draft release (tag or manual)
-        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.release == 'true'
+      # מהדורה מפורסמת (לא טיוטה) בלשונית "Releases": בכל עדכון של main, בתגית v* או בהרצה ידנית. הקובץ להורדה: DeviceGuard.exe
+      - name: Publish release
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') || github.event.inputs.release == 'true')
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="${{ github.ref_name }}"
-          if [[ "${{ github.ref }}" != refs/tags/* ]]; then TAG="build-${{ github.run_number }}"; fi
-          gh release create "$TAG" out/DeviceGuard.exe --draft --title "DeviceGuard $TAG" --generate-notes
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then TAG="${{ github.ref_name }}"; else TAG="v2.8.${{ github.run_number }}"; fi
+          gh release create "$TAG" out/DeviceGuard.exe --target "${{ github.sha }}" --title "אלף המגן $TAG" --generate-notes --latest

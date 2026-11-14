@@ -4,7 +4,7 @@
 
 ## בנייה
 
-* **GitHub Actions** (מומלץ): כל push ל-`main` בונה ומעלה את `DeviceGuard.exe` כ-Artifact. Release טיוטה נוצר רק בתגית `v*` או בהרצה ידנית עם `release=true`.
+* **GitHub Actions** (מומלץ): כל push ל-`main` בונה את התוכנה ומפרסם מהדורה חדשה בלשונית **Releases** (מהדורות) עם הקובץ `DeviceGuard.exe` להורדה. גם תגית `v*` או הרצה ידנית עם `release=true` מפרסמות מהדורה.
 * **מקומית**: Windows + .NET 10 SDK, להריץ `build.cmd` (השער הקל דורש גם Visual Studio Build Tools עם "Desktop development with C++"; בלעדיו הבנייה ממשיכה בלי השער הקל). התוצר: `out\DeviceGuard.exe`.
 
 קובץ אחד בלבד. כשלוחצים "החל שינויים" התוכנה מעתיקה את עצמה ל-`C:\ProgramData\DeviceGuard\DeviceGuardWatch.exe` ומתקינה ממנו את השירות והשער (אין יותר `Gate.exe` נפרד).
